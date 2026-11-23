@@ -152,19 +152,19 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
 static BOOLEAN handle_msr_allowlist_pass(ULONG msr)
 {
     switch (msr) {
-    case 0x00000010ULL:   /* IA32_TIME_STAMP_COUNTER      */
-    case 0x0000001BULL:   /* IA32_APIC_BASE               */
-    case 0x000000FEULL:   /* IA32_MTRRCAP                 */
-    case 0x00000277ULL:   /* IA32_PAT                     */
-    case 0x000002FFULL:   /* IA32_MTRR_DEF_TYPE           */
-    case 0xC0000080ULL:   /* IA32_EFER                    */
-    case 0xC0000081ULL:   /* STAR                         */
-    case 0xC0000082ULL:   /* LSTAR                        */
-    case 0xC0000083ULL:   /* CSTAR                        */
-    case 0xC0000084ULL:   /* SFMASK                       */
-    case 0xC0000100ULL:   /* FS_BASE                      */
-    case 0xC0000101ULL:   /* GS_BASE                      */
-    case 0xC0000102ULL:   /* KERNEL_GS_BASE               */
+    case 0x00000010UL:   /* IA32_TIME_STAMP_COUNTER      */
+    case 0x0000001BUL:   /* IA32_APIC_BASE               */
+    case 0x000000FEUL:   /* IA32_MTRRCAP                 */
+    case 0x00000277UL:   /* IA32_PAT                     */
+    case 0x000002FFUL:   /* IA32_MTRR_DEF_TYPE           */
+    case 0xC0000080UL:   /* IA32_EFER                    */
+    case 0xC0000081UL:   /* STAR                         */
+    case 0xC0000082UL:   /* LSTAR                        */
+    case 0xC0000083UL:   /* CSTAR                        */
+    case 0xC0000084UL:   /* SFMASK                       */
+    case 0xC0000100UL:   /* FS_BASE                      */
+    case 0xC0000101UL:   /* GS_BASE                      */
+    case 0xC0000102UL:   /* KERNEL_GS_BASE               */
         return TRUE;
     default:
         return FALSE;
