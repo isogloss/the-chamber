@@ -42,6 +42,7 @@
 #include "timing.h"
 #include "npt.h"
 #include "integrity.h"
+#include "identity.h"
 #include <wdmsec.h>   /* IoCreateDeviceSecure + SDDL_DEVOBJ_SYS_ALL_ADM_ALL */
 
 CHAMBER_GLOBALS g_chamber;
@@ -50,23 +51,61 @@ CHAMBER_GLOBALS g_chamber;
  * Initialized once in DriverEntry; declared extern in the_chamber.h. */
 KSPIN_LOCK g_stealth_lock;
 
-/* Phase 1.7: runtime-patchable config blob in a dedicated section. The
- * launcher locates the section by name (".cfg") and the magic field, then
- * overwrites device_path/symlink_path/marker_path with a per-install
- * randomized name before signing and loading the driver. Defaults below
- * look like a generic storage-filter driver so that a fresh build that
- * skipped the launcher is still non-obvious. */
+/* Seed-derived config blob. The launcher locates this section by name
+ * (".cfg") and by (magic == CHAMBER_CFG_MAGIC_V2 && version == 2 &&
+ * total_length == 632), overwriting it with the full 632-byte derived
+ * blob before signing. The default blob below carries placeholder
+ * values so the driver object code is self-consistent if a developer
+ * loads an un-patched build locally; nothing here is meant to be used
+ * on a release install. */
 #pragma section(".cfg", read, write)
 __declspec(allocate(".cfg"))
+CHAMBER_CFG_V2 g_chamber_cfg_v2 = {
+    CHAMBER_CFG_MAGIC_V2,
+    2,
+    CHAMBER_CFG_V2_TOTAL_LENGTH,
+    { 0 },                                      /* seed */
+    0,                                          /* toggles */
+    { 's','v','c','_','p','l','c','h','d','r',0,0 },
+    { 'p','l','c','h','d','r','d','e','v',0,0,0 },
+    { 'FsFl','FsFl','FsFl','FsFl','FsFl','FsFl' },
+    0x5452484D4648434AULL,                      /* vmmcall_magic placeholder */
+    0,                                          /* cfg_magic_override placeholder */
+    0, { 0, 0, 0 },                             /* rename_donor_index + pad */
+    1,                                          /* guest_asid (overridden) */
+    0, 0,                                       /* section_scramble, driver_nonce */
+    { 'C','H','A','M','B','E','R','-','P','L','C','H','D','R','-',0 },
+    { 0 },                                      /* machine_guid */
+    0,                                          /* install_date */
+    { 'X','X','X','X','X','-','X','X','X','X','X','-','X','X','X','X','X','-','X','X','X','X','X',0 },
+    { 0 },                                      /* digital_product_id */
+    { 'A','M','D',' ','R','y','z','e','n',' ','7',' ','7','7','0','0',
+      'X',' ','8','-','C','o','r','e',' ','P','r','o','c','e','s','s',
+      'o','r',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',0 },
+    { 0 }, { 0 }, { 0 }, { 0 }, { 0 },           /* smbios uuid, serials, bios */
+    { { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 } }, /* mac_addrs */
+    { { 0 } },                                   /* disk_serials */
+    { { 0 } },                                   /* volume_serials */
+    0x10022208UL,                                /* gpu_ven_dev placeholder */
+    { 0 },                                       /* edid_nonce */
+    { 0 }                                        /* tail pad */
+};
+
+/* Runtime wrapper over CHAMBER_CFG_V2, populated at DriverEntry so
+ * downstream call sites keep stable pointers to UNICODE_STRING buffers
+ * that persist for the driver's lifetime. The v1 struct name is kept
+ * purely so existing code paths compile; no v1 blob is read anywhere. */
 CHAMBER_CFG g_chamber_cfg = {
-    CHAMBER_CFG_MAGIC_V1,
-    1,
-    L"\\Device\\PciStor",
-    L"\\DosDevices\\PciStor",
-    L"\\??\\C:\\Windows\\System32\\config\\pcistor.dat",
+    CHAMBER_CFG_MAGIC_V2,
+    2,
+    { 0 },
+    { 0 },
+    { 0 },
     0,
     { 0 }
 };
+
+BOOLEAN g_chamber_cfg_v2_valid = FALSE;
 
 /* --- Forward decls --- */
 DRIVER_INITIALIZE DriverEntry;
@@ -77,6 +116,64 @@ DRIVER_DISPATCH   IrpDeviceControl;
 static NTSTATUS crash_marker_present(BOOLEAN *out_present);
 static NTSTATUS crash_marker_drop(void);
 static NTSTATUS crash_marker_clear(void);
+
+/* Expand the v2 blob into the legacy WCHAR buffers consumed below.
+ * Called once in DriverEntry after the version/magic probe succeeds.
+ * Returns FALSE if either suffix would exceed its buffer, so the
+ * caller can refuse to load rather than truncate a path. */
+static BOOLEAN expand_cfg_v2_to_wide(void)
+{
+    SIZE_T i;
+    SIZE_T len;
+    static const WCHAR DEV_PREFIX[]    = L"\\Device\\";
+    static const WCHAR DOS_PREFIX[]    = L"\\DosDevices\\";
+    static const WCHAR MARKER_PREFIX[] =
+        L"\\??\\C:\\Windows\\System32\\config\\";
+    static const WCHAR MARKER_SUFFIX[] = L".dat";
+
+    /* device_path = L"\\Device\\" + suffix(ASCII). */
+    for (i = 0; DEV_PREFIX[i]; i++) g_chamber_cfg.device_path[i] = DEV_PREFIX[i];
+    len = i;
+    for (i = 0; i < sizeof(g_chamber_cfg_v2.device_suffix); i++) {
+        UCHAR b = g_chamber_cfg_v2.device_suffix[i];
+        if (b == 0) break;
+        if (len + 2 >= CHAMBER_CFG_DEVICE_MAX) return FALSE;
+        g_chamber_cfg.device_path[len++] = (WCHAR)b;
+    }
+    g_chamber_cfg.device_path[len] = 0;
+
+    /* symlink_path = L"\\DosDevices\\" + suffix. */
+    for (i = 0; DOS_PREFIX[i]; i++) g_chamber_cfg.symlink_path[i] = DOS_PREFIX[i];
+    len = i;
+    for (i = 0; i < sizeof(g_chamber_cfg_v2.device_suffix); i++) {
+        UCHAR b = g_chamber_cfg_v2.device_suffix[i];
+        if (b == 0) break;
+        if (len + 2 >= CHAMBER_CFG_SYMLINK_MAX) return FALSE;
+        g_chamber_cfg.symlink_path[len++] = (WCHAR)b;
+    }
+    g_chamber_cfg.symlink_path[len] = 0;
+
+    /* marker_path = L"\\??\\C:\\...\\" + service_name + L".dat". */
+    for (i = 0; MARKER_PREFIX[i]; i++) g_chamber_cfg.marker_path[i] = MARKER_PREFIX[i];
+    len = i;
+    for (i = 0; i < sizeof(g_chamber_cfg_v2.service_name); i++) {
+        UCHAR b = g_chamber_cfg_v2.service_name[i];
+        if (b == 0) break;
+        if (len + 6 >= CHAMBER_CFG_MARKER_MAX) return FALSE;
+        g_chamber_cfg.marker_path[len++] = (WCHAR)b;
+    }
+    for (i = 0; MARKER_SUFFIX[i]; i++) {
+        if (len + 2 >= CHAMBER_CFG_MARKER_MAX) return FALSE;
+        g_chamber_cfg.marker_path[len++] = MARKER_SUFFIX[i];
+    }
+    g_chamber_cfg.marker_path[len] = 0;
+
+    /* Pool-tag override: first subsystem tag (svm) carries the aggregate
+     * override; subsystem-specific tags are consulted by pool-aware call
+     * sites once the launcher populates them via the seed. */
+    g_chamber_cfg.pool_tag_override = g_chamber_cfg_v2.pool_tag[0];
+    return TRUE;
+}
 
 static void watchdog_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2);
 static void start_watchdog(void);
@@ -223,6 +320,7 @@ static void watchdog_unload_worker(PDEVICE_OBJECT DevObj, PVOID Ctx)
         npt_free_tables();
         g_chamber.npt_initialized = FALSE;
     }
+    identity_release();
 
     /* Free the work item itself. We stashed its pointer in globals so
      * the DPC could queue it exactly once; zero the pointer AFTER free
@@ -505,6 +603,7 @@ VOID UnloadRoutine(PDRIVER_OBJECT Driver)
         npt_free_tables();
         g_chamber.npt_initialized = FALSE;
     }
+    identity_release();
     vmexit_cleanup();
 
     UNICODE_STRING sym;
@@ -544,12 +643,30 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
      * instead of the registry subkey name. */
     scrub_service_key_name(Driver);
 
-    /* Sanity-check the config blob the launcher was supposed to patch. */
-    if (g_chamber_cfg.magic != CHAMBER_CFG_MAGIC_V1) {
-        CHAMBER_LOG_ERR("config blob magic mismatch 0x%08x\n",
-                        g_chamber_cfg.magic);
+    /* Version dispatch on the seed-derived config blob. The wave-3 v1
+     * shape is retired in place: the installer must have produced v2
+     * (magic 'CFG2', version 2, total_length 632). Loading a v1 blob
+     * is refused with a specific error so the installer path surfaces
+     * the mismatch rather than silently running under stale values. */
+    if (g_chamber_cfg_v2.magic == CHAMBER_CFG_MAGIC_V1 ||
+        g_chamber_cfg_v2.version == 1) {
+        CHAMBER_LOG_ERR("v1 config blob detected; v2 required\n");
+        return STATUS_REVISION_MISMATCH;
+    }
+    if (g_chamber_cfg_v2.magic != CHAMBER_CFG_MAGIC_V2 ||
+        g_chamber_cfg_v2.version != 2 ||
+        g_chamber_cfg_v2.total_length != CHAMBER_CFG_V2_TOTAL_LENGTH) {
+        CHAMBER_LOG_ERR("cfg blob mismatch magic=0x%08x ver=%u len=%u\n",
+                        g_chamber_cfg_v2.magic,
+                        g_chamber_cfg_v2.version,
+                        g_chamber_cfg_v2.total_length);
         return STATUS_INVALID_PARAMETER;
     }
+    if (!expand_cfg_v2_to_wide()) {
+        CHAMBER_LOG_ERR("cfg suffix too long for legacy path buffers\n");
+        return STATUS_INVALID_PARAMETER;
+    }
+    g_chamber_cfg_v2_valid = TRUE;
 
     /* Crash-marker safety: refuse to load if the previous session left
      * one, OR if the probe returned an indeterminate status (now
@@ -627,6 +744,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
         goto fail;
     }
     g_chamber.svm_initialized = TRUE;
+
+    /* Populate per-vCPU identity tables and single-valued derived state.
+     * svm_online_cpu has already run on every CPU (KeIpiGenericCall at
+     * the tail of svm_init_all_cpus), but the VMCB builder reads no
+     * identity state at bringup; the identity lookup is consulted at
+     * VMEXIT time by handle_cpuid and handle_msr. Applying the table
+     * after bringup is therefore sufficient and avoids calling an
+     * allocator from inside the IPI broadcast. */
+    st = identity_apply(&g_chamber_cfg_v2);
+    if (!NT_SUCCESS(st)) {
+        CHAMBER_LOG_ERR("identity_apply failed 0x%08x\n", st);
+        goto fail;
+    }
 
     /* Phase 1.2: set the pessimistic default microcode round-trip cost that
      * timing_update() adds to every captured host interval. */
