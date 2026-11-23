@@ -55,7 +55,11 @@
  * per-core RDTSC monotonicity (lock-free data-structure primitives,
  * microarchitectural benchmarks) would need to disable the global
  * accumulator and go back to per-CPU state at the cost of cross-core
- * consistency. For a detection-avoidance HV, cross-core uniformity wins.
+ * consistency. For a detection-avoidance HV, cross-core uniformity wins:
+ * modern VM-presence probes (VMAware, pafish) specifically compare TSC
+ * samples across logical processors, so per-core drift is a stronger
+ * signal than rare, under-load local regression. Phase 1.3 formalizes
+ * the choice.
  */
 #include "the_chamber.h"
 #include "svm.h"
@@ -69,6 +73,13 @@
  * any change to the intercept vectors must also clear this bit, otherwise
  * hardware keeps serving the stale cached control area. */
 #define VMCB_CLEAN_BIT_TSC (1U << 0)
+
+/* Phase 1.3: compile-time sanity check that the asm EQUs in vmrun.asm
+ * match the C struct layout. If this fires, vmrun.asm's timing captures
+ * are writing into unrelated fields and every guest tsc_offset is
+ * garbage -- a one-line correctness disaster. */
+C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, host_interval_start) == 192);
+C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, host_interval_end)   == 200);
 
 /* Phase 1.3: ONE global accumulator shared by every CPU. */
 volatile LONG64 g_total_accumulated_cycles = 0;
