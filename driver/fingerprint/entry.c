@@ -24,6 +24,7 @@
  */
 
 #include "fingerprint_cfg.h"
+#include <wdmsec.h>     /* IoCreateDeviceSecure + SDDL_* constants */
 
 #define CFP_TAG         'cFPC'
 
@@ -146,13 +147,15 @@ DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg_path)
     cfp_target_init();
     cfp_instr_init();
 
-    /* 4. Control device. */
+    /* 4. Control device. SDDL_DEVOBJ_SYS_ALL_ADM_ALL: SYSTEM + admins only.
+     *    The launcher runs elevated; no non-admin process should be able
+     *    to open \\.\CFPControl and arm spoofing. */
     UNICODE_STRING dev_name;
     RtlInitUnicodeString(&dev_name, L"\\Device\\CFPControl");
     status = IoCreateDeviceSecure(
         drv, 0, &dev_name, FILE_DEVICE_UNKNOWN,
         FILE_DEVICE_SECURE_OPEN, FALSE,
-        &SDDL_DEVOBJ_SYS_ALL_ADM_RWX_WORLD_RWX_RES_RWX,
+        &SDDL_DEVOBJ_SYS_ALL_ADM_ALL,
         NULL, &g_device);
     if (!NT_SUCCESS(status)) {
         cfp_cfg_unload();
