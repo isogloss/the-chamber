@@ -30,6 +30,7 @@
 #include "timing.h"
 #include "npt.h"
 #include "dump.h"
+#include "integrity.h"
 
 volatile ULONGLONG g_vmexit_count = 0;
 
@@ -458,6 +459,22 @@ static void handle_vmmcall(PER_CPU_CTX *ctx, VMCB *vmcb)
         break;
     case THE_CHAMBER_HCALL_SHUTDOWN:
         InterlockedExchange(&ctx->shutdown_requested, 1);
+        break;
+    case CHAMBER_HCALL_SELF_INTEGRITY:
+        /* Phase 7.2 code-integrity self-check. First call latches the
+         * known-good hash; subsequent calls compare and set the
+         * failure flag on mismatch. HV code is mapped in root
+         * context's kernel VA without NPT translation, so reading it
+         * here is a plain pool-memory access.
+         *
+         * NOTE: integrity.c's DPC currently can bypass this handler
+         * and call integrity_handle_hcall() directly when
+         * CHAMBER_HV_INTROSPECTION_RESIST is OFF, avoiding the need
+         * for a kernel-side VMMCALL emitter. Future work: write an
+         * asm thunk in asm_helpers.asm that emits VMMCALL with RAX =
+         * code and RBX = magic, and make the DPC use it
+         * unconditionally. */
+        integrity_handle_hcall();
         break;
     case CHAMBER_HCALL_DUMP_CR3: {
         /* Phase 6.2 pause-the-world capture. Operator calling convention

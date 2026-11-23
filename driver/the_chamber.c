@@ -41,6 +41,7 @@
 #include "stealth.h"
 #include "timing.h"
 #include "npt.h"
+#include "integrity.h"
 #include <wdmsec.h>   /* IoCreateDeviceSecure + SDDL_DEVOBJ_SYS_ALL_ADM_ALL */
 
 CHAMBER_GLOBALS g_chamber;
@@ -364,6 +365,11 @@ VOID UnloadRoutine(PDRIVER_OBJECT Driver)
     CHAMBER_LOG("unload begin (vmexits=%llu, kicks=%ld)\n",
                 g_vmexit_count, g_chamber.kick_counter);
 
+    /* Phase 7.2: stop the integrity DPC first; it reads HV code via
+     * either direct call or VMMCALL, both of which are unsafe after
+     * we start tearing down. */
+    integrity_shutdown();
+
     /* Restore ourselves to PsLoadedModuleList + DriverObject BEFORE any
      * of the IO-manager cleanup paths run. */
     (void)stealth_revert(Driver);
@@ -531,6 +537,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
      * stealth_apply, but doing this first keeps the hide pass agnostic
      * to stealth internals. */
     (void)npt_hide_hv_image(Driver->DriverStart, Driver->DriverSize);
+
+    /* Phase 7.2: arm the integrity self-check DPC. Non-fatal on
+     * failure -- operator can disable integrity by removing this call
+     * without breaking the rest of the HV. Must come AFTER
+     * npt_hide_hv_image so that, when §7.1 is enabled, the DPC's
+     * compile-time branch sees the correct state. */
+    (void)integrity_init(Driver);
 
     /* Self-hide: rename our KLDR entry + null driver name.  Keep the
      * crash marker set across stealth_apply so a bugcheck from the
