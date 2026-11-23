@@ -32,7 +32,6 @@ void vmexit_handler(PER_CPU_CTX *ctx)
     VMCB *vmcb;
     ULONGLONG exit_code;
 
-    timing_before_handler(ctx);
     InterlockedIncrement64((LONG64 *)&g_vmexit_count);
 
     vmcb = (VMCB *)ctx->vmcb_va;
@@ -63,8 +62,12 @@ void vmexit_handler(PER_CPU_CTX *ctx)
         break;
     }
 
-    /* Mask VMEXIT latency from guest-visible TSC. */
-    timing_after_vmexit(ctx);
+    /* Phase 1.2: no more per-handler timing hooks here. vmrun.asm captures
+     * the host-interval START right after `vmrun rax` returns (before
+     * vmsave) and the host-interval END just before the next `vmrun rax`
+     * (after any vmload); it then calls timing_update(ctx) which folds the
+     * delta plus g_fixed_vmexit_cost into the global accumulator and
+     * refreshes this CPU's VMCB tsc_offset. */
 }
 
 /* ------------------------------------------------------------------ */

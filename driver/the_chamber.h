@@ -58,8 +58,19 @@ typedef struct _PER_CPU_CTX {
     /* Shadow GPR save area, written by vmrun.asm after each VMEXIT and
      * consumed by handle_cpuid/handle_msr. Layout:
      *  0=rax, 1=rbx, 2=rcx, 3=rdx, 4=rsi, 5=rdi, 6=rbp, 7=rsp(unused),
-     *  8=r8 ..15=r15. */
+     *  8=r8 ..15=r15.
+     * Offset 64 (0x40); 16 x 8 = 128 bytes, ends at 192 (0xC0). */
     ULONGLONG   gpr_save[CHAMBER_GPR_COUNT];
+    /* NEW in Phase 1.2: host-only interval TSC captures.
+     * vmrun.asm writes host_interval_start right after `vmrun rax` returns
+     * (before `vmsave`) and host_interval_end immediately before the next
+     * `vmrun rax` (after the handler and any vmload). timing_update()
+     * reads their difference, adds the calibrated fixed-vmexit microcode
+     * cost, and refreshes the VMCB tsc_offset from the shared global
+     * accumulator. Offsets 192/200 MUST match the TIMING_HOST_INTERVAL_START
+     * / TIMING_HOST_INTERVAL_END EQUs in vmrun.asm. */
+    ULONGLONG   host_interval_start;    /* offset 192 (0xC0) */
+    ULONGLONG   host_interval_end;      /* offset 200 (0xC8) */
 } PER_CPU_CTX, *PPER_CPU_CTX;
 
 typedef struct _CHAMBER_GLOBALS {

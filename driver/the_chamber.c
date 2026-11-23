@@ -14,6 +14,7 @@
 
 #include "the_chamber.h"
 #include "stealth.h"
+#include "timing.h"
 
 CHAMBER_GLOBALS g_chamber;
 
@@ -373,6 +374,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
         goto fail;
     }
     g_chamber.svm_initialized = TRUE;
+
+    /* Phase 1.2: set the pessimistic default microcode round-trip cost that
+     * timing_update() adds to every captured host interval. A proper
+     * guest-side synthetic-VMMCALL calibration pass can refine this value
+     * later; the Phase 1 bringup path has no running guest in which to
+     * execute it, so timing_calibrate() picks a conservative Zen 4
+     * constant. See timing.c for the measurement protocol. */
+    timing_calibrate();
 
     start_watchdog();
     crash_marker_clear();  /* init complete -- next boot can load again */
