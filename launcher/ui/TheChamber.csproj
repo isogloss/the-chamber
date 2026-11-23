@@ -45,13 +45,8 @@
 
   <ItemGroup>
     <Resource Include="Resources\chamber.png" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ApplicationDefinition Remove="App.xaml" />
-    <ApplicationDefinition Include="App.xaml">
-      <Generator>MSBuild:Compile</Generator>
-    </ApplicationDefinition>
+    <EmbeddedResource Include="Resources\Resources.resx"
+                      LogicalName="TheChamber.Resources.Resources.resources" />
   </ItemGroup>
 
 </Project>
