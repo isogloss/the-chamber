@@ -49,12 +49,20 @@ public partial class App : Application
         }
         catch (Exception ex)
         {
-            MessageBox.Show(
-                _splash,
-                $"Startup aborted:\n\n{ex.Message}",
-                "The Chamber",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
+            // _splash may already be closed and nulled by DriveAsync.
+            // MessageBox.Show demands a non-null owner, so pass whatever
+            // is live.
+            Window? owner = _splash is { IsLoaded: true } ? _splash : null;
+            var text = $"Startup aborted:\n\n{ex.Message}";
+            if (owner is null)
+            {
+                MessageBox.Show(text, "The Chamber", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            else
+            {
+                MessageBox.Show(owner, text, "The Chamber",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
             Shutdown(1);
         }
     }
