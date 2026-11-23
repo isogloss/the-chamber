@@ -45,13 +45,21 @@ Assert-NoAntiCheatRunning
 Write-Host "obfuscate.ps1 -> delegating to install_service.ps1" -ForegroundColor Cyan
 Write-Host "(per-install random name via NtLoadDriver; no sc.exe, no 7045/7036 events)" -ForegroundColor DarkGray
 
-$installer = Join-Path $repoRoot 'launcher\install_service.ps1'
-if (-not (Test-Path -LiteralPath $installer)) {
-    # Running from the deployed tree.
-    $installer = 'C:\THE_CHAMBER\launcher\install_service.ps1'
+$installer = $null
+try {
+    $installer = (Resolve-Path (Join-Path $PSScriptRoot '..\launcher\install_service.ps1') -ErrorAction Stop).Path
+} catch {
+    # $PSScriptRoot-relative resolve failed (packaged binary, script
+    # invoked from an arbitrary cwd). Fall back to the deployed tree,
+    # then to $repoRoot (Split-Path -Parent $scriptDir) as a last resort.
+    $candidates = @(
+        'C:\THE_CHAMBER\launcher\install_service.ps1',
+        (Join-Path $repoRoot 'launcher\install_service.ps1')
+    )
+    $installer = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 }
-if (-not (Test-Path -LiteralPath $installer)) {
-    Write-Host "install_service.ps1 not found at $installer; aborting." -ForegroundColor Red
+if (-not $installer -or -not (Test-Path -LiteralPath $installer)) {
+    Write-Host "install_service.ps1 not found (tried PSScriptRoot-relative, C:\THE_CHAMBER\launcher, repoRoot); aborting." -ForegroundColor Red
     exit 1
 }
 & $installer

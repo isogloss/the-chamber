@@ -64,9 +64,44 @@ function Read-InstallName {
 }
 
 function Test-ServiceLoaded([string]$name) {
-    # A live NtLoadDriver install leaves HKLM\...\Services\<name> on disk
-    # and the device symlink reachable via CreateFile. Get-Service also
-    # reports it as "Running" without round-tripping through SCM start.
+    # Primary signal: the device symlink is reachable. NtLoadDriver-loaded
+    # drivers are not necessarily SCM-tracked, so Get-Service "Running" is
+    # unreliable; a successful CreateFile on \\.\<name> + zero-byte ReadFile
+    # tells us the driver is live and servicing IRPs.
+    if (-not ('TheChamber.Probe' -as [type])) {
+        Add-Type -Namespace TheChamber -Name Probe -MemberDefinition @'
+            using System;
+            using System.Runtime.InteropServices;
+            using Microsoft.Win32.SafeHandles;
+            public static class ProbeNative {
+                [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+                public static extern SafeFileHandle CreateFile(
+                    string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+                    IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+                    uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+                [DllImport("kernel32.dll", SetLastError = true)]
+                public static extern bool ReadFile(
+                    SafeFileHandle hFile, IntPtr lpBuffer, uint nNumberOfBytesToRead,
+                    out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+            }
+'@ -ErrorAction SilentlyContinue
+    }
+    $FILE_GENERIC_READ = [uint32]0x80000000
+    $OPEN_EXISTING_P   = [uint32]3
+    try {
+        $probe = [TheChamber.Probe+ProbeNative]::CreateFile(
+            "\\.\$name", $FILE_GENERIC_READ, 0,
+            [IntPtr]::Zero, $OPEN_EXISTING_P, 0, [IntPtr]::Zero)
+        if (-not $probe.IsInvalid) {
+            $read = 0
+            [TheChamber.Probe+ProbeNative]::ReadFile(
+                $probe, [IntPtr]::Zero, 0, [ref]$read, [IntPtr]::Zero) | Out-Null
+            $probe.Close()
+            return $true
+        }
+    } catch {}
+    # Fallback: SCM query. A kernel driver without a device namespace entry
+    # but a registered service still reports Running on some Windows builds.
     $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
     return ($null -ne $svc -and $svc.Status -eq 'Running')
 }
@@ -125,7 +160,10 @@ if (-not ('TheChamber.Pinvoke' -as [type])) {
 
 # CTL_CODE(DeviceType, Function, Method, Access) =
 #   (DeviceType << 16) | (Access << 14) | (Function << 2) | Method
-# with DeviceType=0x8000, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0.
+# with DeviceType=0x8000, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0,
+# FILE_READ_ACCESS=1, FILE_WRITE_ACCESS=2. KICK/SHUTDOWN mutate device
+# state and require FILE_WRITE_ACCESS so the I/O manager's access-check
+# passes on a GENERIC_WRITE-opened handle.
 function New-CtlCode {
     param([uint32]$DeviceType, [uint32]$Function, [uint32]$Method = 0, [uint32]$Access = 0)
     return ([uint32](($DeviceType -shl 16) -bor ($Access -shl 14) -bor ($Function -shl 2) -bor $Method))
@@ -133,15 +171,15 @@ function New-CtlCode {
 
 $GENERIC_READ_WRITE = 0xC0000000
 $OPEN_EXISTING      = 3
-$IOCTL_STATUS   = New-CtlCode -DeviceType 0x8000 -Function 0x801   # 0x80002004
-$IOCTL_KICK     = New-CtlCode -DeviceType 0x8000 -Function 0x802   # 0x80002008
-$IOCTL_SHUTDOWN = New-CtlCode -DeviceType 0x8000 -Function 0x803   # 0x8000200C
+$IOCTL_STATUS   = New-CtlCode -DeviceType 0x8000 -Function 0x801 -Access 0   # 0x80002004
+$IOCTL_KICK     = New-CtlCode -DeviceType 0x8000 -Function 0x802 -Access 2   # 0x8000A008
+$IOCTL_SHUTDOWN = New-CtlCode -DeviceType 0x8000 -Function 0x803 -Access 2   # 0x8000A00C
 
 # Self-check: re-derive and assert. A mistyped literal here cost us a
 # watchdog kick in an earlier revision -- never again.
 if ($IOCTL_STATUS   -ne 0x80002004) { throw ("IOCTL_STATUS   recompute mismatch: 0x{0:X}" -f $IOCTL_STATUS) }
-if ($IOCTL_KICK     -ne 0x80002008) { throw ("IOCTL_KICK     recompute mismatch: 0x{0:X}" -f $IOCTL_KICK) }
-if ($IOCTL_SHUTDOWN -ne 0x8000200C) { throw ("IOCTL_SHUTDOWN recompute mismatch: 0x{0:X}" -f $IOCTL_SHUTDOWN) }
+if ($IOCTL_KICK     -ne 0x8000A008) { throw ("IOCTL_KICK     recompute mismatch: 0x{0:X}" -f $IOCTL_KICK) }
+if ($IOCTL_SHUTDOWN -ne 0x8000A00C) { throw ("IOCTL_SHUTDOWN recompute mismatch: 0x{0:X}" -f $IOCTL_SHUTDOWN) }
 
 $h = [TheChamber.Pinvoke+Native]::CreateFile(
     $symlink, $GENERIC_READ_WRITE, 0,
