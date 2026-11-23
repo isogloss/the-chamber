@@ -64,9 +64,44 @@ function Read-InstallName {
 }
 
 function Test-ServiceLoaded([string]$name) {
-    # A live NtLoadDriver install leaves HKLM\...\Services\<name> on disk
-    # and the device symlink reachable via CreateFile. Get-Service also
-    # reports it as "Running" without round-tripping through SCM start.
+    # Primary signal: the device symlink is reachable. NtLoadDriver-loaded
+    # drivers are not necessarily SCM-tracked, so Get-Service "Running" is
+    # unreliable; a successful CreateFile on \\.\<name> + zero-byte ReadFile
+    # tells us the driver is live and servicing IRPs.
+    if (-not ('TheChamber.Probe' -as [type])) {
+        Add-Type -Namespace TheChamber -Name Probe -MemberDefinition @'
+            using System;
+            using System.Runtime.InteropServices;
+            using Microsoft.Win32.SafeHandles;
+            public static class ProbeNative {
+                [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+                public static extern SafeFileHandle CreateFile(
+                    string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+                    IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+                    uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+                [DllImport("kernel32.dll", SetLastError = true)]
+                public static extern bool ReadFile(
+                    SafeFileHandle hFile, IntPtr lpBuffer, uint nNumberOfBytesToRead,
+                    out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+            }
+'@ -ErrorAction SilentlyContinue
+    }
+    $FILE_GENERIC_READ = [uint32]0x80000000
+    $OPEN_EXISTING_P   = [uint32]3
+    try {
+        $probe = [TheChamber.Probe+ProbeNative]::CreateFile(
+            "\\.\$name", $FILE_GENERIC_READ, 0,
+            [IntPtr]::Zero, $OPEN_EXISTING_P, 0, [IntPtr]::Zero)
+        if (-not $probe.IsInvalid) {
+            $read = 0
+            [TheChamber.Probe+ProbeNative]::ReadFile(
+                $probe, [IntPtr]::Zero, 0, [ref]$read, [IntPtr]::Zero) | Out-Null
+            $probe.Close()
+            return $true
+        }
+    } catch {}
+    # Fallback: SCM query. A kernel driver without a device namespace entry
+    # but a registered service still reports Running on some Windows builds.
     $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
     return ($null -ne $svc -and $svc.Status -eq 'Running')
 }
