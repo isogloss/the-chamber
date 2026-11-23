@@ -289,7 +289,13 @@ NTSTATUS npt_init(void)
     /* Legacy MMIO holes in the first 2 MB: install a dedicated 2 MB UC
      * leaf at frame 0 so VGA (0xA0000-0xBFFFF) and the ROM shadow
      * (0xC0000-0xFFFFF) are reachable with the correct cache attribute
-     * instead of either being unmapped or covered by a WB leaf. */
+     * instead of either being unmapped or covered by a WB leaf.
+     *
+     * Master plan 2.6 ideally splits VGA (UC+Writable) from ROM shadow
+     * (UC+ReadOnly). A 2 MB large page cannot represent that split, so
+     * this leaf maps both regions UC+Writable as a passive-dump
+     * compromise. Splitting into 4 KB leaves to differentiate attributes
+     * is a future enhancement, not a Phase 1 requirement. */
     {
         NPT_PDPT_SLOT *slot = npt_ensure_pdpt(0);
         if (slot != NULL) {
