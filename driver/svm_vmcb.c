@@ -314,7 +314,17 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
     ctl->intercept_vec3 |= IVEC3_CPUID | IVEC3_MSR | IVEC3_RDPMC;
 
     /* AMD 15.9 / 15.5.1: VMRUN must be intercepted; VMMCALL is the guest ->
-     * host hypercall path (intercept vector 4). */
+     * host hypercall path (intercept vector 4).
+     *
+     * Deliberately NOT intercepted: VMLOAD, VMSAVE, CLGI, STGI, INVLPGA,
+     * SKINIT, ICEBP, WBINVD, MONITOR, MWAIT, MWAIT_COND, XSETBV. Bare-metal
+     * Zen 4 with SVM available delivers #GP(0) on each of these at CPL > 0
+     * (XSETBV also faults on OSXSAVE=0); #UD only when SVM is unavailable
+     * or EFER.SVME is clear. Letting hardware deliver the fault matches
+     * what a probe at CPL 3 would see on a bare-metal box. OR'ing any of
+     * the IVEC4_VMLOAD/VMSAVE/CLGI/STGI/SKINIT/MONITOR/MWAIT/MWAIT_COND/
+     * XSETBV bits here would create a VMEXIT where bare metal would have
+     * delivered a fault at the trojan instruction. Don't add them. */
     ctl->intercept_vec4 |= IVEC4_VMRUN | IVEC4_VMMCALL;
 
     /* No DR intercepts.  Phase 6.3 HW-breakpoint capture is out of scope
