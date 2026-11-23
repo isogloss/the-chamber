@@ -200,6 +200,14 @@ typedef struct _VMCB_STATE_SAVE_AREA {
 } VMCB_STATE_SAVE_AREA;
 
 C_ASSERT(sizeof(VMCB_STATE_SAVE_AREA) == 0x400);
+/* VMRUN auto-saves CR0/CR2/CR3/CR4 into the state-save area at the
+ * offsets below. CR2 is not grouped with the other three. If any of
+ * these offsets drifts, a guest that observes its own CR state through
+ * these fields sees the wrong value and VMRUN consistency checks fail. */
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, cr4) == 0x148);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, cr3) == 0x150);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, cr0) == 0x158);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, cr2) == 0x240);
 
 typedef struct _VMCB {
     VMCB_CONTROL_AREA ctl;
