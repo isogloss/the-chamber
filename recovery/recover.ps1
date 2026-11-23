@@ -78,7 +78,7 @@ if (Test-Path -LiteralPath $stateFile) {
 # System32\drivers whose basename is 10 lowercase-alnum chars starting
 # with a letter and whose bytes contain CHAMBER_CFG magic (0x5F474643),
 # treat it as a chamber install and unload / clean it up.
-$magicBytes = [byte[]](0x43, 0x46, 0x47, 0x5F)  # "CFG_" little-endian = 0x5F474643
+$magicBytes = [byte[]](0x43, 0x46, 0x47, 0x5F, 0x01, 0x00, 0x00, 0x00)  # "CFG_" + version 1 (LE)
 function Test-ChamberFingerprint {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
@@ -86,24 +86,28 @@ function Test-ChamberFingerprint {
         $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'Read')
         try {
             $buf = New-Object byte[] 8192
-            $prev = New-Object byte[] 4
+            $prev = New-Object byte[] 7
             while ($true) {
                 $n = $fs.Read($buf, 0, $buf.Length)
                 if ($n -le 0) { break }
-                # Join with trailing 3 bytes of previous chunk so a magic
-                # straddling the window boundary is still found.
-                $search = New-Object byte[] ($n + 3)
-                [Array]::Copy($prev, 0, $search, 0, 3)
-                [Array]::Copy($buf, 0, $search, 3, $n)
-                for ($i = 0; $i -le $search.Length - 4; $i++) {
+                # Join with trailing 7 bytes of previous chunk so an 8-byte
+                # magic straddling the window boundary is still found.
+                $search = New-Object byte[] ($n + 7)
+                [Array]::Copy($prev, 0, $search, 0, 7)
+                [Array]::Copy($buf, 0, $search, 7, $n)
+                for ($i = 0; $i -le $search.Length - 8; $i++) {
                     if ($search[$i]   -eq $magicBytes[0] -and
                         $search[$i+1] -eq $magicBytes[1] -and
                         $search[$i+2] -eq $magicBytes[2] -and
-                        $search[$i+3] -eq $magicBytes[3]) {
+                        $search[$i+3] -eq $magicBytes[3] -and
+                        $search[$i+4] -eq $magicBytes[4] -and
+                        $search[$i+5] -eq $magicBytes[5] -and
+                        $search[$i+6] -eq $magicBytes[6] -and
+                        $search[$i+7] -eq $magicBytes[7]) {
                         return $true
                     }
                 }
-                [Array]::Copy($buf, [math]::Max(0, $n - 3), $prev, 0, [math]::Min(3, $n))
+                [Array]::Copy($buf, [math]::Max(0, $n - 7), $prev, 0, [math]::Min(7, $n))
             }
             return $false
         } finally {
