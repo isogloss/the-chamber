@@ -152,8 +152,11 @@ NTSTATUS svm_init_all_cpus(void) {
 
 static VOID svm_offline_cpu(PER_CPU_CTX *ctx) {
     InterlockedExchange(&ctx->shutdown_requested, 1);
-    __writemsr(SVM_MSR_EFER, __readmsr(SVM_MSR_EFER) & ~EFER_SVME);
+    /* AMD APM Appendix B: WRMSR to VM_HSAVE_PA with EFER.SVME=0 raises
+     * #GP(0).  Zero VM_HSAVE_PA FIRST (while SVME is still set), then
+     * clear SVME.  Matches Linux KVM's cpu_svm_disable sequence. */
     __writemsr(SVM_MSR_VM_HSAVE_PA, 0);
+    __writemsr(SVM_MSR_EFER, __readmsr(SVM_MSR_EFER) & ~EFER_SVME);
     ctx->active = FALSE;
 }
 
@@ -173,6 +176,15 @@ static VOID svm_free_cpu(PER_CPU_CTX *ctx) {
 NTSTATUS svm_shutdown_all_cpus(void) {
     ULONG i;
     if (!g_cpu_ctx) return STATUS_SUCCESS;
+
+    /* Cooperative shutdown: GIF=0 on the host side between VMEXIT and
+     * the next VMRUN blocks IPIs.  Setting shutdown_requested on every
+     * CPU FIRST lets each CPU exit its vmrun loop on its own next
+     * VMEXIT and fall out to host_done (which issues STGI), so the
+     * IPI broadcast below is deliverable. */
+    for (i = 0; i < g_cpu_count; i++) {
+        InterlockedExchange(&g_cpu_ctx[i].shutdown_requested, 1);
+    }
 
     KeIpiGenericCall((PKIPI_BROADCAST_WORKER)ipi_offline, 0);
 
