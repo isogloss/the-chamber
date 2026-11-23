@@ -1,0 +1,52 @@
+; the_chamber.inx -- INF for THE_CHAMBER AMD SVM ring-0 instrumentation driver.
+; Version-1 class INF for a software-only device. Service installed as
+; SERVICE_KERNEL_DRIVER + SERVICE_DEMAND_START so it never auto-loads at boot.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = 11/22/2026,1.0.0.0
+CatalogFile = the_chamber.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+winhvmon.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+; Software-only pseudo-device -- there is no hardware to enumerate.
+%DeviceDescription% = THE_CHAMBER_Install, ROOT\THE_CHAMBER
+
+[THE_CHAMBER_Install.NT]
+CopyFiles = THE_CHAMBER_Copy
+
+[THE_CHAMBER_Copy]
+winhvmon.sys
+
+[THE_CHAMBER_Install.NT.Services]
+AddService = the_chamber, 0x00000002, THE_CHAMBER_Service
+
+[THE_CHAMBER_Service]
+DisplayName   = %ServiceDescription%
+Description   = %ServiceDescription%
+ServiceType   = 1       ; SERVICE_KERNEL_DRIVER
+StartType     = 3       ; SERVICE_DEMAND_START
+ErrorControl  = 1       ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\winhvmon.sys
+
+[Strings]
+ProviderName       = "THE_CHAMBER"
+ManufacturerName   = "THE_CHAMBER"
+DeviceDescription  = "THE_CHAMBER SVM Instrumentation"
+ServiceDescription = "THE_CHAMBER SVM Instrumentation Service"
+DiskName           = "THE_CHAMBER Install Disk"

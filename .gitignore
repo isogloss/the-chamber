@@ -1,0 +1,48 @@
+# Build artifacts
+build/obj/
+build/*.obj
+*.obj
+*.o
+
+# Compiled driver binaries
+*.sys
+*.pdb
+driver/the_chamber.sys
+driver/the_chamber.pdb
+driver/winhvmon.sys
+driver/winhvmon.pdb
+
+# WDK intermediate
+*.cat
+*.inf.bak
+
+# Logs
+logs/*.log
+logs/*.err
+*.log
+*.err
+
+# Signing material — NEVER COMMIT
+recovery/*.pfx
+recovery/*.key
+recovery/*.pvk
+recovery/*.p12
+*.pfx
+*.key
+*.pvk
+*.p12
+
+# Test certs (public portion only — decide per-file, default exclude)
+recovery/*.cer
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
+*.swp
+*~
+.vs/
+.vscode/
+*.user
+
+# BCD snapshots (machine-specific)
+recovery/*.bcd
