@@ -19,8 +19,11 @@ namespace TheChamber;
 ///   3. Query BCD state (testsigning, HVCI). Offer to flip if blocked.
 ///   4. Load persisted seed or mint one (user action only; see SeedService).
 ///   5. Open the Randomize modal; user hits Proceed.
-///   6. Extract embedded driver, patch CHAMBER_CFG v2, write to Program Files.
-///   7. NtLoadDriver, open device, swap to the Operator window.
+///   6. Extract both embedded drivers, patch CHAMBER_CFG v2, re-sign,
+///      write to Program Files.
+///   7. NtLoadDriver the HV driver first, then NtLoadDriver the
+///      fingerprint driver (reads the same CFG blob from registry).
+///   8. Open HV device, swap to the Operator window.
 /// </summary>
 public partial class App : Application
 {
@@ -162,20 +165,37 @@ public partial class App : Application
         await _seed.SaveAsync().ConfigureAwait(true);
 
         _splash.SetStatus("patching driver image");
-        var driverBytes = LoadEmbeddedDriverOrPlaceholder("TheChamber.Drivers.the_chamber.sys");
+        var hvBytes = LoadEmbeddedDriverOrPlaceholder("TheChamber.Drivers.the_chamber.sys");
+        var fpBytes = LoadEmbeddedDriverOrPlaceholder("TheChamber.Drivers.chamber_fingerprint.sys");
         var derived = _seed.DeriveAll();
         var targetPath = _patcher.ComputeTargetPath(derived.ServiceName);
 
-        // deferred: when the real driver is embedded by the final packaging
-        // wave we still expect this call to find the magic; until then the
-        // call falls through to a no-op scan and writes the bytes unchanged.
-        var written = await _patcher
-            .PatchAndWriteAsync(driverBytes, derived, targetPath)
+        // Patch HV driver. Returns both the path and the 632-byte CFG blob
+        // (byte-exact) so the second driver can be arranged to read the
+        // same bytes from its own Parameters\CfgBlob value.
+        var hvResult = await _patcher
+            .PatchAndWriteAsync(hvBytes, derived, targetPath)
+            .ConfigureAwait(true);
+        await _patcher.ResignAsync(hvResult.Path).ConfigureAwait(true);
+
+        // Fingerprint driver: distinct service name (seed-derived so each
+        // install differs). The on-disk filename reuses the fingerprint
+        // service name for symmetry with the_chamber.sys path layout.
+        var fpServiceName = _seed.DeriveFingerprintServiceName();
+        var fpTargetPath = _patcher.ComputeTargetPath(fpServiceName);
+        var fpResult = await _patcher
+            .PatchAndWriteAsync(fpBytes, derived, fpTargetPath)
+            .ConfigureAwait(true);
+        await _patcher.ResignAsync(fpResult.Path).ConfigureAwait(true);
+
+        _splash.SetStatus("loading hv driver");
+        var device = await _loader
+            .InstallAndLoadAsync(derived.ServiceName, hvResult.Path, derived.DeviceSuffix)
             .ConfigureAwait(true);
 
-        _splash.SetStatus("loading driver");
-        var device = await _loader
-            .InstallAndLoadAsync(derived.ServiceName, written, derived.DeviceSuffix)
+        _splash.SetStatus("loading fingerprint driver");
+        await _loader
+            .InstallAndLoadFingerprintAsync(fpServiceName, fpResult.Path, fpResult.CfgBlob)
             .ConfigureAwait(true);
 
         _splash.SetStatus("live");
