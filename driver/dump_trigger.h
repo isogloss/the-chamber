@@ -37,18 +37,21 @@
  *
  * Implementation notes:
  *
- * NPT edits are performed through npt_hide_range at the 2 MB
- * granularity -- the only published API that clears a PDE's P/W/U
- * bits. Clearing all three makes any access through the PDE fault,
- * not only writes or executes: the trigger then consults exit_info_1
- * on the fault (ID bit 4 for instruction fetch, W/R bit 1 for write)
- * to decide whether this fault was the one the trigger cared about.
- * If the fault bits do not match the trigger kind, the trigger
- * transparently re-maps the page via npt_map_page so the access
- * completes without the guest observing a spurious fault.
+ * NPT edits use npt_map_page with flags=0 at the 2 MB granularity so
+ * the PDE is written with no P/W/U set (and no NX bit since the
+ * 12-bit flag mask cannot reach bit 63). The next access through
+ * the PDE faults, regardless of its class. The NPF handler then
+ * consults exit_info_1 (ID bit 4 for instruction fetch, W/R bit 1
+ * for write) to decide whether this fault was the one the trigger
+ * cared about; otherwise it silently re-maps and lets the guest
+ * retry.
+ *
+ * npt_hide_range is deliberately NOT used because it stashes GPAs
+ * in the HV-introspection hide side table -- handle_npf would then
+ * inject #PF instead of handing the fault to the trigger module.
  *
  * This keeps the trigger module inside the Wave-6 scope (driver/npt.c
- * is unchanged). A follow-up pass that exposes per-permission PDE
+ * is unchanged). A follow-up pass that exposed per-permission PDE
  * edits in npt.c would let WX and WRITE_THRESHOLD trap only the
  * relevant access class directly.
  */
