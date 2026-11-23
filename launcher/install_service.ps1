@@ -26,11 +26,25 @@
 
 $ErrorActionPreference = 'Stop'
 
-$gate = 'C:\Users\lkhnj\Downloads\testbench\gpu_spoof\_safety_gate.ps1'
-if (Test-Path $gate) {
-    . $gate
-    Assert-NoAntiCheatRunning
+# --- Safety gate ---
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot  = Split-Path -Parent $scriptDir
+$gateCandidates = @(
+    (Join-Path $repoRoot 'pentest\_safety_gate.ps1'),
+    'C:\THE_CHAMBER\pentest\_safety_gate.ps1',
+    'C:\Users\lkhnj\Downloads\testbench\gpu_spoof\_safety_gate.ps1'
+)
+$gate = $gateCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $gate) {
+    Write-Host "Safety gate not found; refusing to install." -ForegroundColor Red
+    exit 1
 }
+. $gate
+if (-not (Get-Command Assert-NoAntiCheatRunning -ErrorAction SilentlyContinue)) {
+    Write-Host "Safety gate loaded but Assert-NoAntiCheatRunning is undefined; refusing to install." -ForegroundColor Red
+    exit 1
+}
+Assert-NoAntiCheatRunning
 
 # ---- Elevation ----
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -66,6 +80,14 @@ function New-RandomName {
 
 $randName = New-RandomName
 $dstSys   = "$env:SystemRoot\System32\drivers\$randName.sys"
+
+# ---- copy + patch + sign gate ----
+# Track whether the re-sign step fully succeeded. The outer try/finally
+# removes the dropped .sys if we leave with $signSucceeded = $false, so
+# a mid-sequence throw never leaves a patched-unsigned driver lingering
+# in System32\drivers.
+$signSucceeded = $false
+try {
 
 Copy-Item $srcSys $dstSys -Force
 Write-Host "Installed as $dstSys" -ForegroundColor Cyan
@@ -151,6 +173,18 @@ if (-not $signtool) { throw "signtool.exe not found" }
 Write-Host "Re-signing patched driver..." -ForegroundColor Cyan
 & $signtool.FullName sign /f $pfx /p 'build-test' /fd SHA256 $dstSys | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "signtool sign failed" }
+$signSucceeded = $true
+
+} finally {
+    # If we leave the copy+patch+sign sequence without signSucceeded=true,
+    # the dropped .sys is an unsigned (or signature-stripped) kernel driver
+    # sitting in System32\drivers; remove it so repeated failed installs
+    # don't accumulate.
+    if (-not $signSucceeded -and (Test-Path -LiteralPath $dstSys)) {
+        Remove-Item -LiteralPath $dstSys -Force -ErrorAction SilentlyContinue
+        Write-Host "Removed un-signed intermediate driver: $dstSys" -ForegroundColor DarkYellow
+    }
+}
 
 # ---- Write the registry service key directly (no sc.exe) ----
 $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$randName"
