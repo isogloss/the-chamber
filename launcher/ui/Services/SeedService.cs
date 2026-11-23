@@ -122,6 +122,24 @@ public sealed class SeedService
     public void BumpHvSalt() => _hvSalt++;
 
     /// <summary>
+    /// Overwrite the master seed from a 64-char hex string; resets both
+    /// group salts to zero (an external seed carries no salt history).
+    /// Returns false if <paramref name="hex"/> is not exactly 32 bytes.
+    /// </summary>
+    public bool SetSeedHex(string hex)
+    {
+        if (hex is null || hex.Length != 64) return false;
+        byte[] parsed;
+        try { parsed = Convert.FromHexString(hex); }
+        catch (FormatException) { return false; }
+        if (parsed.Length != SeedLen) return false;
+        Array.Copy(parsed, _seed, SeedLen);
+        _identitySalt = 0;
+        _hvSalt = 0;
+        return true;
+    }
+
+    /// <summary>
     /// Pure derive: out = SHA256(seed || field) truncated/extended with
     /// chained SHA256(h_i || "continue") to outlen bytes.
     /// </summary>
