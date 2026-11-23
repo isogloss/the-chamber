@@ -196,6 +196,11 @@ public sealed class SeedService
     {
         var d = new DerivedIdentity();
 
+        // Copy the master seed into the derived identity so CfgPatcher can
+        // write it into CHAMBER_CFG_V2.seed[32]. The HV's identity_apply
+        // derives CPU identity from that slot directly.
+        d.Seed = (byte[])_seed.Clone();
+
         // --- HV identity (group "hv") ---
         d.ServiceName = DeriveServiceName();
         d.DeviceSuffix = DeriveDeviceSuffix();
@@ -481,11 +486,17 @@ public sealed class SeedService
         return pool[raw[0] % pool.Length];
     }
 
-    // --- Pools, verbatim per design Section 4.3 ---
+    // --- Pools. DonorPool MUST be byte-identical to driver/stealth.c
+    //     DONOR_POOL[] because RenameDonorIndex is a single uint8 and the
+    //     driver indexes its own pool by the same number. The prior
+    //     user-mode-exe names (winlogon.sys, lsass.sys, ...) resolved to
+    //     the wrong donor on the driver side, so the UI showed the
+    //     operator a name the sample would never see. These are the real
+    //     boot-critical kernel-mode modules. ---
     public static readonly string[] DonorPool =
     {
-        "winlogon.sys", "spoolsv.sys", "lsass.sys", "svchost.sys",
-        "services.sys", "csrss.sys", "smss.sys", "wininit.sys",
+        "pci.sys", "acpi.sys", "msrpc.sys", "storport.sys",
+        "tcpip.sys", "ndis.sys", "disk.sys", "partmgr.sys",
     };
 
     public static readonly string[] CpuBrandPoolAmd =

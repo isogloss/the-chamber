@@ -169,12 +169,16 @@ public sealed class CfgPatcher
 
     private static void WriteFields(Span<byte> cfg, DerivedIdentity id)
     {
-        // The seed itself: we don't ship it into the kernel (the driver
-        // only reads already-expanded fields), but the format reserves the
-        // slot and we fill it with a deterministic marker so a crash dump
-        // can carry it. Zeros are also fine; we stick with zeros to avoid
-        // leaking the master seed into the kernel image.
-        cfg.Slice(OffSeed, 32).Clear();
+        // Master seed copied into the kernel image. identity_apply in
+        // driver/identity.c derives CPU-identity values (cpu_signature,
+        // microcode_rev, platform_id, TSC ratio/freq, APIC ID base,
+        // extended feature bits, per-vCPU TSC_AUX) from this slot via
+        // chamber_derive. Zeroing it would stop those fields from
+        // varying across randomize -- the whole point of the seed.
+        if (id.Seed.Length != 32)
+            throw new InvalidOperationException(
+                $"DerivedIdentity.Seed must be 32 bytes; got {id.Seed.Length}");
+        id.Seed.AsSpan().CopyTo(cfg.Slice(OffSeed, 32));
 
         BinaryPrimitives.WriteUInt32LittleEndian(cfg.Slice(OffToggles), id.Toggles);
 

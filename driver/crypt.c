@@ -173,18 +173,21 @@ void chamber_derive(const chamber_u8 seed[32],
                     chamber_u8      *outbuf,
                     chamber_size     outlen)
 {
-    chamber_u8   buf[64];
+    /* buf must hold seed(32) + full field name. C# SeedService.DeriveRaw
+     * applies no truncation; keep 224 bytes free for composed names of
+     * the form 'g1:<group>.<salt>:<field>' which can exceed 32 chars
+     * once group salts grow into double digits. If a future caller passes
+     * a longer field, the final SHA-256 falls back to truncate-at-buf. */
+    chamber_u8   buf[256];
     chamber_u8   h[32];
     chamber_size flen = field_len(field);
     chamber_size pos, copy, i;
     static const char CONTINUE_TAG[] = "continue";
     const chamber_size ctag_len = sizeof(CONTINUE_TAG) - 1;
 
-    /* First block: seed(32) || field_name. Overflow-guard against
-     * fields longer than 32 bytes of ASCII by truncating (never called
-     * with such a long field; design uses short names). */
+    /* First block: seed(32) || field_name. */
     for (i = 0; i < 32; i++) buf[i] = seed[i];
-    chamber_size take = (flen > 32) ? 32 : flen;
+    chamber_size take = (flen > sizeof(buf) - 32) ? sizeof(buf) - 32 : flen;
     for (i = 0; i < take; i++) buf[32 + i] = (chamber_u8)field[i];
     chamber_sha256(buf, 32 + take, h);
 

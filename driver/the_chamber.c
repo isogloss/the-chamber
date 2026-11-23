@@ -781,8 +781,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
      * the live DRIVER_OBJECT BEFORE stealth_apply scrambles section
      * headers and zeros the PE prefix; DriverStart/DriverSize survive
      * stealth_apply, but doing this first keeps the hide pass agnostic
-     * to stealth internals. */
-    (void)npt_hide_hv_image(Driver->DriverStart, Driver->DriverSize);
+     * to stealth internals.
+     *
+     * The runtime toggle (CHAMBER_TOGGLE_HV_INTROSPECTION_RESIST) is
+     * also honoured -- an operator who left it off in the launcher UI
+     * gets the hide pass skipped even on a build that compiled it in. */
+    if (g_chamber_cfg_v2_valid &&
+        (g_chamber_cfg_v2.toggles & CHAMBER_TOGGLE_HV_INTROSPECTION_RESIST))
+    {
+        (void)npt_hide_hv_image(Driver->DriverStart, Driver->DriverSize);
+    }
 
     /* Phase 7.1 TLB flush: broadcast the ASID-flush request to every
      * per-CPU VMCB so stale (GVA, HPA) translations from before the

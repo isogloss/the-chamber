@@ -11,6 +11,14 @@ namespace TheChamber.Model;
 /// </summary>
 public sealed class DerivedIdentity
 {
+    // --- Master seed (byte-exact copy written to CHAMBER_CFG_V2.seed[32]).
+    // The HV driver's identity_apply derives CPU-identity values
+    // (cpu_signature, microcode_rev, platform_id, TSC ratio/freq, APIC ID
+    // base, ext_feat bits) directly from this seed via chamber_derive, so
+    // these fields would return constant bytes across randomize if the
+    // slot were zeroed. ---
+    public byte[] Seed { get; set; } = new byte[32];
+
     // --- HV identity ---
     public string ServiceName { get; set; } = "";
     public string DeviceSuffix { get; set; } = "";

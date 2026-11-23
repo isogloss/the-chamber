@@ -79,7 +79,14 @@ cfp_ic_trampoline PROC
         mov     r8,  gs:[1480h]             ; shim-stashed syscall number
         call    cfp_ic_dispatch
 
-        ; --- write rewritten return value back into saved rcx slot. ---
+        ; --- write rewritten return value into the saved RAX slot.
+        ; User-mode code after syscall reads the return from RAX (the
+        ; x64 syscall calling convention), NOT from RCX. Kernel places
+        ; the return in RCX on IC entry as a convenience for the
+        ; callback; we have to put the final value back in RAX before
+        ; jmp r10 or the caller reads scratch. Also mirror into the RCX
+        ; slot so anything inspecting both registers sees consistency. ---
+        mov     qword ptr [rbp + 32], rax
         mov     qword ptr [rbp + 40], rax
 
         ; --- teardown. ---
@@ -88,8 +95,8 @@ cfp_ic_trampoline PROC
         pop     rdi
         pop     rsi
         pop     rbx
-        pop     rax
-        pop     rcx                     ; rewritten return value
+        pop     rax                     ; rewritten return value (user-visible)
+        pop     rcx                     ; mirrored rewritten value
         pop     rdx
         pop     r8
         pop     r9
