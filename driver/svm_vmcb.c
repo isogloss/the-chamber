@@ -236,6 +236,16 @@ static void svm_ensure_bitmaps(void) {
                     /* TSC_RATIO: return 8.32 fixed-point 1.0 so a guest
                      * that queries it reads the hardware default. */
                     msrpm_set_intercept(b, 0xC0000104ULL);  /* TSC_RATIO */
+                    /* Seed-derived identity rewrites. */
+                    msrpm_set_intercept(b, 0x00000017ULL);  /* IA32_PLATFORM_ID */
+                    msrpm_set_intercept(b, 0x0000008BULL);  /* IA32_BIOS_SIGN_ID (patch level) */
+                    /* TSC_AUX is now intercepted so WRMSRs latch into the
+                     * per-vCPU identity table and RDMSRs serve the latch
+                     * instead of the host's physical TSC_AUX value. */
+                    msrpm_set_intercept(b, 0xC0000103ULL);  /* TSC_AUX */
+                    /* HWCR: a few bits are SVM state we hide; rewrite in
+                     * handle_msr. */
+                    msrpm_set_intercept(b, 0xC0010015ULL);  /* HWCR */
                     /* PMU: intercept every WRMSR to PerfEvtSelCoreN
                      * (even MSRs; odd PerfCtrCoreN stays passthrough and
                      * is shadowed inside the VMEXIT handler). Tracks
@@ -251,8 +261,6 @@ static void svm_ensure_bitmaps(void) {
                      *   0x48 SPEC_CTRL, 0x49 PRED_CMD       mitigation controls
                      *   0xE7 MPERF, 0xE8 APERF              frequency readouts
                      *   0x277 IA32_PAT                       guest-owned PAT
-                     *   0xC0000103 TSC_AUX                  RDTSCP tag
-                     *   0xC0010015 HWCR                     no SVM-state bits
                      *   0xC0010201/03/05/07/09/0B PerfCtrCore0..5
                      *   STAR/LSTAR/CSTAR/SFMASK/FS_BASE/GS_BASE/KernelGSBase
                      * handle_msr still services them when another exit
@@ -339,8 +347,16 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
     ctl->msrpm_base_pa = g_msrpm_pa;   /* AMD 15.11   MSR permission map  */
     ctl->iopm_base_pa  = g_iopm_pa;    /* AMD 15.10.2 I/O permission map  */
 
-    /* AMD 15.16.1: guest ASID must be non-zero for TLB tagging. */
-    ctl->guest_asid_tlb = 1;
+    /* AMD 15.16.1: guest ASID must be non-zero for TLB tagging. The
+     * seed picks a value in [0x1000, 0x7FFF] so the TLB-tag space seen
+     * by a profiling tool differs across reseeds. The value is masked
+     * to a safe range by identity_compute_all; if the blob carries 0
+     * (un-patched developer load) fall back to a non-zero default. */
+    {
+        ULONG asid = g_chamber_cfg_v2_valid ? g_chamber_cfg_v2.guest_asid : 1u;
+        if (asid == 0) asid = 1u;
+        ctl->guest_asid_tlb = asid;
+    }
 
     /* AMD 15.25.3: enable Nested Paging and install the NPT top-level table. */
     ctl->np_enable = NP_ENABLE;

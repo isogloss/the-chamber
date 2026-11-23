@@ -62,21 +62,119 @@
  * ----------------------------------------------------------------------- */
 
 #define CHAMBER_CFG_MAGIC_V1     0x5F474643UL   /* "CFG_" launcher marker */
+#define CHAMBER_CFG_MAGIC_V2     0x32474643UL   /* "CFG2" launcher marker */
 #define CHAMBER_CFG_DEVICE_MAX   64
 #define CHAMBER_CFG_SYMLINK_MAX  64
 #define CHAMBER_CFG_MARKER_MAX   128
 
+/* v1 struct kept for name compatibility; the .cfg section now holds the
+ * v2 blob and the v1 shape is no longer accepted at DriverEntry. */
 typedef struct _CHAMBER_CFG {
-    ULONG magic;                                 /* CHAMBER_CFG_MAGIC_V1 */
+    ULONG magic;
     ULONG version;
-    WCHAR device_path [CHAMBER_CFG_DEVICE_MAX];  /* L"\\Device\\<name>" */
-    WCHAR symlink_path[CHAMBER_CFG_SYMLINK_MAX]; /* L"\\DosDevices\\<name>" */
-    WCHAR marker_path [CHAMBER_CFG_MARKER_MAX];  /* L"\\??\\C:\\...\\<name>.dat" */
-    ULONG pool_tag_override;                     /* 0 => use CHAMBER_POOL_TAG */
+    WCHAR device_path [CHAMBER_CFG_DEVICE_MAX];
+    WCHAR symlink_path[CHAMBER_CFG_SYMLINK_MAX];
+    WCHAR marker_path [CHAMBER_CFG_MARKER_MAX];
+    ULONG pool_tag_override;
     ULONG reserved[16];
 } CHAMBER_CFG;
 
-extern CHAMBER_CFG g_chamber_cfg;
+/* ---- Seed-derived machine-identity config (v2) -----------------------
+ * Wire format is byte-exact: #pragma pack(1), little-endian, 632 bytes.
+ * The installer locates this blob in the on-disk .sys by scanning for
+ * (magic == 0x32474643 && version == 2 && total_length == 632) and
+ * overwrites it with seed-expanded values before signing. Every
+ * runtime-visible machine fingerprint comes from this blob or from
+ * iterated SHA-256 of the seed. The signing identity (cert + the
+ * embedded launcher cert) stays constant across reseeds. */
+
+/* Toggle bit positions in CHAMBER_CFG_V2.toggles. */
+#define CHAMBER_TOGGLE_CI_STATE_SPOOF         (1UL <<  0)
+#define CHAMBER_TOGGLE_MACHINE_IDENTITY_SPOOF (1UL <<  1)
+#define CHAMBER_TOGGLE_HV_INTROSPECTION_RESIST (1UL << 2)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_SVM       (1UL << 3)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_NPT       (1UL << 4)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_VMEXIT    (1UL << 5)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_DUMP      (1UL << 6)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_INTEGRITY (1UL << 7)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_DISPATCH  (1UL << 8)
+#define CHAMBER_TOGGLE_TPM_ABSENT_SPOOF             (1UL << 9)
+
+#define CHAMBER_CFG_V2_TOTAL_LENGTH  632
+
+#pragma pack(push, 1)
+typedef struct _CHAMBER_CFG_V2 {
+    /* Header */
+    ULONG     magic;                        /* off 0  */
+    ULONG     version;                      /* off 4  */
+    ULONG     total_length;                 /* off 8  */
+
+    /* Master seed */
+    UCHAR     seed[32];                     /* off 12 */
+
+    /* Toggles (bit-packed) */
+    ULONG     toggles;                      /* off 44 */
+
+    /* HV identity */
+    UCHAR     service_name[12];             /* off 48  */
+    UCHAR     device_suffix[12];            /* off 60  */
+    ULONG     pool_tag[6];                  /* off 72  : svm/npt/vmexit/dump/integrity/dispatch */
+    ULONGLONG vmmcall_magic;                /* off 96  */
+    ULONGLONG chamber_cfg_magic_override;   /* off 104 */
+    UCHAR     rename_donor_index;           /* off 112 */
+    UCHAR     _pad0[3];                     /* off 113 */
+    ULONG     guest_asid;                   /* off 116 */
+    ULONG     section_scramble_seed;        /* off 120 */
+    ULONGLONG driver_nonce;                 /* off 124 */
+
+    /* Machine identity */
+    UCHAR     computer_name[16];            /* off 132 */
+    UCHAR     machine_guid[16];             /* off 148 */
+    ULONGLONG install_date_filetime;        /* off 164 */
+    UCHAR     product_id[24];               /* off 172 */
+    UCHAR     digital_product_id[164];      /* off 196 */
+    UCHAR     cpu_brand_string[48];         /* off 360 */
+    UCHAR     smbios_system_uuid[16];       /* off 408 */
+    UCHAR     baseboard_serial[16];         /* off 424 */
+    UCHAR     chassis_serial[16];           /* off 440 */
+    UCHAR     bios_vendor[16];              /* off 456 */
+    UCHAR     bios_version[16];             /* off 472 */
+    UCHAR     mac_addrs[6][4];              /* off 488 */
+    UCHAR     disk_serials[20][4];          /* off 512 */
+    UCHAR     volume_serials[4][4];         /* off 592 */
+    ULONG     gpu_ven_dev;                  /* off 608 */
+    UCHAR     edid_nonce[16];               /* off 612 */
+
+    /* Tail pad to 8-aligned total length */
+    UCHAR     _tail_pad[4];                 /* off 628 */
+} CHAMBER_CFG_V2;
+#pragma pack(pop)
+C_ASSERT(sizeof(CHAMBER_CFG_V2) == CHAMBER_CFG_V2_TOTAL_LENGTH);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, seed)                == 12);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, toggles)             == 44);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, pool_tag)            == 72);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, vmmcall_magic)       == 96);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, rename_donor_index)  == 112);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, guest_asid)          == 116);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, driver_nonce)        == 124);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, computer_name)       == 132);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, cpu_brand_string)    == 360);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, mac_addrs)           == 488);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, disk_serials)        == 512);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, volume_serials)      == 592);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, gpu_ven_dev)         == 608);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, edid_nonce)          == 612);
+
+extern CHAMBER_CFG     g_chamber_cfg;         /* legacy wrapper; populated at init from v2 */
+extern CHAMBER_CFG_V2  g_chamber_cfg_v2;      /* authoritative seed-derived blob */
+extern BOOLEAN         g_chamber_cfg_v2_valid; /* TRUE after DriverEntry version probe */
+
+/* Agent C's fingerprint driver reads its own copy of CHAMBER_CFG_V2 from
+ * a service-parameters registry blob (see audit/wave4_design.md §7).
+ * TODO (Agent C): if a shared-memory hook is needed for runtime coordination
+ * between the HV driver and chamber_fingerprint.sys, declare it here and
+ * wire the implementation in a dedicated file; the HV side exposes only
+ * the v2 cfg through the launcher's patcher. */
 
 #define THE_CHAMBER_VERSION  0x00010000UL  /* 1.0.0 */
 #define WATCHDOG_TIMEOUT_MS  60000
