@@ -30,6 +30,7 @@
 #include "timing.h"
 #include "npt.h"
 #include "dump.h"
+#include "dump_trigger.h"
 #include "integrity.h"
 #include "identity.h"
 
@@ -770,6 +771,17 @@ static void handle_npf(PER_CPU_CTX *ctx, VMCB *vmcb)
     fault_gpa  = vmcb->ctl.exit_info_2;   /* GPA that caused the fault */
     fault_info = vmcb->ctl.exit_info_1;   /* fault error-code bits     */
     fault_page = fault_gpa & ~0xFFFULL;   /* 4 KiB alignment for lookup */
+
+    /* Passive-trigger routing. If the fault lands on a GPA that an
+     * armed dump trigger (WX / OEP / WRITE_THRESHOLD) staked out, the
+     * trigger module classifies the access via fault_info, re-maps
+     * the PDE so the instruction retry completes, and fires a dump
+     * when the access class matches the trigger kind. Returning TRUE
+     * means the fault is handled: do NOT advance RIP (fault-class
+     * exit) and do NOT fall through to npt_map_page below. */
+    if (dump_trigger_on_npf(vmcb, fault_gpa, fault_info)) {
+        return;
+    }
 
     mon = npt_monitor_find(fault_page);
     if (mon) {
