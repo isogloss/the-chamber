@@ -22,8 +22,11 @@
 ; write, before using R15 to hold ctx.
 ;
 ; Stack alignment: MS x64 ABI requires rsp mod 16 == 0 immediately before
-; CALL (so rsp mod 16 == 8 inside the callee).  After 8 pushes (rsp%16=8),
-; sub rsp,16 (rsp%16=8), sub rsp,40 (rsp%16=0) aligns correctly.
+; CALL (so rsp mod 16 == 8 inside the callee).  The vmrun loop runs on the
+; dedicated 16 KiB per-CPU host stack (allocated in svm_preallocate_cpu).
+; host_stack_top is 16-byte aligned; after sub rdx,16 for the ctx+scratch
+; frame, rsp%16 == 0 at the top of host_vmexit_loop.  `sub rsp,32` (shadow
+; space) keeps rsp%16 == 0 at each CALL.
 
 TIMING_HOST_INTERVAL_START EQU 192          ; offset 0xC0
 TIMING_HOST_INTERVAL_END   EQU 200          ; offset 0xC8
@@ -85,7 +88,7 @@ svm_launch PROC
     clgi
 
 host_vmexit_loop:
-    ; rsp = top of ctx frame.  rsp%16 == 8.
+    ; rsp = top of ctx frame on dedicated host stack.  rsp%16 == 0.
     mov r15, [rsp]                      ; r15 = ctx
 
     ; vmsave host_save_pa: save host hidden state (TR/LDTR, KernelGsBase,
@@ -110,13 +113,13 @@ host_vmexit_loop:
 
     ; Host-interval START captured right after vmrun returns, BEFORE
     ; vmsave + handler.  Preserve guest vmcb_pa in rax across rdtsc.
-    push rax                            ; [rsp]=guest vmcb_pa; rsp%16=0
+    push rax                            ; [rsp]=guest vmcb_pa; rsp%16=8
     lfence
     rdtsc
     shl rdx, 32
     or rax, rdx
     mov [r15 + TIMING_HOST_INTERVAL_START], rax
-    pop rax                             ; rsp%16=8; rax=guest vmcb_pa
+    pop rax                             ; rsp%16=0; rax=guest vmcb_pa
 
     ; vmsave guest hidden state back; vmload host hidden state for handler.
     vmsave rax                          ; vmsave guest_vmcb_pa
@@ -149,9 +152,9 @@ host_vmexit_loop:
     fxsave64 [rax]
 
     mov rcx, r15                        ; first arg = ctx
-    sub rsp, 40                         ; shadow + 8 pad for 16-byte align
+    sub rsp, 32                         ; shadow space (rsp%16 0->0 at CALL)
     call vmexit_handler
-    add rsp, 40
+    add rsp, 32
 
     mov r15, [rsp]                      ; reload ctx
 
@@ -171,9 +174,9 @@ host_vmexit_loop:
     mov [r15 + TIMING_HOST_INTERVAL_END], rax
 
     mov rcx, r15                        ; first arg = ctx
-    sub rsp, 40                         ; shadow + 8 pad for 16-byte align
+    sub rsp, 32                         ; shadow space (rsp%16 0->0 at CALL)
     call timing_update
-    add rsp, 40
+    add rsp, 32
     mov r15, [rsp]                      ; reload ctx after call
 
     lea rax, [r15 + FXSAVE_AREA]
