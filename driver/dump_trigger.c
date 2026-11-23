@@ -42,7 +42,9 @@
  * the composition note in dump.c). The kernel API prototypes and
  * MemoryBasicInformation enum are declared once in dump.c's prologue
  * and inherit into this file; redeclaring them here would create
- * duplicate-signature conflicts in the composed translation unit. */
+ * duplicate-signature conflicts in the composed translation unit.
+ * PsSetCreateProcessNotifyRoutineEx + PS_CREATE_NOTIFY_INFO come
+ * from ntddk.h which dump.c's prologue included. */
 #include "npt.h"
 #include "dump_trigger.h"
 
@@ -113,8 +115,44 @@ static volatile LONG g_trigger_outstanding = 0;
 
 static WORKER_THREAD_ROUTINE trigger_fire_worker;
 
+/* Process-exit callback. Walks the trigger registry and disarms every
+ * slot whose target_pid == exiting PID so a reused physical frame
+ * cannot produce a spurious trigger fire after the target dies. The
+ * callback runs at PASSIVE_LEVEL inside PsExitSpecialApc; KeAcquire-
+ * SpinLock to DISPATCH is fine. */
+static BOOLEAN g_trigger_notify_installed = FALSE;
+
+static VOID trigger_process_notify(PEPROCESS Process,
+                                    HANDLE ProcessId,
+                                    PPS_CREATE_NOTIFY_INFO CreateInfo)
+{
+    ULONG i;
+    KIRQL irql;
+    BOOLEAN any = FALSE;
+    ULONGLONG pid;
+
+    UNREFERENCED_PARAMETER(Process);
+    if (CreateInfo != NULL) return;        /* process start -- ignore */
+    if (!g_trigger_init) return;
+
+    pid = (ULONGLONG)(ULONG_PTR)ProcessId;
+
+    KeAcquireSpinLock(&g_trigger_lock, &irql);
+    for (i = 0; i < TRIGGER_MAX_ARMED; i++) {
+        if (!g_triggers[i].in_use) continue;
+        if (g_triggers[i].target_pid != pid) continue;
+        trigger_reset_slot_locked(&g_triggers[i]);
+        any = TRUE;
+    }
+    KeReleaseSpinLock(&g_trigger_lock, irql);
+
+    if (any) trigger_broadcast_tlb_flush();
+}
+
 NTSTATUS dump_trigger_init(void)
 {
+    NTSTATUS st;
+
     if (g_trigger_init) return STATUS_SUCCESS;
 
     g_triggers = (TRIGGER_STATE *)ExAllocatePool2(
@@ -126,6 +164,18 @@ NTSTATUS dump_trigger_init(void)
     KeInitializeSpinLock(&g_trigger_lock);
     g_trigger_outstanding = 0;
     g_trigger_init = TRUE;
+
+    /* Install the exit callback. Failure is non-fatal -- the trigger
+     * module still works, triggers just need manual disarm if the
+     * target goes away. */
+    st = PsSetCreateProcessNotifyRoutineEx(trigger_process_notify, FALSE);
+    if (NT_SUCCESS(st)) {
+        g_trigger_notify_installed = TRUE;
+    } else {
+        CHAMBER_LOG_WARN("PsSetCreateProcessNotifyRoutineEx failed 0x%08x; "
+                         "trigger auto-disarm on target exit disabled\n", st);
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -138,6 +188,13 @@ void dump_trigger_shutdown(void)
     ULONG waits = 0;
 
     if (!g_trigger_init) return;
+
+    /* Remove the exit callback first so it cannot race the slot
+     * teardown. Non-fatal on failure -- we proceed with disarm. */
+    if (g_trigger_notify_installed) {
+        (void)PsSetCreateProcessNotifyRoutineEx(trigger_process_notify, TRUE);
+        g_trigger_notify_installed = FALSE;
+    }
 
     KeAcquireSpinLock(&g_trigger_lock, &irql);
     for (i = 0; i < TRIGGER_MAX_ARMED; i++) {
