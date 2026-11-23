@@ -16,6 +16,7 @@
 #include "the_chamber.h"
 #include "stealth.h"
 #include "timing.h"
+#include <wdmsec.h>   /* IoCreateDeviceSecure + SDDL_DEVOBJ_SYS_ALL_ADM_ALL */
 
 CHAMBER_GLOBALS g_chamber;
 
@@ -85,6 +86,10 @@ static NTSTATUS crash_marker_present(BOOLEAN *out_present)
         st == STATUS_OBJECT_PATH_NOT_FOUND) {
         return STATUS_SUCCESS;
     }
+    /* Any other status (SHARING_VIOLATION, ACCESS_DENIED, IO_DEVICE_ERROR)
+     * is indeterminate: treat it as "present or unknown" so the load-time
+     * safety gate refuses rather than quietly proceeds. */
+    *out_present = TRUE;
     return st;
 }
 
@@ -247,7 +252,15 @@ static void scrub_service_key_name(PDRIVER_OBJECT Driver)
         skn->Buffer[i] = (WCHAR)(L'a' + ((seed >> 33) % 26));
     }
     if (chars > 0) skn->Buffer[chars - 1] = L'\0';
-    if (skn->Length >= sizeof(WCHAR)) skn->Length -= sizeof(WCHAR);
+    /* Recompute Length from the actual string we just wrote (chars - 1
+     * WCHARs of noise plus the NUL terminator at index chars - 1).  The
+     * previous blind `Length -= 2` mismatched readers that disagreed on
+     * whether the original Length counted the NUL. */
+    if (chars > 0) {
+        skn->Length = (USHORT)((chars - 1) * sizeof(WCHAR));
+    } else {
+        skn->Length = 0;
+    }
 }
 
 /* --- IRP handlers --- */
@@ -331,6 +344,11 @@ VOID UnloadRoutine(PDRIVER_OBJECT Driver)
     (void)stealth_revert(Driver);
 
     stop_watchdog();
+    /* KeRemoveQueueDpc does NOT wait for an in-flight DPC on another
+     * CPU; without this flush, a pending watchdog_dpc_routine may race
+     * svm_shutdown_all_cpus freeing g_cpu_ctx and write into freed
+     * pool. */
+    KeFlushQueuedDpcs();
 
     if (g_chamber.svm_initialized) {
         svm_shutdown_all_cpus();
@@ -386,10 +404,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
         return STATUS_INVALID_PARAMETER;
     }
 
-    /* Crash-marker safety: refuse to load if the previous session left one */
+    /* Crash-marker safety: refuse to load if the previous session left
+     * one, OR if the probe returned an indeterminate status (now
+     * surfaced as marker_present=TRUE so the safety gate fails closed). */
     st = crash_marker_present(&marker_present);
     if (!NT_SUCCESS(st)) {
-        CHAMBER_LOG_WARN("marker probe failed 0x%08x -- continuing\n", st);
+        CHAMBER_LOG_WARN("marker probe failed 0x%08x -- refusing\n", st);
     }
     if (marker_present) {
         CHAMBER_LOG_ERR("crash marker from previous session present -- "
@@ -403,19 +423,32 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
         return STATUS_NOT_SUPPORTED;
     }
 
-    /* Drop crash marker -- cleared again at end on success. If we crash
-     * between here and the end of DriverEntry, the marker survives and
-     * next boot refuses to load. */
-    (void)crash_marker_drop();
+    /* Drop crash marker -- cleared again at end on success. If we
+     * crash between here and the end of DriverEntry, the marker
+     * survives and next boot refuses to load. */
+    st = crash_marker_drop();
+    if (!NT_SUCCESS(st)) {
+        CHAMBER_LOG_ERR("crash_marker_drop failed 0x%08x -- refusing\n", st);
+        return st;
+    }
 
-    /* Device + symlink, both sourced from the patchable config blob. */
+    /* Device + symlink, both sourced from the patchable config blob.
+     * Use IoCreateDeviceSecure with SDDL_DEVOBJ_SYS_ALL_ADM_ALL so only
+     * SYSTEM and the Administrators group can open the device.  Pass a
+     * zero class GUID: the device class is driver-owned and the
+     * randomized Phase 1.7 names mean we can't share a stable GUID
+     * across installs. */
     RtlInitUnicodeString(&dev, g_chamber_cfg.device_path);
     RtlInitUnicodeString(&sym, g_chamber_cfg.symlink_path);
 
-    st = IoCreateDevice(Driver, 0, &dev, FILE_DEVICE_UNKNOWN,
-        FILE_DEVICE_SECURE_OPEN, FALSE, &device);
+    {
+        UNICODE_STRING sddl;
+        RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+        st = IoCreateDeviceSecure(Driver, 0, &dev, FILE_DEVICE_UNKNOWN,
+            FILE_DEVICE_SECURE_OPEN, FALSE, &sddl, NULL, &device);
+    }
     if (!NT_SUCCESS(st)) {
-        CHAMBER_LOG_ERR("IoCreateDevice failed 0x%08x\n", st);
+        CHAMBER_LOG_ERR("IoCreateDeviceSecure failed 0x%08x\n", st);
         goto fail;
     }
     g_chamber.device_object = device;
@@ -453,10 +486,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
     timing_calibrate();
 
     start_watchdog();
-    crash_marker_clear();  /* init complete -- next boot can load again */
 
-    /* Self-hide: rename our KLDR entry + null driver name. */
+    /* Self-hide: rename our KLDR entry + null driver name.  Keep the
+     * crash marker set across stealth_apply so a bugcheck from the
+     * KLDR walk leaves a next-boot refuse-to-load gate. */
     (void)stealth_apply(Driver);
+
+    crash_marker_clear();  /* init complete -- next boot can load again */
 
     CHAMBER_LOG("ready (cpus=%u)\n", g_cpu_count);
     return STATUS_SUCCESS;
