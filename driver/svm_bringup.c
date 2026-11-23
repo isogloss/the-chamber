@@ -71,7 +71,14 @@ static NTSTATUS svm_preallocate_cpu(ULONG cpu_index) {
      * memory the HV owns. Without this, VM_HSAVE_PA.host_rsp saves a
      * pointer into the loader thread's kernel stack, which the OS
      * reclaims for other calls after DriverEntry returns -- first
-     * VMEXIT then reads garbage.  16 KiB per CPU, 16-byte aligned. */
+     * VMEXIT then reads garbage.  16 KiB per CPU, 16-byte aligned.
+     *
+     * BIG POOL NOTE: 16 KiB > 4080 (POOL_BUDDY_MAX, ~PAGE_SIZE -
+     * POOL_HEADER_SIZE), so this allocation lands in the big-pool
+     * allocator and is enumerable via !bigpool / SystemBigPoolInformation.
+     * Pool-tag randomization alone does NOT hide it; the allocation
+     * size + address pattern remains identifiable. Accept the surface
+     * and keep the tag indistinguishable from common minifilter tags. */
     ctx->host_stack_size = 16 * 1024;
     ctx->host_stack_va   = ExAllocatePool2(
         POOL_FLAG_NON_PAGED, ctx->host_stack_size,
@@ -115,6 +122,12 @@ NTSTATUS svm_init_all_cpus(void) {
     g_cpu_count = KeQueryActiveProcessorCount(NULL);
     if (g_cpu_count == 0) return STATUS_UNSUCCESSFUL;
 
+    /* BIG POOL NOTE: PER_CPU_CTX is ~1 KiB/CPU; on a 7700X (16 logical
+     * CPUs) the array is ~16 KiB. Comfortably above POOL_BUDDY_MAX
+     * (~4080), so this allocation sits in big pool and is enumerable
+     * via !bigpool / SystemBigPoolInformation. No way around this -- a
+     * per-CPU array of variable size has to be a single allocation for
+     * cache-line adjacency. Accept the surface. */
     g_cpu_ctx = (PER_CPU_CTX *)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         sizeof(PER_CPU_CTX) * g_cpu_count,
