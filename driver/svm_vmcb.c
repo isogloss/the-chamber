@@ -245,7 +245,6 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
     /* AMD 15.5.1: guest RSP = top of this CPU's private host stack. */
     save->rsp = (ULONGLONG)((ULONG_PTR)ctx->host_stack_va + ctx->host_stack_size);
 
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-               "WinHvMon: VMCB built CPU %u (msrpm=%llx, iopm=%llx, n_cr3=%llx, rsp=%llx)\n",
-               ctx->cpu_index, g_msrpm_pa, g_iopm_pa, (ULONGLONG)ctl->n_cr3, save->rsp);
+    CHAMBER_LOG("VMCB built CPU %u (msrpm=%llx, iopm=%llx, n_cr3=%llx, rsp=%llx)\n",
+                ctx->cpu_index, g_msrpm_pa, g_iopm_pa, (ULONGLONG)ctl->n_cr3, save->rsp);
 }

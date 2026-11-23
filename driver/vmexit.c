@@ -15,6 +15,7 @@
 #include "the_chamber.h"
 #include "svm.h"
 #include "timing.h"
+#include "npt.h"
 
 volatile ULONGLONG g_vmexit_count = 0;
 
@@ -32,7 +33,6 @@ void vmexit_handler(PER_CPU_CTX *ctx)
     VMCB *vmcb;
     ULONGLONG exit_code;
 
-    timing_before_handler(ctx);
     InterlockedIncrement64((LONG64 *)&g_vmexit_count);
 
     vmcb = (VMCB *)ctx->vmcb_va;
@@ -56,15 +56,18 @@ void vmexit_handler(PER_CPU_CTX *ctx)
         break;
 
     default:
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                   "WinHvMon: unhandled VMEXIT code=%llx info1=%llx info2=%llx\n",
-                   exit_code, vmcb->ctl.exit_info_1, vmcb->ctl.exit_info_2);
+        CHAMBER_LOG("unhandled VMEXIT code=%llx info1=%llx info2=%llx\n",
+                    exit_code, vmcb->ctl.exit_info_1, vmcb->ctl.exit_info_2);
         vmcb->save.rip = vmcb->ctl.next_rip;
         break;
     }
 
-    /* Mask VMEXIT latency from guest-visible TSC. */
-    timing_after_vmexit(ctx);
+    /* Phase 1.2: no more per-handler timing hooks here. vmrun.asm captures
+     * the host-interval START right after `vmrun rax` returns (before
+     * vmsave) and the host-interval END just before the next `vmrun rax`
+     * (after any vmload); it then calls timing_update(ctx) which folds the
+     * delta plus g_fixed_vmexit_cost into the global accumulator and
+     * refreshes this CPU's VMCB tsc_offset. */
 }
 
 /* ------------------------------------------------------------------ */
@@ -84,8 +87,20 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
         regs[2] &= ~(1 << 31);
     }
 
-    if (leaf >= 0x40000000 && leaf <= 0x40000010) {
-        /* Hide the hypervisor CPUID vendor/feature range. */
+    if (leaf >= 0x40000000 && leaf <= 0x4FFFFFFF) {
+        /* Phase 1.1: widen the hypervisor-brand zero band to the full
+         * 0x40000000..0x4FFFFFFF reserved range.
+         *
+         * Rationale: the VMware/hypervisor convention is that this entire
+         * CPUID range is dedicated to hypervisor use. Mainstream hypervisors
+         * (Hyper-V, KVM, Xen, VMware, QEMU-KVM) all follow it, and AMD Zen 4
+         * bare metal returns all-zeros for every leaf in the band (observed
+         * behavior; not APM-mandated). VMAware and pafish probe specific
+         * leaves such as 0x40000080 and 0x40000100 that lie well above the
+         * previous 0x40000010 ceiling, which left a trivial detection vector:
+         * any non-zero value returned by the native host __cpuidex in that
+         * range would fingerprint us as a hypervisor. Zeroing the whole band
+         * mirrors bare-metal behavior and closes that gap. */
         regs[0] = 0;
         regs[1] = 0;
         regs[2] = 0;
@@ -97,6 +112,11 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
     ctx->gpr_save[2] = (ULONGLONG)(ULONG)regs[2]; /* ecx */
     ctx->gpr_save[3] = (ULONGLONG)(ULONG)regs[3]; /* edx */
 
+    /* CPUID is a DECODED intercept: next_rip is architecturally valid.
+     * On Zen 4 CPUID 8000_000A EDX bit 3 (NRIP_SAVE) is set, so the
+     * processor populates next_rip for this exit. See handle_npf() for
+     * the list of other exits where next_rip is valid and the full list
+     * of fault-class exits where it is NOT. */
     vmcb->save.rip = vmcb->ctl.next_rip;
 }
 
@@ -209,17 +229,57 @@ static void handle_vmmcall(PER_CPU_CTX *ctx, VMCB *vmcb)
 
 /* ------------------------------------------------------------------ */
 /* Nested page fault (AMD 15.19.1).                                   */
+/*                                                                    */
+/* NPF is a FAULT-class VMEXIT: the faulting instruction has not been */
+/* retired. The handler fixes the mapping (grants permissions, maps a */
+/* missing page) and returns WITHOUT advancing RIP so hardware retries */
+/* the same instruction. Previous code advanced RIP to next_rip -- that */
+/* is catastrophic for a fault: the guest would skip the faulting      */
+/* instruction, miss its intended side effects, and on a reread of the */
+/* same address re-fault at the same RIP -> infinite loop if the next  */
+/* instruction also accesses the unmapped page.                        */
+/*                                                                    */
+/* About next_rip (vmcb->ctl.next_rip, offset 0xC8): AMD APM Vol 2    */
+/* 15.9 restricts next_rip to the DECODED intercepts only -- CPUID,   */
+/* IN/OUT (IOIO), MSR access, VMMCALL, INVD, INVLPG, HLT, MONITOR,    */
+/* MWAIT, RDTSC and RDTSCP -- and only when the processor advertises  */
+/* NRIP_SAVE (CPUID 8000_000A EDX bit 3, a.k.a. "Decode Assists" on   */
+/* older silicon). For fault-class VMEXITs (NPF, #DB, #BP, #UD, #GP,  */
+/* #PF, SS, #NMI) next_rip is UNDEFINED and must not be read.         */
 /* ------------------------------------------------------------------ */
 
 static void handle_npf(PER_CPU_CTX *ctx, VMCB *vmcb)
 {
+    ULONGLONG fault_gpa;
+    ULONGLONG fault_info;
+    ULONGLONG fault_page;
+    NPT_MONITOR *mon;
+
     UNREFERENCED_PARAMETER(ctx);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "WinHvMon: NPF at PA=%llx info=%llx\n",
-               vmcb->ctl.exit_info_2, vmcb->ctl.exit_info_1);
+    fault_gpa  = vmcb->ctl.exit_info_2;   /* GPA that caused the fault */
+    fault_info = vmcb->ctl.exit_info_1;   /* fault error-code bits     */
+    fault_page = fault_gpa & ~0xFFFULL;   /* 4 KiB alignment for lookup */
 
-    vmcb->save.rip = vmcb->ctl.next_rip;
+    mon = npt_monitor_find(fault_page);
+    if (mon) {
+        /* Phase 6 real implementation; Phase 1.6 stub returns NULL so
+         * this path is dead. If a future caller matches a monitored
+         * page, the monitor does whatever it needs (toggle perms,
+         * single-step, log) and we retry -- NO rip advance. */
+        npt_monitor_handle_fault(mon, vmcb, fault_info);
+        return;
+    }
+
+    /* Grow the NPT on demand: install a 2 MB identity mapping covering
+     * the faulting guest-physical address. Phase 1 grants full
+     * Present|Writable|User permissions; Phase 6 may tighten this. */
+    (void)npt_map_page(fault_page, fault_page,
+                       NPT_PRESENT | NPT_WRITABLE | NPT_USER);
+
+    /* Do NOT advance RIP. Hardware retries the faulting instruction with
+     * the new mapping. vmcb->ctl.next_rip is undefined for NPF (see the
+     * block comment above) and must not be read here. */
 }
 
 /* ------------------------------------------------------------------ */
@@ -228,6 +288,5 @@ static void handle_npf(PER_CPU_CTX *ctx, VMCB *vmcb)
 
 void vmexit_cleanup(void)
 {
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "WinHvMon: final vmexit count = %llu\n", g_vmexit_count);
+    CHAMBER_LOG("final vmexit count = %llu\n", g_vmexit_count);
 }

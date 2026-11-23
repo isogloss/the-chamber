@@ -21,14 +21,12 @@ BOOLEAN svm_is_supported(void) {
 
     __cpuid(regs, (int)CPUID_EXT_FEATURES);
     if ((regs[2] & CPUID_SVM_BIT) == 0) {
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-                   "WinHvMon: SVM not reported by CPUID\n");
+        CHAMBER_LOG_ERR("SVM not reported by CPUID\n");
         return FALSE;
     }
     vm_cr = __readmsr(SVM_MSR_VM_CR);
     if (vm_cr & VM_CR_SVMDIS) {
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-                   "WinHvMon: SVM disabled by BIOS (VM_CR.SVMDIS=1)\n");
+        CHAMBER_LOG_ERR("SVM disabled by BIOS (VM_CR.SVMDIS=1)\n");
         return FALSE;
     }
     return TRUE;
@@ -112,14 +110,14 @@ NTSTATUS svm_init_all_cpus(void) {
     g_cpu_ctx = (PER_CPU_CTX *)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         sizeof(PER_CPU_CTX) * g_cpu_count,
-        THE_CHAMBER_POOL_TAG);
+        POOLTAG("per_cpu_ctx"));
     if (!g_cpu_ctx) return STATUS_INSUFFICIENT_RESOURCES;
     RtlZeroMemory(g_cpu_ctx, sizeof(PER_CPU_CTX) * g_cpu_count);
 
     /* PASSIVE_LEVEL: warm the shared MSRPM/IOPM bitmaps once. */
     st = svm_init_bitmaps();
     if (!NT_SUCCESS(st)) {
-        ExFreePoolWithTag(g_cpu_ctx, THE_CHAMBER_POOL_TAG);
+        ExFreePoolWithTag(g_cpu_ctx, POOLTAG("per_cpu_ctx"));
         g_cpu_ctx = NULL; g_cpu_count = 0;
         return st;
     }
@@ -128,8 +126,7 @@ NTSTATUS svm_init_all_cpus(void) {
     for (i = 0; i < g_cpu_count; i++) {
         st = svm_preallocate_cpu(i);
         if (!NT_SUCCESS(st)) {
-            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-                       "WinHvMon: pre-alloc failed on CPU %u (0x%x)\n", i, st);
+            CHAMBER_LOG_ERR("pre-alloc failed on CPU %u (0x%x)\n", i, st);
             (void)svm_shutdown_all_cpus();
             return st;
         }
@@ -141,15 +138,13 @@ NTSTATUS svm_init_all_cpus(void) {
     /* Verify every CPU came up. */
     for (i = 0; i < g_cpu_count; i++) {
         if (!g_cpu_ctx[i].active) {
-            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-                       "WinHvMon: CPU %u failed to activate\n", i);
+            CHAMBER_LOG_ERR("CPU %u failed to activate\n", i);
             (void)svm_shutdown_all_cpus();
             return STATUS_UNSUCCESSFUL;
         }
     }
 
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-               "WinHvMon: SVM initialized on %u CPUs\n", g_cpu_count);
+    CHAMBER_LOG("SVM initialized on %u CPUs\n", g_cpu_count);
     return STATUS_SUCCESS;
 }
 
@@ -185,9 +180,9 @@ NTSTATUS svm_shutdown_all_cpus(void) {
     for (i = 0; i < g_cpu_count; i++) svm_free_cpu(&g_cpu_ctx[i]);
 
     svm_free_bitmaps();
-    ExFreePoolWithTag(g_cpu_ctx, THE_CHAMBER_POOL_TAG);
+    ExFreePoolWithTag(g_cpu_ctx, POOLTAG("per_cpu_ctx"));
     g_cpu_ctx = NULL;
     g_cpu_count = 0;
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL, "WinHvMon: SVM shutdown complete\n");
+    CHAMBER_LOG("SVM shutdown complete\n");
     return STATUS_SUCCESS;
 }

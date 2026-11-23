@@ -371,6 +371,86 @@ NTSTATUS npt_hide_range(ULONGLONG start_pa, SIZE_T size)
     return status;
 }
 
+/* ------------------------------------------------------------------ */
+/* Phase 1.6: handle_npf fault-recovery path.                         */
+/*                                                                    */
+/* npt_init() identity-maps every range MmGetPhysicalMemoryRanges()   */
+/* reports. A guest access to RAM outside that reported set (e.g.     */
+/* firmware-reserved region revealed by a later ACPI walk) takes a    */
+/* Nested Page Fault. handle_npf() calls npt_map_page() here to       */
+/* grow the NPT on demand at the 2 MB PDE granularity and retries the */
+/* faulting instruction by NOT advancing RIP.                         */
+/* ------------------------------------------------------------------ */
+
+NTSTATUS npt_map_page(ULONGLONG gpa, ULONGLONG hpa, ULONGLONG flags)
+{
+    ULONGLONG gpa_2mb;
+    ULONGLONG hpa_2mb;
+    ULONG     pml4_i;
+    ULONG     pdpt_i;
+    ULONG     pd_i;
+    NPT_PDPT_SLOT *slot;
+    ULONGLONG *pd;
+    KIRQL     old_irql;
+
+    if (g_npt_pml4_va == NULL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    gpa_2mb = gpa & ~(NPT_PAGE_SIZE_2MB - 1);
+    hpa_2mb = hpa & ~(NPT_PAGE_SIZE_2MB - 1);
+    pml4_i  = (ULONG)((gpa_2mb >> 39) & 0x1FF);
+    pdpt_i  = (ULONG)((gpa_2mb >> 30) & 0x1FF);
+    pd_i    = (ULONG)((gpa_2mb >> 21) & 0x1FF);
+
+    /* The side table is guarded by g_npt_hide_lock to keep the PDPT /
+     * PD allocation and the final PDE write atomic against a concurrent
+     * npt_hide_range() / npt_unhide_range() on the same PDE. */
+    KeAcquireSpinLock(&g_npt_hide_lock, &old_irql);
+
+    slot = npt_ensure_pdpt(pml4_i);
+    if (slot == NULL) {
+        KeReleaseSpinLock(&g_npt_hide_lock, old_irql);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    pd = npt_ensure_pd(slot, pdpt_i);
+    if (pd == NULL) {
+        KeReleaseSpinLock(&g_npt_hide_lock, old_irql);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    /* 2 MB leaf PDE: frame | PS | caller-supplied perms. Drop any bits
+     * of `flags` above the low 12 that would collide with the PFN. */
+    pd[pd_i] = (hpa_2mb & ~0x1FFFFFULL) | NPT_LARGE_PS | (flags & 0xFFF);
+
+    KeReleaseSpinLock(&g_npt_hide_lock, old_irql);
+    return STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 1.6 NPT monitor stubs. Phase 6 replaces these with the real  */
+/* per-page execute-only / read-only / write-trap bookkeeping used    */
+/* for tracing specific guest-physical regions. For Phase 1 they      */
+/* always report "not monitored" so handle_npf() falls through to     */
+/* npt_map_page().                                                    */
+/* ------------------------------------------------------------------ */
+
+NPT_MONITOR *npt_monitor_find(ULONGLONG gpa_page)
+{
+    UNREFERENCED_PARAMETER(gpa_page);
+    return NULL;
+}
+
+void npt_monitor_handle_fault(NPT_MONITOR *mon,
+                              VMCB       *vmcb,
+                              ULONGLONG   fault_info)
+{
+    UNREFERENCED_PARAMETER(mon);
+    UNREFERENCED_PARAMETER(vmcb);
+    UNREFERENCED_PARAMETER(fault_info);
+}
+
 NTSTATUS npt_unhide_range(ULONGLONG start_pa, SIZE_T size)
 {
     ULONGLONG aligned_start;

