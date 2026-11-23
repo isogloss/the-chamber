@@ -31,6 +31,7 @@
 #include "npt.h"
 #include "dump.h"
 #include "integrity.h"
+#include "identity.h"
 
 volatile ULONGLONG g_vmexit_count = 0;
 
@@ -158,33 +159,159 @@ void vmexit_handler(PER_CPU_CTX *ctx)
 /* CPUID interception (AMD 15.8).                                     */
 /* ------------------------------------------------------------------ */
 
+/* TRUE when the launcher's seed-derived identity blob is live and the
+ * machine-identity spoof toggle is set. Guards every seed-driven
+ * CPUID rewrite path so an un-patched developer build still returns
+ * raw host values. */
+static BOOLEAN identity_rewrites_enabled(void)
+{
+    return g_chamber_cfg_v2_valid && g_identity_valid &&
+           ((g_chamber_cfg_v2.toggles &
+             CHAMBER_TOGGLE_MACHINE_IDENTITY_SPOOF) != 0);
+}
+
+/* Pack 16 bytes of the 48-byte cpu_brand_string into EAX/EBX/ECX/EDX for
+ * one of the three brand-string leaves (0x80000002..4). `slot` is the
+ * zero-based leaf offset: 0 for 0x80000002, 1 for 0x80000003, 2 for
+ * 0x80000004. Each of the four registers receives 4 consecutive bytes,
+ * little-endian (byte 0 goes in bits 7:0 of EAX). */
+static void brand_slot_to_regs(ULONG slot, int regs[4])
+{
+    const UCHAR *base = &g_chamber_cfg_v2.cpu_brand_string[slot * 16];
+    ULONG i, r;
+    for (r = 0; r < 4; r++) {
+        ULONG v = 0;
+        for (i = 0; i < 4; i++) {
+            v |= ((ULONG)base[r * 4 + i]) << (i * 8);
+        }
+        regs[r] = (int)v;
+    }
+}
+
+/* CPUID 0x1 EBX layout: EBX[31:24] initial APIC ID. */
+static void rewrite_leaf_1(PER_CPU_CTX *ctx, int regs[4])
+{
+    ULONG apic = identity_get_apic_id(ctx->cpu_index) & 0xFFu;
+    ULONG ebx = (ULONG)regs[1];
+    ebx = (ebx & 0x00FFFFFFu) | (apic << 24);
+    regs[1] = (int)ebx;
+    if (g_identity_cpu_signature) regs[0] = (int)g_identity_cpu_signature;
+    /* Clear the hypervisor-present bit (ECX[31]). */
+    regs[2] &= ~(1u << 31);
+}
+
+/* CPUID 0x7 subleaf 0: extended feature flags. Mask off bits that would
+ * leak uArch generation across the rewrite. For now we pass the host
+ * flags unchanged; a future pass can trim features that correlate with
+ * the chosen brand. */
+static void rewrite_leaf_7(int regs[4])
+{
+    (void)regs;
+}
+
+/* CPUID 0xB / 0x1F extended topology: EDX carries the x2APIC ID. */
+static void rewrite_leaf_topology(PER_CPU_CTX *ctx, int regs[4])
+{
+    regs[3] = (int)identity_get_x2apic_id(ctx->cpu_index);
+}
+
+/* CPUID 0x15 TSC/crystal ratio. */
+static void rewrite_leaf_15(int regs[4])
+{
+    regs[0] = (int)g_identity_tsc_denom;
+    regs[1] = (int)g_identity_tsc_numer;
+    regs[2] = (int)g_identity_tsc_crystal;
+    regs[3] = 0;
+}
+
+/* CPUID 0x16 processor frequency fields (MHz). */
+static void rewrite_leaf_16(int regs[4])
+{
+    regs[0] = (int)(g_identity_cpu_base_mhz & 0xFFFFu);
+    regs[1] = (int)(g_identity_cpu_max_mhz  & 0xFFFFu);
+    regs[2] = (int)(g_identity_cpu_bus_mhz  & 0xFFFFu);
+    regs[3] = 0;
+}
+
+/* CPUID 0x80000001 extended feature flags: overlay seed-derived ECX/EDX
+ * bits onto the host-reported baseline so a reseed shifts observable
+ * extended features without turning any bit on that the host lacks. */
+static void rewrite_leaf_80000001(int regs[4])
+{
+    ULONG host_ecx = (ULONG)regs[2];
+    ULONG host_edx = (ULONG)regs[3];
+    /* Mask the overlay to the host's advertised bits; never claim a
+     * feature the hardware does not support. */
+    regs[2] = (int)(host_ecx & (host_ecx ^ g_identity_cpu_ext_feat_ecx));
+    regs[3] = (int)(host_edx & (host_edx ^ g_identity_cpu_ext_feat_edx));
+    /* Union with host feature set so core capabilities (LM, SYSCALL,
+     * NX, LAHF, SSE4A) stay reported; the overlay only shifts the
+     * uncovered high-bit landscape. */
+    regs[2] = (int)((ULONG)regs[2] | (host_ecx & 0x000003FFu));
+    regs[3] = (int)((ULONG)regs[3] | (host_edx & 0x3FFFFFFFu));
+}
+
+/* CPUID 0x8000001F SEV/SME capability: must always report SEV off so
+ * the HV's own use of SVM does not leak. Design doc rule. */
+static void rewrite_leaf_8000001F(int regs[4])
+{
+    regs[0] &= ~0x7;  /* EAX[0]=SME, EAX[1]=SEV, EAX[2]=Page flush */
+    regs[1] = 0;
+    regs[2] = 0;
+    regs[3] = 0;
+}
+
 static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
 {
     ULONG leaf = (ULONG)vmcb->save.rax;
     ULONG subleaf = (ULONG)ctx->gpr_save[2];   /* rcx */
     int regs[4];
+    BOOLEAN rewrite = identity_rewrites_enabled();
 
     __cpuidex(regs, (int)leaf, (int)subleaf);
 
     if (leaf == 1) {
-        /* Clear the hypervisor-present bit (ECX[31]). */
-        regs[2] &= ~(1u << 31);
+        if (rewrite) {
+            rewrite_leaf_1(ctx, regs);
+        } else {
+            /* Minimum: clear hypervisor-present bit (ECX[31]). */
+            regs[2] &= ~(1u << 31);
+        }
+    } else if (leaf == 7 && subleaf == 0) {
+        if (rewrite) rewrite_leaf_7(regs);
+    } else if (leaf == 0xB || leaf == 0x1F) {
+        if (rewrite) rewrite_leaf_topology(ctx, regs);
+    } else if (leaf == 0x15) {
+        if (rewrite) rewrite_leaf_15(regs);
+    } else if (leaf == 0x16) {
+        if (rewrite) rewrite_leaf_16(regs);
+    } else if (leaf == 0x80000001U) {
+        if (rewrite) rewrite_leaf_80000001(regs);
+    } else if (leaf == 0x80000002U) {
+        if (rewrite) brand_slot_to_regs(0, regs);
+    } else if (leaf == 0x80000003U) {
+        if (rewrite) brand_slot_to_regs(1, regs);
+    } else if (leaf == 0x80000004U) {
+        if (rewrite) brand_slot_to_regs(2, regs);
+    } else if (leaf == 0x80000008U) {
+        /* EAX[7:0] physical address bits, EAX[15:8] virtual address bits,
+         * ECX[7:0] NC (logical processor count minus 1). Pass through for
+         * now; the identity table does not currently vary core count. */
+    } else if (leaf == 0x8000001DU || leaf == 0x8000001EU) {
+        /* Cache / core topology extended. Pass through unchanged — the
+         * identity rewrite varies APIC IDs and brand string, not core
+         * topology. */
+    } else if (leaf == 0x8000001FU) {
+        /* Must zero SEV/SME regardless of rewrite toggle: the HV's own
+         * SVM use should never leak a hardware SEV advertisement to the
+         * guest. */
+        rewrite_leaf_8000001F(regs);
     }
 
-    if (leaf >= 0x40000000 && leaf <= 0x4FFFFFFF) {
-        /* Phase 1.1: widen the hypervisor-brand zero band to the full
-         * 0x40000000..0x4FFFFFFF reserved range.
-         *
-         * Rationale: the VMware/hypervisor convention is that this entire
-         * CPUID range is dedicated to hypervisor use. Mainstream hypervisors
-         * (Hyper-V, KVM, Xen, VMware, QEMU-KVM) all follow it, and AMD Zen 4
-         * bare metal returns all-zeros for every leaf in the band (observed
-         * behavior; not APM-mandated). VMAware and pafish probe specific
-         * leaves such as 0x40000080 and 0x40000100 that lie well above the
-         * previous 0x40000010 ceiling, which left a trivial detection vector:
-         * any non-zero value returned by the native host __cpuidex in that
-         * range would fingerprint us as a hypervisor. Zeroing the whole band
-         * mirrors bare-metal behavior and closes that gap. */
+    if (leaf >= 0x40000000U && leaf <= 0x4FFFFFFFU) {
+        /* Zero the entire hypervisor-reserved range so VMAware / pafish
+         * probes at well-known leaves (0x40000080, 0x40000100) see the
+         * same all-zero response bare-metal AMD returns. */
         regs[0] = 0;
         regs[1] = 0;
         regs[2] = 0;
