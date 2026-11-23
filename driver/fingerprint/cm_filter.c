@@ -1,26 +1,29 @@
 /* cm_filter.c -- CmRegisterCallbackEx handler.
  *
- * Covers wave 4 design surfaces 24-34, 48, 56-58, 61 — every registry
- * value a packed sample reads to fingerprint the host.
+ * Covers every registry identity value a packed sample reads to
+ * fingerprint the host: MachineGuid, ProductId, InstallDate,
+ * DigitalProductId, EDID blob, BitLocker status, NtpServer, and the
+ * HARDWARE\\DESCRIPTION\\System\\BIOS mirror.
  *
  * The registered callback fires pre-op and post-op on every registry
- * operation in the kernel. We intercept RegNtPreQueryValueKey and
- * RegNtPostQueryValueKey only, PID-filter against the spoof list, and
- * for matched paths and value names we supply a seed-derived override.
+ * operation in the kernel. We intercept RegNtPostQueryValueKey only,
+ * PID-filter against the spoof list, and for matched paths and value
+ * names we supply a seed-derived override.
  *
- * Why we patch on *post*-op (for most paths) rather than *pre*:
- * returning STATUS_CALLBACK_BYPASS from pre-op with a synthesized buffer
- * works but forces us to allocate and lifetime-manage every buffer. The
+ * Why we patch on *post*-op rather than *pre*: returning
+ * STATUS_CALLBACK_BYPASS from pre-op with a synthesized buffer works
+ * but forces us to allocate and lifetime-manage every buffer. The
  * cleaner path is to let the real read happen, then overwrite the
- * returned buffer in place at post-op. Registry values are usually small
- * (REG_SZ / REG_DWORD / short REG_BINARY) and the kernel copied them into
- * the caller's KVPI buffer, which we can edit before returning.
+ * returned buffer in place at post-op. Registry values are usually
+ * small (REG_SZ / REG_DWORD / short REG_BINARY) and the kernel copied
+ * them into the caller's KVPI buffer, which we can edit before
+ * returning.
  *
- * One exception: surface 48 (EDID) is where we really do want to
- * synthesize the whole 128-byte blob, because the real value may not
- * exist at all on a VM or the real monitor may differ from the shape we
- * claim. For that one path we rewrite the blob in post-op to our EDID
- * template, truncating if the caller's buffer is shorter.
+ * One exception: EDID is where we really do want to synthesize the
+ * whole 128-byte blob, because the real value may not exist at all on
+ * a VM or the real monitor may differ from the shape we claim. For
+ * that one path we rewrite the blob in post-op to our EDID template,
+ * truncating if the caller's buffer is shorter.
  */
 
 #include "fingerprint_cfg.h"
@@ -209,7 +212,7 @@ compute_dword_override(PCUNICODE_STRING key_path, PCUNICODE_STRING value_name,
             return TRUE;
         }
     }
-    /* BitLocker off — surface 61. */
+    /* BitLocker reports off under machine-identity spoof. */
     if (unicode_contains_i(key_path, L"Control\\BitLockerStatus")) {
         ULONG toggles = 0;
         cfp_cfg_get(CFP_FID_TOGGLES, &toggles, sizeof(toggles));

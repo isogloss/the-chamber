@@ -1,6 +1,6 @@
 /* edid_template.c -- 128-byte EDID template with seed-spliced identity.
  *
- * Surface 48 in the wave 4 design: a sample reads the monitor EDID from
+ * A sample reads the monitor EDID from
  * HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY\<mfr>\<serial>\Device
  * Parameters\EDID. Our CmRegisterCallbackEx handler supplies a synthetic
  * 128-byte blob whenever a spoofed PID reads that value.

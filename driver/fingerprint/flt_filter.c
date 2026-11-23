@@ -1,13 +1,13 @@
 /* flt_filter.c -- minifilter for IRP_MJ_DEVICE_CONTROL on NDIS.
  *
- * Wave 4 design surface 45: a sample calls DeviceIoControl on a handle
- * to \Device\Ndis with IOCTL_NDIS_QUERY_GLOBAL_STATS and OID
- * OID_802_3_PERMANENT_ADDRESS or OID_802_3_CURRENT_ADDRESS to read the
- * adapter's hardware MAC. GetAdaptersAddresses / GetAdaptersInfo bottom
- * out in the same path, and the IC handler in syscall_rewrite.c covers
- * the syscall-return side of that chain. This minifilter exists so a
- * sample opening \Device\Ndis directly (rather than through iphlpapi)
- * sees the same spoofed MAC.
+ * A sample can call DeviceIoControl on a handle to \Device\Ndis with
+ * IOCTL_NDIS_QUERY_GLOBAL_STATS and OID OID_802_3_PERMANENT_ADDRESS or
+ * OID_802_3_CURRENT_ADDRESS to read the adapter's hardware MAC.
+ * GetAdaptersAddresses / GetAdaptersInfo bottom out in the same path,
+ * and the IC handler in syscall_rewrite.c covers the syscall-return
+ * side of that chain. This minifilter exists so a sample opening
+ * \Device\Ndis directly (rather than through iphlpapi) sees the same
+ * spoofed MAC.
  *
  * Minifilter rather than legacy filter because FltRegisterFilter is the
  * documented, PG-safe, EDR-sanctioned attach path. We register with a

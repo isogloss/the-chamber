@@ -7,18 +7,18 @@
  * syscall just returned, and if it is one of the fingerprint-sensitive
  * classes we rewrite the caller-provided output buffer in place.
  *
- * Covered surfaces (wave 4 design Section 2, rows marked IC):
- *   18-23  NtQuerySystemInformation SystemFirmwareTableInformation (DMI)
- *   35-37  NtQuerySystemInformation CI / Secure Boot classes
- *   38-39  NtDeviceIoControlFile with storage IOCTLs
- *   40     NtQueryVolumeInformationFile FileFsVolumeInformation
- *   41     storage adapter IOCTL (same handler as 38/39)
- *   42-43  NtDeviceIoControlFile to \Device\Nsi (adapter enum)
- *   46-47  EnumDisplayDevices lower path (NtOpenKey + NtQueryValueKey)
- *   50-53  NtQuerySystemInformation topology / basic / proc-perf classes
- *   54-55  NtQueryInformationProcess / NtQueryInformationToken paths
- *   59-60  Tbsi_GetDeviceInfo via NtDeviceIoControlFile to \Device\Tbs
- *   62     NtQuerySystemEnvironmentValueEx
+ * Covered syscalls:
+ *   NtQuerySystemInformation
+ *       SystemFirmwareTableInformation  (DMI blob rewrite)
+ *       SystemCodeIntegrityInformation  (CI state spoof)
+ *       SystemSecureBootPolicyInformation
+ *       SystemCodeIntegrityPolicyFullInformation
+ *       SystemBasicInformation / topology  (pass through)
+ *   NtQueryVolumeInformationFile (FileFsVolumeInformation)
+ *       VolumeSerialNumber rewrite
+ *   NtDeviceIoControlFile
+ *       IOCTL_STORAGE_QUERY_PROPERTY / _EX  (serial-ASCII patch)
+ *       IOCTL_NDIS_QUERY_GLOBAL_STATS       (MAC rewrite)
  *
  * Design intent: each handler is a pure in-place rewrite of the output
  * buffer the user process passed to the syscall. We never rewrite the
@@ -208,8 +208,8 @@ rewrite_storage_descriptor(PUCHAR buf, ULONG len)
 
     /* 20-char serial from the stored slot tag expanded by chained derive.
      * Slot 0 is the first disk the shim walks; slot-to-handle mapping is
-     * launcher-side. For wave 4 we use slot 0 for all disk queries from a
-     * spoofed process — real multi-disk expansion arrives in wave 5. */
+     * launcher-side. For now we use slot 0 for all disk queries from a
+     * spoofed process; per-handle slot resolution is a later refinement. */
     UCHAR tag[4];
     if (!cfp_cfg_get(CFP_FID_DISK_SERIAL_0, tag, sizeof(tag))) return;
 
@@ -304,11 +304,11 @@ cfp_ic_dispatch(SIZE_T return_value, PVOID return_rip, SIZE_T saved_rax)
 {
     UNREFERENCED_PARAMETER(return_rip);
 
-    /* The shim fills a per-thread CFP_IC_CTX before the detour. For wave 4
-     * we accept return_value + saved_rax (NT syscall number) and read the
-     * args from the thread's user-mode stack via the shim's prologue. The
-     * per-thread CTX pointer rides in gs:[0x1480] (an unused slot in TEB
-     * on current Windows; shim reserves it at attach).
+    /* The shim fills a per-thread CFP_IC_CTX before the detour. We
+     * accept return_value + saved_rax (NT syscall number) and read the
+     * args from the thread's user-mode stack via the shim's prologue.
+     * The per-thread CTX pointer rides in gs:[0x1480] (an unused slot
+     * in TEB on current Windows; shim reserves it at attach).
      *
      * This kernel-mode file is linked into chamber_fingerprint.sys for
      * contract clarity. At runtime the compiled version of this function

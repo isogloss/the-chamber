@@ -17,10 +17,10 @@
  * returns the failure. A partial teardown never leaks a registered
  * callback.
  *
- * Device and symlink names are static for wave 4 (no per-install
- * randomization yet — that is wave 5's extension of the same CFG-driven
- * rename scheme the HV driver already has). The launcher opens
- * \\.\CFPControl to send IOCTLs.
+ * Device and symlink names are static in this revision — per-install
+ * randomization of these names is a planned extension of the same
+ * CFG-driven rename scheme the HV driver already has. The launcher
+ * opens \\.\CFPControl to send IOCTLs.
  */
 
 #include "fingerprint_cfg.h"

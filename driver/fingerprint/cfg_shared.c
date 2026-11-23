@@ -17,14 +17,14 @@
 
 /* Local cached copy. Allocated at cfp_cfg_load, freed at cfp_cfg_unload.
  * Reads are lock-free: the blob is only replaced on explicit reload, which
- * callers must sequence so no IC/CM handler is mid-read. For wave 4 we do
- * not hot-reload; reload = driver restart via launcher.
+ * callers must sequence so no IC/CM handler is mid-read. We do not
+ * support hot-reload; reload = driver restart via launcher.
  */
 static PUCHAR   g_cfg_blob    = NULL;
 static ULONG    g_cfg_len     = 0;
 static BOOLEAN  g_cfg_loaded  = FALSE;
 
-/* -------- offset table (byte-exact against wave4_design Section 3) ----- */
+/* -------- offset table (byte-exact against CFG v2 wire format) ----- */
 
 #define OFF_MAGIC                   0
 #define OFF_VERSION                 4

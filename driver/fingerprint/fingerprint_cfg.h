@@ -9,10 +9,10 @@
 
 #include "../the_chamber.h"
 
-/* TODO(wave4-merge): CHAMBER_CFG_V2, CHAMBER_CFG_MAGIC_V2, g_chamber_cfg_v2
- * are provided by driver/the_chamber.h after Agent B's merge. If a build runs
- * before that merge lands this directory will not compile — expected, see
- * audit/wave4_design.md Section 7 merge order.
+/* TODO(merge): CHAMBER_CFG_V2 and its magic constant are provided by
+ * driver/the_chamber.h after the HV-side agent's merge. Before that
+ * merge lands this directory does not compile standalone — expected;
+ * see the merge order in the identity design doc under audit/.
  */
 
 /* Read-only accessor the local .c files use; defined in cfg_shared.c. */
@@ -30,9 +30,9 @@ BOOLEAN  cfp_cfg_get(_In_ ULONG field_id,
                      _Out_writes_bytes_(len) PVOID out,
                      _In_ ULONG len);
 
-/* Field identifiers for cfp_cfg_get. Match wave4_design.md Section 4.2 but
- * numbered independently so this directory does not depend on an installer
- * header.
+/* Field identifiers for cfp_cfg_get. Independent of the installer's
+ * field-ID numbering so this directory does not have to depend on an
+ * installer header.
  */
 enum cfp_field_id {
     CFP_FID_COMPUTER_NAME = 1,      /* 16 bytes ASCII (15 chars + NUL) */
