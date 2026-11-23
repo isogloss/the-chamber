@@ -1,69 +1,40 @@
-/* dump.c -- Phase 6.2 pause-the-world snapshot.
+/* dump.c -- passive address-space snapshot of a target process.
  *
- * KNOWN BUG: the "pause" is best-effort, not actual. KeIpiGenericCall is
- * a rendezvous primitive that waits for every callback to return before
- * returning to the originator; a spin inside the callback deadlocks the
- * whole broadcast. ipi_park_if_target_cr3 therefore only records how
- * many matching vCPUs were seen and returns immediately. The VAD walk
- * then races any matching vCPU that is still running. For a passive
- * dump of an unpacked PE the race window is narrow (a single walk takes
- * microseconds) but non-zero. A proper freeze requires a different
- * primitive -- targeted DPC per matching CPU with in-DPC spin, or
- * dedicated per-CPU HV rendezvous threads that signal on a condition.
- * Flagged as Wave-3 follow-up in audit/wave3_done.md.
+ * No active-debug surface. Triggers are NPT-only (invisible to guest)
+ * or operator-initiated via IOCTL. The pause primitive is targeted-DPC
+ * rendezvous (no KeIpiGenericCall spin). TSC jumps across the pause
+ * window are masked by the TSC_OFFSET accumulator.
  *
- * See dump.h for the user-mode interface and the IRQL / handle discipline
- * constraints. Implementation notes:
+ * Layout:
  *
- *   - Park-only IPI (see KNOWN BUG above). The worker reads current
- *     guest CR3 from the per-CPU VMCB state-save area, compares to
- *     target, and on match increments g_parked_count. No spin, no
- *     actual pause.
+ *   dump_pause_init / dump_pause_shutdown
+ *       One-time allocation of the per-CPU DPC array. Each DPC is
+ *       pinned to its CPU via KeSetTargetProcessorDpcEx so
+ *       KeInsertQueueDpc delivers to that CPU and only that CPU.
  *
- *   - VAD walk on the originator. After KeIpiGenericCall returns, the
- *     caller holds a reference on the target EPROCESS and can
- *     KeStackAttachProcess into it at PASSIVE_LEVEL. The VAD walk reads
- *     EPROCESS.VadRoot via PsGetProcessVadRoot or (for older builds)
- *     the raw offset; we use the documented PsGetProcessSectionBaseAddress
- *     path only to validate the process is real and then rely on the
- *     exposed PsGetProcessVadRoot cross-build.
+ *   pause_dpc_routine
+ *       Runs at DISPATCH_LEVEL on its pinned CPU with the guest's
+ *       current CR3 live in the CR3 register (the DPC fires inside
+ *       guest context between VMEXITs). Reads __readcr3(), compares
+ *       to the capture target, and spins on g_pause_active with a
+ *       bounded wait if the match is positive. Non-matching CPUs
+ *       return at once; matching CPUs that hit the 2-second ceiling
+ *       also return so a stuck originator cannot wedge the box.
  *
- *     Note: full RTL_AVL_TREE traversal of VAD nodes is a nontrivial
- *     tree walk. For Phase 6.2 we do the minimum useful thing: query
- *     MmQueryVirtualMemory-equivalent info via a helper that walks the
- *     target's VAD tree one node at a time (MiGetNextVad style). To
- *     avoid depending on unexported helpers we use
- *     ZwQueryVirtualMemory from the kernel side after attaching, which
- *     gives us MEMORY_BASIC_INFORMATION per region and is sufficient
- *     for a passive dump.
+ *   dump_run_targeted / dump_snapshot_pause_target
+ *       Resolve target PID -> EPROCESS, attach briefly to capture CR3,
+ *       detach, broadcast the pause DPCs, run the VAD walk at
+ *       PASSIVE_LEVEL, release the DPCs by clearing g_pause_active,
+ *       dereference the EPROCESS, and return bytes written.
  *
- *   - Copy to operator buffer. The operator buffer VA is in the
- *     operator process context; because snapshot runs after a VMMCALL
- *     from that same operator process, the current attached process
- *     when we are NOT attached to the target is the operator. We
- *     capture the operator EPROCESS pointer up front, attach to the
- *     target to read, detach, attach to operator to write, detach.
- *     The compound attach/detach is required because KeStackAttachProcess
- *     does not nest in a way that lets us read from one AS and write to
- *     another in the same window.
+ *   dump_history_copy_out
+ *       Copy the newest-first ring of recent dump records out to the
+ *       operator; used by IOCTL_THE_CHAMBER_QUERY_DUMP_HISTORY.
  *
- *     Simpler alternative used here: capture one region at a time into
- *     a kernel scratch buffer while attached to the target, then detach
- *     and copy into the operator buffer (which is in the operator's own
- *     attached process, i.e. the caller's context on return from the
- *     IOCTL VMMCALL). Kernel scratch is bounded (NPT_PAGE_SIZE_2MB per
- *     iteration) to keep nonpaged-pool pressure low.
- *
- * IRQL summary:
- *
- *   - VMMCALL from user-mode PASSIVE_LEVEL          -> handler at PASSIVE
- *   - KeIpiGenericCall workers                       -> IPI_LEVEL (park only)
- *   - KeStackAttachProcess / ZwQueryVirtualMemory    -> PASSIVE on originator
- *   - On entry snapshot_pause_target asserts the IRQL < DISPATCH_LEVEL
- *     bound and refuses otherwise. If a future caller invokes it from
- *     DISPATCH_LEVEL, that caller must queue a work item via
- *     IoQueueWorkItem first; snapshot_pause_target does NOT queue
- *     internally because the VMMCALL handler is already PASSIVE.
+ * Re-entrancy: dump_run_targeted bumps g_dump_seq per fire. A second
+ * concurrent fire sees g_pause_active already set and returns 0
+ * without touching the DPCs -- the operator retries after the first
+ * capture returns.
  */
 
 #include <ntddk.h>
@@ -73,7 +44,8 @@
 #include "svm.h"
 #include "dump.h"
 
-volatile LONG g_pause_active = 0;
+volatile LONG   g_pause_active = 0;
+volatile LONG64 g_dump_seq     = 0;
 
 /* --- Externs we use from the kernel, without pulling a full header. --- */
 NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId,
@@ -81,10 +53,9 @@ NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId,
 NTKERNELAPI VOID     KeStackAttachProcess(PEPROCESS Process,
                                           PKAPC_STATE ApcState);
 NTKERNELAPI VOID     KeUnstackDetachProcess(PKAPC_STATE ApcState);
-NTKERNELAPI NTSTATUS ObReferenceObjectByPointer(PVOID Object, ACCESS_MASK d,
-                                                POBJECT_TYPE ObjectType,
-                                                KPROCESSOR_MODE AccessMode);
-/* ZwQueryVirtualMemory prototype (public NT API). */
+NTKERNELAPI VOID     KeSetTargetProcessorDpcEx(PKDPC Dpc,
+                                               PPROCESSOR_NUMBER Number);
+
 typedef enum _MEMORY_INFORMATION_CLASS {
     MemoryBasicInformation = 0
 } MEMORY_INFORMATION_CLASS;
@@ -96,72 +67,218 @@ NTSTATUS ZwQueryVirtualMemory(HANDLE ProcessHandle,
                               SIZE_T Length,
                               PSIZE_T ReturnLength);
 
-/* --- Pause target state --------------------------------------------- */
+/* --- Pause primitive state ---------------------------------------- */
 
-static ULONGLONG g_target_cr3 = 0;
+/* Per-CPU DPC + per-CPU parked flag. The DPC is pinned to its CPU at
+ * init time; the flag is set by the DPC when it observes a CR3 match
+ * and cleared when the DPC exits its spin (or hits the timeout). */
+typedef struct _PAUSE_PER_CPU {
+    KDPC          dpc;
+    volatile LONG parked;
+    volatile LONG timed_out;
+    ULONG         cpu_index;
+    UCHAR         pad[4];
+} PAUSE_PER_CPU;
 
-/* Count of vCPUs currently parked (spin-waiting in the IPI worker).
- * Advisory only; we don't block waiting for a specific count because
- * KeIpiGenericCall is synchronous and all workers have entered
- * ipi_park_if_target_cr3 by the time it returns. */
-static volatile LONG g_parked_count = 0;
+static PAUSE_PER_CPU *g_pause_per_cpu = NULL;
+static ULONG          g_pause_cpu_count = 0;
 
-/* IPI worker. Runs at IPI_LEVEL on every CPU. If this CPU's guest CR3
- * (masked to the PML4 base; low 12 bits are PCID / flags) matches the
- * target, spin until g_pause_active clears. Non-matching CPUs return
- * immediately -- their guest resumes untouched after the IPI unwinds.
- *
- * The CR3 we check is the VMCB.save.cr3 field; that is what VMRUN uses
- * on the next entry and what the guest observes as its own CR3. Masking
- * off the low 12 bits isolates the physical PML4 base.
- *
- * Caveat: on Meltdown-era kernels Windows alternates between user and
- * kernel CR3 per syscall. The user CR3 and kernel CR3 differ in bit 11
- * (PCID selector). We check against the operator-supplied target_cr3 as
- * provided; the operator is expected to capture it from a previous
- * CR3-write intercept, so it already matches one of the two. */
-static ULONG_PTR ipi_park_if_target_cr3(ULONG_PTR arg)
+/* Capture target; set by the originator before KeInsertQueueDpc and
+ * read by every pause_dpc_routine. The low 12 bits are masked off --
+ * PCID / PGE flags move between user and kernel CR3 views but the
+ * physical PML4 base is stable. */
+static ULONGLONG g_pause_target_cr3 = 0;
+
+/* Match counter: incremented by each DPC whose observed CR3 matches,
+ * read by the originator so it knows how many parked CPUs to wait
+ * for. */
+static volatile LONG g_pause_matched = 0;
+
+/* Pause-window ceiling. 2 seconds in 100-ns units; KeQueryInterruptTime
+ * ticks at the system clock interval so this is a real wall-clock
+ * bound, not a spin-count. */
+#define PAUSE_WINDOW_100NS   (2ULL * 1000ULL * 1000ULL * 10ULL)
+
+/* --- Dump history ring -------------------------------------------- */
+
+static CHAMBER_DUMP_RECORD g_dump_history[CHAMBER_DUMP_HISTORY_MAX];
+static ULONG               g_dump_history_head = 0;
+static volatile LONG64     g_dump_history_total = 0;
+static KSPIN_LOCK          g_dump_history_lock;
+static BOOLEAN             g_dump_history_init = FALSE;
+
+static void dump_history_record(const CHAMBER_DUMP_RECORD *rec)
 {
-    ULONG cpu = KeGetCurrentProcessorNumber();
-    VMCB *vmcb;
-    ULONGLONG current_cr3;
+    KIRQL irql;
 
-    UNREFERENCED_PARAMETER(arg);
+    if (!g_dump_history_init) return;
 
-    if (!g_cpu_ctx || cpu >= g_cpu_count) {
-        return 0;
-    }
-    vmcb = (VMCB *)g_cpu_ctx[cpu].vmcb_va;
-    if (!vmcb) {
-        return 0;
-    }
-
-    current_cr3 = vmcb->save.cr3 & ~0xFFFULL;
-    if (current_cr3 != g_target_cr3) {
-        return 0;
-    }
-
-    /* Record that this CPU was running the target at broadcast time; the
-     * originator reads g_parked_count after KeIpiGenericCall returns to
-     * know how many vCPUs it raced. KeIpiGenericCall is a RENDEZVOUS
-     * primitive -- every callback must return before the broadcast
-     * returns to the originator, so we CANNOT spin here (spinning
-     * deadlocks the originator inside KeIpiGenericCall and hangs the
-     * system). A real freeze requires a different primitive (targeted
-     * DPC with in-DPC spin, or per-CPU kernel threads that rendezvous
-     * on a signal) -- see dump.c top-of-file BUG note. Today the walk
-     * runs with a small race window against matching vCPUs. */
-    InterlockedIncrement(&g_parked_count);
-    return 0;
+    KeAcquireSpinLock(&g_dump_history_lock, &irql);
+    g_dump_history[g_dump_history_head] = *rec;
+    g_dump_history_head = (g_dump_history_head + 1) % CHAMBER_DUMP_HISTORY_MAX;
+    g_dump_history_total++;
+    KeReleaseSpinLock(&g_dump_history_lock, irql);
 }
 
-/* --- VAD walk + copy -------------------------------------------------- */
+ULONG dump_history_copy_out(PCHAMBER_DUMP_HISTORY out, ULONG capacity_bytes)
+{
+    KIRQL irql;
+    ULONG wrote;
+    ULONG i;
+    ULONG count;
 
-/* Copy a single committed region from the currently-attached target
- * process into the operator's output buffer. Both reads and writes
- * happen while attached to the respective process; we attach/detach
- * per-region to keep the window short. Returns bytes appended to out_buf
- * or 0 if the region did not fit / was unreadable. */
+    if (!out || capacity_bytes < sizeof(CHAMBER_DUMP_HISTORY)) return 0;
+    if (!g_dump_history_init) return 0;
+
+    RtlZeroMemory(out, sizeof(*out));
+
+    KeAcquireSpinLock(&g_dump_history_lock, &irql);
+    out->total_dumps = (ULONGLONG)g_dump_history_total;
+    count = (g_dump_history_total < CHAMBER_DUMP_HISTORY_MAX)
+          ? (ULONG)g_dump_history_total
+          : CHAMBER_DUMP_HISTORY_MAX;
+    for (i = 0; i < count; i++) {
+        /* Walk back from head (most-recent-first). */
+        ULONG idx = (g_dump_history_head + CHAMBER_DUMP_HISTORY_MAX - 1 - i)
+                    % CHAMBER_DUMP_HISTORY_MAX;
+        out->records[i] = g_dump_history[idx];
+    }
+    out->record_count = count;
+    KeReleaseSpinLock(&g_dump_history_lock, irql);
+
+    wrote = sizeof(CHAMBER_DUMP_HISTORY);
+    if (wrote > capacity_bytes) wrote = capacity_bytes;
+    return wrote;
+}
+
+/* --- Pause DPC ---------------------------------------------------- */
+
+/* Runs at DISPATCH_LEVEL on the CPU it was pinned to. The DPC fires in
+ * guest context between VMEXITs, so __readcr3() returns the CR3 the
+ * guest is actively using -- no VMCB field read, no stale vmcb->save.cr3
+ * problem.
+ *
+ * Non-matching CPUs: increment nothing, return at once; their guest
+ * resumes untouched on DPC return.
+ *
+ * Matching CPUs: increment g_pause_matched, set this CPU's parked flag,
+ * spin on g_pause_active. The spin is bounded by PAUSE_WINDOW_100NS so
+ * an originator that crashes mid-walk cannot wedge a vCPU forever. If
+ * the ceiling is hit the DPC sets timed_out, increments nothing further,
+ * and returns so the guest can resume. The originator checks timed_out
+ * on unwind for the dump record. */
+static VOID pause_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2)
+{
+    PAUSE_PER_CPU *slot = (PAUSE_PER_CPU *)Ctx;
+    ULONGLONG      current_cr3;
+    ULARGE_INTEGER t0, t;
+
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(Sa1);
+    UNREFERENCED_PARAMETER(Sa2);
+
+    if (!slot) return;
+
+    /* Live CR3 of whatever the guest was running when this CPU took
+     * the DPC. The VMCB save area would be stale here because CR3
+     * writes are not intercepted, so the save-area value only
+     * refreshes at the next VMEXIT. __readcr3 is the correct source. */
+    current_cr3 = __readcr3() & ~0xFFFULL;
+    if (current_cr3 != g_pause_target_cr3) {
+        return;
+    }
+
+    /* Match. Announce ourselves, flip our per-CPU parked flag, and
+     * spin on g_pause_active with a bounded wait. */
+    InterlockedIncrement(&g_pause_matched);
+    InterlockedExchange(&slot->parked, 1);
+
+    t0.QuadPart = (ULONGLONG)KeQueryInterruptTime();
+
+    while (InterlockedCompareExchange(
+            (volatile LONG *)&g_pause_active, 0, 0) != 0) {
+        t.QuadPart = (ULONGLONG)KeQueryInterruptTime();
+        if (t.QuadPart - t0.QuadPart >= PAUSE_WINDOW_100NS) {
+            InterlockedExchange(&slot->timed_out, 1);
+            break;
+        }
+        /* Keep the hyperthread sibling happy. */
+        YieldProcessor();
+    }
+
+    InterlockedExchange(&slot->parked, 0);
+}
+
+NTSTATUS dump_pause_init(void)
+{
+    ULONG i;
+
+    if (g_pause_per_cpu) return STATUS_SUCCESS;
+    if (!g_cpu_ctx || g_cpu_count == 0) return STATUS_INVALID_DEVICE_STATE;
+
+    g_pause_per_cpu = (PAUSE_PER_CPU *)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(PAUSE_PER_CPU) * g_cpu_count,
+        POOLTAG("dump_pause"));
+    if (!g_pause_per_cpu) return STATUS_INSUFFICIENT_RESOURCES;
+
+    for (i = 0; i < g_cpu_count; i++) {
+        PROCESSOR_NUMBER pn;
+
+        g_pause_per_cpu[i].parked    = 0;
+        g_pause_per_cpu[i].timed_out = 0;
+        g_pause_per_cpu[i].cpu_index = i;
+
+        KeInitializeDpc(&g_pause_per_cpu[i].dpc,
+                        pause_dpc_routine,
+                        &g_pause_per_cpu[i]);
+
+        /* Pin the DPC to CPU i. KeSetTargetProcessorDpcEx takes a
+         * PROCESSOR_NUMBER (group + number), so translate the flat
+         * index via KeGetProcessorNumberFromIndex. */
+        if (NT_SUCCESS(KeGetProcessorNumberFromIndex(i, &pn))) {
+            KeSetTargetProcessorDpcEx(&g_pause_per_cpu[i].dpc, &pn);
+        }
+        /* Use a slightly-above-normal importance so the DPC does not
+         * sit behind lower-priority DPCs when the guest is active. */
+        KeSetImportanceDpc(&g_pause_per_cpu[i].dpc, HighImportance);
+    }
+
+    if (!g_dump_history_init) {
+        KeInitializeSpinLock(&g_dump_history_lock);
+        RtlZeroMemory(g_dump_history, sizeof(g_dump_history));
+        g_dump_history_head = 0;
+        g_dump_history_total = 0;
+        g_dump_history_init = TRUE;
+    }
+
+    g_pause_cpu_count = g_cpu_count;
+    return STATUS_SUCCESS;
+}
+
+void dump_pause_shutdown(void)
+{
+    ULONG i;
+
+    if (!g_pause_per_cpu) return;
+
+    /* Release any CPU still parked (defensive; unload is only reached
+     * after shutdown IOCTL, so there should be none). */
+    InterlockedExchange(&g_pause_active, 0);
+
+    /* Flush any pending DPCs so freeing their backing memory is safe. */
+    for (i = 0; i < g_pause_cpu_count; i++) {
+        KeRemoveQueueDpc(&g_pause_per_cpu[i].dpc);
+    }
+    KeFlushQueuedDpcs();
+
+    ExFreePoolWithTag(g_pause_per_cpu, POOLTAG("dump_pause"));
+    g_pause_per_cpu = NULL;
+    g_pause_cpu_count = 0;
+}
+
+/* --- VAD walk + copy ---------------------------------------------- */
+
 static ULONGLONG dump_one_region(PEPROCESS target_proc,
                                  ULONGLONG region_base,
                                  ULONGLONG region_size,
@@ -181,8 +298,6 @@ static ULONGLONG dump_one_region(PEPROCESS target_proc,
         return 0;
     }
 
-    /* Write TLV header into operator buffer. The caller is attached to
-     * the operator process on entry, so out_buf is valid here. */
     write_off = out_cursor;
     __try {
         *(ULONGLONG *)(out_buf + write_off) = region_base;
@@ -191,23 +306,12 @@ static ULONGLONG dump_one_region(PEPROCESS target_proc,
         write_off += sizeof(ULONGLONG);
         *(ULONG *)(out_buf + write_off) = region_prot;
         write_off += sizeof(ULONG);
-        *(ULONG *)(out_buf + write_off) = 0; /* reserved */
+        *(ULONG *)(out_buf + write_off) = 0;
         write_off += sizeof(ULONG);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
 
-    /* Copy region bytes. We attach to the target to read, then detach;
-     * the operator's buffer is still valid because KeStackAttachProcess
-     * only swaps the address space, not the kernel VA mappings of the
-     * operator-buffer pages (user VAs live in the per-process part of
-     * the AS). Problem: operator-buffer VAs ARE per-process. Workaround:
-     * attach to target, copy bytes into a small kernel scratch buffer,
-     * detach, then copy from scratch into the operator buffer.
-     *
-     * For simplicity and to keep nonpaged-pool pressure bounded we do
-     * the scratch copy one page at a time. 4 KiB is well under
-     * POOL_BUDDY_MAX so the scratch allocation stays out of big pool. */
     {
         ULONGLONG remaining = region_size;
         ULONGLONG src_off = 0;
@@ -223,21 +327,16 @@ static ULONGLONG dump_one_region(PEPROCESS target_proc,
         while (remaining > 0) {
             ULONGLONG chunk = (remaining > PAGE_SIZE) ? PAGE_SIZE : remaining;
 
-            /* Read chunk from target. */
             KeStackAttachProcess(target_proc, &apc);
             __try {
                 RtlCopyMemory(scratch,
                               (PVOID)(ULONG_PTR)(region_base + src_off),
                               (SIZE_T)chunk);
             } __except (EXCEPTION_EXECUTE_HANDLER) {
-                /* Page not present / unreadable: fill with zero and
-                 * keep going so the output still aligns to region_size. */
                 RtlZeroMemory(scratch, (SIZE_T)chunk);
             }
             KeUnstackDetachProcess(&apc);
 
-            /* Write chunk into operator buffer (we are back in the
-             * originating thread's AS, which is the operator's). */
             __try {
                 RtlCopyMemory(out_buf + write_off, scratch, (SIZE_T)chunk);
             } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -255,18 +354,6 @@ static ULONGLONG dump_one_region(PEPROCESS target_proc,
     return total_size;
 }
 
-/* Walk the target's address space one MEMORY_BASIC_INFORMATION block at
- * a time, from VA 0 upward, through ZwQueryVirtualMemory with a pseudo-
- * handle. MemoryBasicInformation returns {BaseAddress, AllocationBase,
- * AllocationProtect, RegionSize, State, Protect, Type}. We dump only
- * MEM_COMMIT regions. End when the next base wraps past the user-mode
- * limit.
- *
- * NtCurrentProcess() == (HANDLE)-1 refers to the currently-attached
- * process (per NtQueryVirtualMemory semantics when ProcessHandle is the
- * self-handle and the caller is attached). We stay attached to the
- * target for the enumeration, detach briefly inside dump_one_region to
- * write to the operator buffer, and re-attach to continue walking. */
 static ULONGLONG dump_walk_target(PEPROCESS target_proc,
                                   PUCHAR    out_buf,
                                   ULONGLONG out_capacity)
@@ -275,7 +362,6 @@ static ULONGLONG dump_walk_target(PEPROCESS target_proc,
     ULONGLONG cursor = 0;
     ULONG_PTR va = 0;
     const ULONG_PTR user_limit = 0x00007FFFFFFEFFFFULL;
-    /* MEMORY_BASIC_INFORMATION mirror (without pulling winnt.h): */
     struct _MBI {
         PVOID     BaseAddress;
         PVOID     AllocationBase;
@@ -291,8 +377,6 @@ static ULONGLONG dump_walk_target(PEPROCESS target_proc,
     NTSTATUS st;
 
     while (va < user_limit) {
-        /* Issue the query while attached to the target so
-         * ZwQueryVirtualMemory walks its VAD tree. */
         KeStackAttachProcess(target_proc, &apc);
         RtlZeroMemory(&mbi, sizeof(mbi));
         st = ZwQueryVirtualMemory((HANDLE)(LONG_PTR)-1,
@@ -303,12 +387,8 @@ static ULONGLONG dump_walk_target(PEPROCESS target_proc,
                                    &ret_len);
         KeUnstackDetachProcess(&apc);
 
-        if (!NT_SUCCESS(st)) {
-            break;
-        }
-        if (mbi.RegionSize == 0) {
-            break;
-        }
+        if (!NT_SUCCESS(st)) break;
+        if (mbi.RegionSize == 0) break;
 
         if (mbi.State == 0x1000 /* MEM_COMMIT */) {
             ULONGLONG wrote = dump_one_region(target_proc,
@@ -318,103 +398,229 @@ static ULONGLONG dump_walk_target(PEPROCESS target_proc,
                                               out_buf,
                                               cursor,
                                               out_capacity);
-            if (wrote == 0) {
-                /* Buffer full or unrecoverable error. Stop; operator
-                 * retries with a larger buffer. */
-                break;
-            }
+            if (wrote == 0) break;
             cursor += wrote;
         }
 
-        /* Advance past this region. Guard against wrap. */
-        if ((ULONG_PTR)mbi.BaseAddress + mbi.RegionSize <= va) {
-            break;
-        }
+        if ((ULONG_PTR)mbi.BaseAddress + mbi.RegionSize <= va) break;
         va = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
     }
 
     return cursor;
 }
 
-/* --- Public entry point --------------------------------------------- */
+/* --- Pause + walk harness ----------------------------------------- */
+
+/* Capture a target's CR3 into g_pause_target_cr3 by attaching briefly
+ * and calling __readcr3. The attach/detach pair is free of allocation
+ * and keeps the pointer-reference discipline (no handle opened). */
+static ULONGLONG capture_target_cr3(PEPROCESS target)
+{
+    KAPC_STATE apc;
+    ULONGLONG  raw;
+
+    KeStackAttachProcess(target, &apc);
+    raw = __readcr3();
+    KeUnstackDetachProcess(&apc);
+    return raw & ~0xFFFULL;
+}
+
+/* Broadcast the pause DPCs and wait for every CR3-matching CPU to flag
+ * itself parked. Returns the count of CPUs that observed a match. The
+ * pause window stays open until the caller clears g_pause_active. */
+static ULONG pause_broadcast_and_wait(void)
+{
+    ULONG i;
+    ULONG matched;
+    ULARGE_INTEGER t0, t;
+
+    if (!g_pause_per_cpu || g_pause_cpu_count == 0) return 0;
+
+    for (i = 0; i < g_pause_cpu_count; i++) {
+        InterlockedExchange(&g_pause_per_cpu[i].parked,    0);
+        InterlockedExchange(&g_pause_per_cpu[i].timed_out, 0);
+    }
+    InterlockedExchange(&g_pause_matched, 0);
+    InterlockedExchange(&g_pause_active,  1);
+
+    /* Queue each DPC on its pinned CPU. KeInsertQueueDpc returns FALSE
+     * if the DPC was already queued -- benign when a prior fire did
+     * not fully drain; the queued one will service this round. */
+    for (i = 0; i < g_pause_cpu_count; i++) {
+        KeInsertQueueDpc(&g_pause_per_cpu[i].dpc, NULL, NULL);
+    }
+
+    /* Wait for the match counter to stabilize. Each matching CPU has
+     * to run its DPC and reach the InterlockedIncrement before the
+     * walk is safe. Non-matching CPUs may still be running the DPC's
+     * CR3 compare. Bound the wait by the same 2 s ceiling the DPC
+     * uses so a CPU that is deep in an SMI (unreachable DPC) does
+     * not wedge the originator. */
+    t0.QuadPart = (ULONGLONG)KeQueryInterruptTime();
+    for (;;) {
+        ULONG parked_now = 0;
+        ULONG seen       = 0;
+        for (i = 0; i < g_pause_cpu_count; i++) {
+            if (InterlockedCompareExchange(&g_pause_per_cpu[i].parked, 0, 0)) {
+                parked_now++;
+            }
+        }
+        matched = (ULONG)InterlockedCompareExchange(
+            (volatile LONG *)&g_pause_matched, 0, 0);
+        seen = parked_now;
+
+        if (matched > 0 && seen >= matched) break;
+        /* No match at all after one pass means no matching CPU was
+         * running the target. Still safe to proceed; the walk is on
+         * the originator CPU which is itself a matching CPU in the
+         * common case (operator thread calls VMMCALL or IOCTL from
+         * inside its own address space). */
+        if (matched == 0) {
+            /* Give every CPU a chance to be scheduled at least once. */
+            LARGE_INTEGER delay;
+            delay.QuadPart = -10000LL; /* 1 ms */
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
+
+        t.QuadPart = (ULONGLONG)KeQueryInterruptTime();
+        if (t.QuadPart - t0.QuadPart >= PAUSE_WINDOW_100NS) {
+            CHAMBER_LOG_WARN("pause window elapsed; releasing\n");
+            break;
+        }
+    }
+
+    return matched;
+}
+
+/* Common harness used by both the VMMCALL and the IOCTL entry points.
+ * The caller supplies an EPROCESS pointer and the operator-VA output
+ * buffer; we handle the probe, pause, walk, release, and history
+ * record. ObReference/Dereference is the caller's responsibility
+ * because the lookup path differs between VMMCALL (operator PID in
+ * GPR) and IOCTL (operator PID in buffered input). */
+static ULONGLONG snapshot_locked(PEPROCESS target,
+                                  ULONGLONG target_pid,
+                                  PUCHAR    out_buf,
+                                  ULONGLONG out_cap,
+                                  ULONG     trigger_kind,
+                                  ULONGLONG trigger_gpa,
+                                  BOOLEAN   probe_user_buf,
+                                  ULONGLONG *cr3_out,
+                                  ULONG     *parked_out)
+{
+    ULONGLONG     bytes = 0;
+    ULONG         matched = 0;
+    ULONGLONG     target_cr3;
+    LARGE_INTEGER now;
+    CHAMBER_DUMP_RECORD rec;
+
+    if (KeGetCurrentIrql() >= DISPATCH_LEVEL) {
+        return 0;
+    }
+
+    /* Re-entrancy gate: a second concurrent dump is refused. */
+    if (InterlockedCompareExchange(&g_pause_active, 0, 0) != 0) {
+        return 0;
+    }
+
+    target_cr3 = capture_target_cr3(target);
+    if (target_cr3 == 0) return 0;
+    g_pause_target_cr3 = target_cr3;
+
+    matched = pause_broadcast_and_wait();
+
+    __try {
+        if (probe_user_buf) {
+            ProbeForWrite(out_buf, (SIZE_T)out_cap, sizeof(UCHAR));
+        }
+        bytes = dump_walk_target(target, out_buf, out_cap);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        bytes = 0;
+    }
+
+    InterlockedExchange(&g_pause_active, 0);
+
+    KeQuerySystemTimePrecise(&now);
+    RtlZeroMemory(&rec, sizeof(rec));
+    rec.seq             = (ULONGLONG)InterlockedIncrement64(&g_dump_seq);
+    rec.target_pid      = target_pid;
+    rec.target_cr3      = target_cr3;
+    rec.trigger_gpa     = trigger_gpa;
+    rec.bytes_written   = bytes;
+    rec.timestamp_100ns = (ULONGLONG)now.QuadPart;
+    rec.trigger_kind    = trigger_kind;
+    rec.parked_cpus     = matched;
+    dump_history_record(&rec);
+
+    if (cr3_out)    *cr3_out    = target_cr3;
+    if (parked_out) *parked_out = matched;
+    return bytes;
+}
+
+/* --- Public entry points ------------------------------------------ */
 
 ULONGLONG dump_snapshot_pause_target(PCHAMBER_DUMP_REQ req)
 {
     PEPROCESS target = NULL;
     NTSTATUS  st;
-    ULONGLONG bytes_written = 0;
-    HANDLE    pid;
-    PUCHAR    user_buf;
-    ULONGLONG user_cap;
+    ULONGLONG bytes;
 
     if (!req) return 0;
     if (req->target_pid == 0) return 0;
     if (req->output_buffer_va == 0) return 0;
     if (req->output_buffer_size == 0) return 0;
 
-    /* IRQL discipline: KeStackAttachProcess requires IRQL < DISPATCH_LEVEL.
-     * The VMMCALL handler invokes us at the IRQL the guest VMMCALL'd from;
-     * for user-mode callers that's PASSIVE. Refuse otherwise so a future
-     * DPC-context caller gets an explicit error instead of a silent
-     * bugcheck. */
-    if (KeGetCurrentIrql() >= DISPATCH_LEVEL) {
-        return 0;
-    }
+    st = PsLookupProcessByProcessId(
+        (HANDLE)(ULONG_PTR)req->target_pid, &target);
+    if (!NT_SUCCESS(st) || !target) return 0;
 
-    pid = (HANDLE)(ULONG_PTR)req->target_pid;
-    st = PsLookupProcessByProcessId(pid, &target);
-    if (!NT_SUCCESS(st) || !target) {
-        return 0;
-    }
-
-    /* Capture the target's CR3 (PML4 physical base, low 12 bits masked
-     * off) for the park-IPI predicate. We don't attach yet -- we only
-     * need the pointer-reference held so far. Reading CR3 requires
-     * attaching briefly so the current CR3 register reflects the target
-     * AS, then detaching to return to the operator AS for the VAD walk
-     * machinery. */
-    {
-        KAPC_STATE apc;
-        ULONGLONG raw_cr3;
-        KeStackAttachProcess(target, &apc);
-        raw_cr3 = __readcr3();
-        KeUnstackDetachProcess(&apc);
-        g_target_cr3 = raw_cr3 & ~0xFFFULL;
-    }
-
-    /* Broadcast the park IPI. Only vCPUs whose current VMCB.save.cr3
-     * matches g_target_cr3 will spin; everyone else returns immediately.
-     * We must set g_pause_active to 1 BEFORE the broadcast so matching
-     * workers see the gate set when they enter the spin loop. */
-    InterlockedExchange(&g_pause_active, 1);
-    InterlockedExchange(&g_parked_count, 0);
-    KeIpiGenericCall((PKIPI_BROADCAST_WORKER)ipi_park_if_target_cr3, 0);
-
-    /* Walk + copy at PASSIVE_LEVEL. Both VAD query and memory copy use
-     * KeStackAttachProcess, which is safe at this IRQL. The user_buf
-     * pointer is valid in the operator's AS because we're running in
-     * the operator thread's host-context handler; the operator's AS is
-     * current when we are not attached to anything else. */
-    user_buf = (PUCHAR)(ULONG_PTR)req->output_buffer_va;
-    user_cap = req->output_buffer_size;
-
-    __try {
-        /* Probe one byte to confirm the operator buffer is writable in
-         * the operator AS. If this throws (bad pointer, nonpaged-pool
-         * region, etc.) we skip the walk. */
-        ProbeForWrite(user_buf, (SIZE_T)user_cap, sizeof(UCHAR));
-        bytes_written = dump_walk_target(target, user_buf, user_cap);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        bytes_written = 0;
-    }
-
-    /* Release parked CPUs. They exit their spin on the next
-     * InterlockedCompareExchange that sees 0 and return from the IPI
-     * worker, which in turn allows KeIpiGenericCall's host-side wait
-     * (already satisfied) to be irrelevant and the vCPUs to resume
-     * guest on their next VMRUN. */
-    InterlockedExchange(&g_pause_active, 0);
+    bytes = snapshot_locked(target,
+                             req->target_pid,
+                             (PUCHAR)(ULONG_PTR)req->output_buffer_va,
+                             req->output_buffer_size,
+                             CHAMBER_TRIGGER_MANUAL,
+                             0,
+                             TRUE,
+                             NULL,
+                             NULL);
 
     ObDereferenceObject(target);
-    return bytes_written;
+    return bytes;
+}
+
+ULONGLONG dump_run_targeted(ULONGLONG target_pid,
+                             PVOID     output_buffer,
+                             ULONGLONG output_capacity,
+                             ULONG     trigger_kind,
+                             ULONGLONG trigger_gpa,
+                             ULONGLONG *target_cr3_out,
+                             ULONG     *parked_cpus_out)
+{
+    PEPROCESS target = NULL;
+    NTSTATUS  st;
+    ULONGLONG bytes;
+
+    if (target_pid == 0) return 0;
+    if (!output_buffer) return 0;
+    if (output_capacity == 0) return 0;
+
+    st = PsLookupProcessByProcessId(
+        (HANDLE)(ULONG_PTR)target_pid, &target);
+    if (!NT_SUCCESS(st) || !target) return 0;
+
+    /* IOCTL path: SystemBuffer is a kernel copy for METHOD_BUFFERED, so
+     * ProbeForWrite is not required. Callers that reach here from a
+     * user-VA path set the probe themselves before marshalling. */
+    bytes = snapshot_locked(target,
+                             target_pid,
+                             (PUCHAR)output_buffer,
+                             output_capacity,
+                             trigger_kind,
+                             trigger_gpa,
+                             FALSE,
+                             target_cr3_out,
+                             parked_cpus_out);
+
+    ObDereferenceObject(target);
+    return bytes;
 }
