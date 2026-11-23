@@ -228,6 +228,18 @@ static void svm_ensure_bitmaps(void) {
                     msrpm_set_intercept(b, 0xC0000080ULL);  /* EFER */
                     msrpm_set_intercept(b, 0xC0010117ULL);  /* VM_HSAVE_PA */
                     msrpm_set_intercept(b, 0xC0010114ULL);  /* VM_CR */
+                    /* Phase 2.1 PMU stealth: intercept every WRMSR to
+                     * PerfEvtSelCoreN (even MSRs; the odd PerfCtrCoreN
+                     * values are left passthrough and shadowed inside
+                     * the VMEXIT handler). Tracks which counters the
+                     * guest armed so handle_rdpmc can serve the matching
+                     * snapshot. */
+                    msrpm_set_intercept(b, 0xC0010200ULL);  /* PerfEvtSelCore0 */
+                    msrpm_set_intercept(b, 0xC0010202ULL);  /* PerfEvtSelCore1 */
+                    msrpm_set_intercept(b, 0xC0010204ULL);  /* PerfEvtSelCore2 */
+                    msrpm_set_intercept(b, 0xC0010206ULL);  /* PerfEvtSelCore3 */
+                    msrpm_set_intercept(b, 0xC0010208ULL);  /* PerfEvtSelCore4 */
+                    msrpm_set_intercept(b, 0xC001020AULL);  /* PerfEvtSelCore5 */
                 }
             }
         }
@@ -278,8 +290,11 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
 
     /* ======================= Control area (Table 15-1) ================== */
 
-    /* AMD 15.9: intercept CPUID and all MSR accesses (intercept vector 3). */
-    ctl->intercept_vec3 |= IVEC3_CPUID | IVEC3_MSR;
+    /* AMD 15.9: intercept CPUID and all MSR accesses (intercept vector 3).
+     * Phase 2.1 PMU stealth also arms IVEC3_RDPMC (bit 15) so handle_rdpmc
+     * serves counter reads from the per-CPU snapshot instead of the raw
+     * PMC that drifted inside the handler. */
+    ctl->intercept_vec3 |= IVEC3_CPUID | IVEC3_MSR | IVEC3_RDPMC;
 
     /* AMD 15.9 / 15.5.1: VMRUN must be intercepted; VMMCALL is the guest ->
      * host hypercall path (intercept vector 4). */

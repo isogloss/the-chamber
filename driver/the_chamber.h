@@ -147,6 +147,14 @@ typedef struct _PER_CPU_CTX {
      * latch is already TRUE. Prevents a stray second call from VMRUNing
      * into a CPU that is already serving guest VMEXITs. */
     BOOLEAN     guest_entered;          /* offset 768 (0x300) */
+    /* Phase 2.1: per-CPU PMU shadow. guest_pmc_armed[i] is TRUE when the
+     * guest has written PerfEvtSelCoreI (even MSR 0xC0010200 + 2*i) with
+     * EN set and a non-zero event. On each VMEXIT, the handler saves the
+     * current PerfCtrCoreI value into guest_pmc_snapshot[i] and restores
+     * it before VMRUN so counts accrued inside the handler are hidden
+     * from the guest. handle_rdpmc also serves reads from the snapshot. */
+    BOOLEAN     guest_pmc_armed[6];
+    ULONGLONG   guest_pmc_snapshot[6];
 } PER_CPU_CTX, *PPER_CPU_CTX;
 
 typedef struct _CHAMBER_GLOBALS {
