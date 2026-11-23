@@ -22,10 +22,14 @@ ULONGLONG g_npt_cr3_pa = 0;
 /*                                                                    */
 /* Every contiguous page we allocate (PML4, PDPTs, PDs) is recorded   */
 /* in g_npt_pages so npt_free_tables() can hand each one back to      */
-/* MmFreeContiguousMemory().                                          */
+/* MmFreeContiguousMemory().  Architectural ceiling for 32 PDPT slots */
+/* is 1 + 32 + 32*512 = 16417 pages; round up to 16448 so sustained   */
+/* sparse NPFs cannot push an allocation past the tracker.            */
 /* ------------------------------------------------------------------ */
 
-static PVOID  g_npt_pages[8192];
+#define NPT_MAX_TRACKED_PAGES 16448
+
+static PVOID  g_npt_pages[NPT_MAX_TRACKED_PAGES];
 static ULONG  g_npt_page_count = 0;
 
 static PVOID  g_npt_pml4_va = NULL;
@@ -55,6 +59,13 @@ static PVOID npt_alloc_page(void)
     PHYSICAL_ADDRESS boundary;
     PVOID va;
 
+    /* Refuse the allocation if the tracker is full.  Previously we
+     * returned a usable VA the caller held without recording it, so
+     * teardown leaked it. */
+    if (g_npt_page_count >= RTL_NUMBER_OF(g_npt_pages)) {
+        return NULL;
+    }
+
     lowest.QuadPart = 0;
     highest.QuadPart = (LONGLONG)0xFFFFFFFFFFFFFFFFULL;
     boundary.QuadPart = 0;
@@ -70,10 +81,7 @@ static PVOID npt_alloc_page(void)
 
     RtlZeroMemory(va, PAGE_SIZE);
 
-    if (g_npt_page_count < RTL_NUMBER_OF(g_npt_pages)) {
-        g_npt_pages[g_npt_page_count++] = va;
-    }
-
+    g_npt_pages[g_npt_page_count++] = va;
     return va;
 }
 
@@ -149,6 +157,39 @@ static ULONGLONG *npt_ensure_pd(NPT_PDPT_SLOT *slot, ULONG pdpt_index)
 /* Public API.                                                        */
 /* ------------------------------------------------------------------ */
 
+/* NPT_UC: uncached leaf attribute.  Bit 4 = PCD on a 2 MB PDE. */
+#define NPT_UC_PCD      (1ULL << 4)
+
+/* Pre-allocate every PDPT and PD that covers [0, NPT_MAX_PHYS_GB) so a
+ * later Nested Page Fault at DISPATCH_LEVEL does NOT need to call
+ * MmAllocateContiguousMemorySpecifyCache (which requires PASSIVE_LEVEL).
+ * The handler can then just write the leaf PDE under g_npt_hide_lock.
+ *
+ * 128 GB coverage = 128 PDPT entries = 1 PDPT slot (512 PDs under one
+ * PDPT = 512 GB), but we're mapping identity so PML4[0]'s PDPT covers
+ * 0..512 GB; pre-allocate 128 PDs under it. */
+static NTSTATUS npt_preallocate_tables(void)
+{
+    NPT_PDPT_SLOT *slot;
+    ULONGLONG       cap_bytes;
+    ULONG           pdpt_i;
+    ULONG           pdpt_count;
+
+    cap_bytes = (ULONGLONG)NPT_MAX_PHYS_GB * 1024ULL * 1024ULL * 1024ULL;
+    pdpt_count = (ULONG)((cap_bytes + (1ULL << 30) - 1) >> 30);
+    if (pdpt_count > 512) pdpt_count = 512;
+
+    slot = npt_ensure_pdpt(0);
+    if (slot == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+
+    for (pdpt_i = 0; pdpt_i < pdpt_count; pdpt_i++) {
+        if (npt_ensure_pd(slot, pdpt_i) == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS npt_init(void)
 {
     PPHYSICAL_MEMORY_RANGE ranges;
@@ -156,6 +197,7 @@ NTSTATUS npt_init(void)
     PHYSICAL_ADDRESS pml4_pa;
     ULONGLONG total_mapped = 0;
     ULONGLONG cap_bytes;
+    NTSTATUS  st;
     ULONG i;
 
     g_npt_page_count = 0;
@@ -171,6 +213,14 @@ NTSTATUS npt_init(void)
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     g_npt_pml4_va = pml4;
+
+    /* Pre-allocate every PDPT and PD at PASSIVE_LEVEL.  Later NPFs can
+     * only write PDE leaves while holding the spin lock. */
+    st = npt_preallocate_tables();
+    if (!NT_SUCCESS(st)) {
+        npt_free_tables();
+        return st;
+    }
 
     ranges = MmGetPhysicalMemoryRanges();
     if (ranges == NULL) {
@@ -192,6 +242,17 @@ NTSTATUS npt_init(void)
         /* Round the range outward to 2 MB boundaries. */
         start &= ~(NPT_PAGE_SIZE_2MB - 1);
         end = (end + (NPT_PAGE_SIZE_2MB - 1)) & ~(NPT_PAGE_SIZE_2MB - 1);
+
+        /* M-15: round-down previously pulled low RAM down to 0, which
+         * identity-mapped VGA 0xA0000-0xBFFFF and ROM shadow
+         * 0xC0000-0xFFFFF as cached-writable-user-exec.  Bump the floor
+         * to 0x100000 so the first MB (with its legacy MMIO holes) is
+         * not covered by the WB-cached leaf; we install explicit UC
+         * leaves for VGA and the ROM shadow below. */
+        if (start < 0x100000ULL) start = 0x100000ULL;
+        if (end <= start)       continue;
+        /* Realign up after bumping start. */
+        start &= ~(NPT_PAGE_SIZE_2MB - 1);
 
         for (f = start; f < end; f += NPT_PAGE_SIZE_2MB) {
             ULONG pml4_i = (ULONG)((f >> 39) & 0x1FF);
@@ -222,6 +283,21 @@ NTSTATUS npt_init(void)
             pd[pd_i] = (f & ~0x1FFFFFULL) | 0x87ULL;
 
             total_mapped += NPT_PAGE_SIZE_2MB;
+        }
+    }
+
+    /* Legacy MMIO holes in the first 2 MB: install a dedicated 2 MB UC
+     * leaf at frame 0 so VGA (0xA0000-0xBFFFF) and the ROM shadow
+     * (0xC0000-0xFFFFF) are reachable with the correct cache attribute
+     * instead of either being unmapped or covered by a WB leaf. */
+    {
+        NPT_PDPT_SLOT *slot = npt_ensure_pdpt(0);
+        if (slot != NULL) {
+            ULONGLONG *pd = npt_ensure_pd(slot, 0);
+            if (pd != NULL) {
+                /* Frame 0 identity-mapped, PRESENT|WRITABLE|USER|PCD|PS. */
+                pd[0] = 0ULL | 0x87ULL | NPT_UC_PCD;
+            }
         }
     }
 
@@ -262,10 +338,20 @@ void npt_free_tables(void)
 /* unheld state, which is valid for KSPIN_LOCK on x64 Windows.        */
 /*                                                                    */
 /* The caller is responsible for TLB invalidation across every CPU's  */
-/* VMCB after the PDE edits (conceptually by OR-ing (1u << 31) into   */
-/* vmcb->ctl.guest_asid_tlb on each per-CPU VMCB) because that        */
-/* broadcast lives outside this translation unit.                     */
+/* VMCB after the PDE edits: write TLB_CONTROL_FLUSH_GUEST (0x03) to  */
+/* vmcb->ctl.tlb_control on each per-CPU VMCB (see npt_tlb_flush).    */
+/* The guest_asid_tlb field is the 32-bit ASID; ORing bit 31 into it  */
+/* silently raises the ASID instead of flushing.                       */
 /* ------------------------------------------------------------------ */
+
+/* Write TLB_CONTROL_FLUSH_GUEST into the low byte of tlb_control so
+ * hardware flushes the guest's TLB entries on the next VMRUN.  Caller
+ * must invoke this on every per-CPU VMCB after a PDE edit. */
+void npt_tlb_flush(VMCB *vmcb)
+{
+    if (!vmcb) return;
+    vmcb->ctl.tlb_control = TLB_CONTROL_FLUSH_GUEST;
+}
 
 typedef struct _NPT_HIDE_ENTRY {
     ULONGLONG pa;
@@ -365,9 +451,9 @@ NTSTATUS npt_hide_range(ULONGLONG start_pa, SIZE_T size)
 
     KeReleaseSpinLock(&g_npt_hide_lock, old_irql);
 
-    /* Caller must broadcast a TLB flush across every CPU's VMCB
-     * (conceptually: vmcb->ctl.guest_asid_tlb |= (1u << 31)) because
-     * that per-CPU broadcast lives outside this translation unit. */
+    /* Caller must broadcast a TLB flush across every CPU's VMCB via
+     * npt_tlb_flush(vmcb) because that per-CPU broadcast lives outside
+     * this translation unit. */
     return status;
 }
 
@@ -505,8 +591,8 @@ NTSTATUS npt_unhide_range(ULONGLONG start_pa, SIZE_T size)
 
     KeReleaseSpinLock(&g_npt_hide_lock, old_irql);
 
-    /* Caller must broadcast a TLB flush across every CPU's VMCB
-     * (conceptually: vmcb->ctl.guest_asid_tlb |= (1u << 31)) because
-     * that per-CPU broadcast lives outside this translation unit. */
+    /* Caller must broadcast a TLB flush across every CPU's VMCB via
+     * npt_tlb_flush(vmcb) because that per-CPU broadcast lives outside
+     * this translation unit. */
     return status;
 }

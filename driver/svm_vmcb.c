@@ -176,8 +176,13 @@ static PVOID svm_alloc_contig_zeroed(SIZE_T size, ULONGLONG *out_pa) {
  * NOTE: MmAllocateContiguousMemorySpecifyCache requires PASSIVE_LEVEL; warm
  * these once at PASSIVE_LEVEL before the bringup broadcast. */
 /* AMD 15.11: MSRPM bit 0 = intercept RDMSR, bit 1 = intercept WRMSR.
- * Zero bitmap means NO MSR intercepts. We must set specific bits for the
- * MSRs we want vmexit_handler to service. */
+ * Zero bitmap means NO MSR intercepts, BUT per APM Vol 2 §15.11 any
+ * MSR access outside the three MSRPM windows is unconditionally
+ * intercepted regardless of bitmap contents.  So the only MSRs the
+ * bitmap can affect are in-window addresses that we want the host to
+ * see.  Out-of-window MSRs (e.g. Hyper-V 0x40000000+) will always exit
+ * and be serviced by handle_msr; calling msrpm_set_intercept on them
+ * is a no-op worth flagging. */
 static void msrpm_set_intercept(PUCHAR bitmap, ULONGLONG msr) {
     ULONG region;
     ULONG offset_msr;
@@ -193,6 +198,9 @@ static void msrpm_set_intercept(PUCHAR bitmap, ULONGLONG msr) {
         region = 2;
         offset_msr = (ULONG)(msr - 0xC0010000ULL);
     } else {
+        /* Out-of-window: the MSR is already auto-intercepted and will
+         * reach handle_msr via IVEC3_MSR.  Flag misuse via NT_ASSERT. */
+        NT_ASSERT(FALSE);
         return;
     }
     bit_pos = offset_msr * 2;
@@ -211,17 +219,15 @@ static void svm_ensure_bitmaps(void) {
                 MmFreeContiguousMemory(p);
             } else {
                 g_msrpm_pa = pa;
-                /* Populate specific MSR intercepts (AMD 15.11). Otherwise a
-                 * zero bitmap = no intercept and handle_msr is dead code. */
+                /* AMD 15.11: bitmap only matters for in-window MSRs.
+                 * Hyper-V (0x40000000..) and KVM (0x4B564D00..) are
+                 * outside all three windows and auto-intercept via
+                 * IVEC3_MSR; handle_msr services them. */
                 {
                     PUCHAR b = (PUCHAR)g_msrpm_va;
-                    ULONGLONG m;
                     msrpm_set_intercept(b, 0xC0000080ULL);  /* EFER */
                     msrpm_set_intercept(b, 0xC0010117ULL);  /* VM_HSAVE_PA */
                     msrpm_set_intercept(b, 0xC0010114ULL);  /* VM_CR */
-                    for (m = 0x40000000ULL; m <= 0x400000FFULL; m++) {
-                        msrpm_set_intercept(b, m);
-                    }
                 }
             }
         }
@@ -350,6 +356,14 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
     /* AMD 15.5.1: guest RSP = top of this CPU's private host stack. */
     save->rsp = (ULONGLONG)((ULONG_PTR)ctx->host_stack_va + ctx->host_stack_size);
 
-    CHAMBER_LOG("VMCB built CPU %u (msrpm=%llx, iopm=%llx, n_cr3=%llx, rsp=%llx)\n",
-                ctx->cpu_index, g_msrpm_pa, g_iopm_pa, (ULONGLONG)ctl->n_cr3, save->rsp);
+    /* AMD 15.15.1: on a full VMCB write set vmcb_clean_bits = ~0u so
+     * hardware reloads nothing it has cached; update paths then clear
+     * only the groups whose fields changed (see timing.c for an
+     * example of clearing the Intercepts bit after a tsc_offset
+     * write). */
+    ctl->vmcb_clean_bits = ~0u;
+
+    /* CHAMBER_LOG unsafe at IPI_LEVEL -- DbgPrintEx acquires pool locks
+     * and may block.  First-CPU summary logged by svm_init_all_cpus
+     * once the broadcast returns. */
 }

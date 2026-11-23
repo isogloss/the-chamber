@@ -65,6 +65,10 @@ NTSTATUS npt_unhide_range(ULONGLONG start_pa, SIZE_T size);
  * a region MmGetPhysicalMemoryRanges() did not report at init time. */
 NTSTATUS npt_map_page(ULONGLONG gpa, ULONGLONG hpa, ULONGLONG flags);
 
+/* Request a guest-ASID TLB flush on the next VMRUN by writing
+ * TLB_CONTROL_FLUSH_GUEST into vmcb->ctl.tlb_control. */
+void npt_tlb_flush(VMCB *vmcb);
+
 /* Phase 1.6 NPT monitor hooks. Phase 6 will implement the real
  * execute-only / read-only / write-trap plumbing for tracing specific
  * pages; the Phase 1 handler must compile against these symbols. The
