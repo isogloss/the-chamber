@@ -38,32 +38,13 @@
  * transparently re-map and retry otherwise.
  */
 
-#include <ntddk.h>
-#include <wdm.h>
-#include <intrin.h>
-#include "the_chamber.h"
-#include "svm.h"
+/* dump_trigger.c is textually included from the tail of dump.c (see
+ * the composition note in dump.c). The kernel API prototypes and
+ * MemoryBasicInformation enum are declared once in dump.c's prologue
+ * and inherit into this file; redeclaring them here would create
+ * duplicate-signature conflicts in the composed translation unit. */
 #include "npt.h"
-#include "dump.h"
 #include "dump_trigger.h"
-
-/* --- Externs we rely on. ------------------------------------------- */
-NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId,
-                                                PEPROCESS *Process);
-NTKERNELAPI VOID     KeStackAttachProcess(PEPROCESS Process,
-                                          PKAPC_STATE ApcState);
-NTKERNELAPI VOID     KeUnstackDetachProcess(PKAPC_STATE ApcState);
-
-typedef enum _MEMORY_INFORMATION_CLASS2 {
-    MemoryBasicInformation2 = 0
-} MEMORY_INFORMATION_CLASS2;
-
-NTSTATUS ZwQueryVirtualMemory(HANDLE ProcessHandle,
-                              PVOID BaseAddress,
-                              MEMORY_INFORMATION_CLASS2 Class,
-                              PVOID Buffer,
-                              SIZE_T Length,
-                              PSIZE_T ReturnLength);
 
 /* --- Trigger state ------------------------------------------------- */
 
@@ -103,14 +84,33 @@ typedef struct _TRIGGER_STATE {
     } gpas[TRIGGER_MAX_GPAS];
     ULONG         gpa_count;
 
+    /* Deferred fire plumbing. The NPF handler runs at DISPATCH_LEVEL
+     * and cannot KeStackAttachProcess; it stashes the fault GPA on
+     * the slot and queues the slot's WORK_QUEUE_ITEM, which runs the
+     * dump at PASSIVE_LEVEL. fire_in_progress is a 0/1 cmpxchg gate
+     * so a burst of NPFs on the same slot queues at most one work
+     * item. The work item lives inline in the slot; the backing
+     * pool is freed by dump_trigger_shutdown. */
+    WORK_QUEUE_ITEM fire_work_item;
     volatile LONG fire_in_progress;
+    volatile LONGLONG fire_gpa;
+    volatile LONG fire_disarm_after;
+    volatile LONG fire_rearm_after;
+    ULONG         fire_kind_snapshot;
 } TRIGGER_STATE;
 
 static TRIGGER_STATE *g_triggers = NULL;
 static KSPIN_LOCK     g_trigger_lock;
 static BOOLEAN        g_trigger_init = FALSE;
 
+/* Outstanding work-item counter; incremented when a WORK_QUEUE_ITEM
+ * is queued and decremented when the worker returns. dump_trigger_shutdown
+ * uses it to wait for stragglers before freeing the trigger pool. */
+static volatile LONG g_trigger_outstanding = 0;
+
 /* --- Lifecycle ----------------------------------------------------- */
+
+static WORKER_THREAD_ROUTINE trigger_fire_worker;
 
 NTSTATUS dump_trigger_init(void)
 {
@@ -123,6 +123,7 @@ NTSTATUS dump_trigger_init(void)
     if (!g_triggers) return STATUS_INSUFFICIENT_RESOURCES;
 
     KeInitializeSpinLock(&g_trigger_lock);
+    g_trigger_outstanding = 0;
     g_trigger_init = TRUE;
     return STATUS_SUCCESS;
 }
@@ -133,6 +134,7 @@ void dump_trigger_shutdown(void)
 {
     ULONG i;
     KIRQL irql;
+    ULONG waits = 0;
 
     if (!g_trigger_init) return;
 
@@ -143,6 +145,17 @@ void dump_trigger_shutdown(void)
         }
     }
     KeReleaseSpinLock(&g_trigger_lock, irql);
+
+    /* Wait for any in-flight workers to return before freeing the
+     * trigger pool. Cap the wait at ~5 s so a wedged worker can't
+     * block unload indefinitely. */
+    while (InterlockedCompareExchange(&g_trigger_outstanding, 0, 0) > 0
+           && waits < 5000) {
+        LARGE_INTEGER delay;
+        delay.QuadPart = -10000LL; /* 1 ms */
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        waits++;
+    }
 
     ExFreePoolWithTag(g_triggers, POOLTAG("dump_trig"));
     g_triggers = NULL;
@@ -253,7 +266,7 @@ static NTSTATUS trigger_collect_gpas(TRIGGER_STATE *t,
         RtlZeroMemory(&mbi, sizeof(mbi));
         st = ZwQueryVirtualMemory((HANDLE)(LONG_PTR)-1,
                                    (PVOID)va,
-                                   MemoryBasicInformation2,
+                                   MemoryBasicInformation,
                                    &mbi,
                                    sizeof(mbi),
                                    &ret_len);
@@ -524,43 +537,97 @@ NTSTATUS dump_trigger_disarm(ULONGLONG target_pid, ULONG trigger_mask)
 
 /* --- NPF handling ------------------------------------------------- */
 
-/* Fire the dump for one matching trigger. The pause primitive writes
- * into the operator's output VA, which is only valid in the operator
- * process's AS -- but armed triggers always fire from guest context
- * (the DPC-rendezvous originator runs in host mode). The operator
- * owns the output VA across the arm/dump lifetime; verifying that is
- * on the operator. This fire path returns the pause primitive's byte
- * count. */
-static ULONGLONG trigger_fire(TRIGGER_STATE *t, ULONGLONG trigger_gpa)
+/* PASSIVE_LEVEL worker that services one pending fire. The NPF handler
+ * raised the fire_in_progress flag and queued this routine; we clear
+ * fire_in_progress on exit. The trigger slot may already be
+ * disarm_after'd under the spin lock; in that case we still do the
+ * dump (the operator asked for it) and then free the slot. */
+static VOID trigger_fire_worker(PVOID Context)
 {
-    ULONGLONG cr3;
-    ULONG     parked;
-    ULONGLONG bytes;
+    TRIGGER_STATE *t = (TRIGGER_STATE *)Context;
+    ULONGLONG     cr3 = 0;
+    ULONG         parked = 0;
+    ULONGLONG     bytes = 0;
+    ULONGLONG     fault_gpa;
+    ULONG         kind_at_fire;
+    ULONGLONG     target_pid;
+    ULONGLONG     output_va;
+    ULONGLONG     output_size;
+    BOOLEAN       disarm_after;
+    BOOLEAN       rearm_after;
+    KIRQL         irql;
 
-    bytes = dump_run_targeted(t->target_pid,
-                               (PVOID)(ULONG_PTR)t->output_va,
-                               t->output_size,
-                               t->kind,
-                               trigger_gpa,
+    if (!t) return;
+
+    /* Snapshot the fire parameters under the lock so a concurrent
+     * disarm cannot rug-pull them mid-dump. */
+    KeAcquireSpinLock(&g_trigger_lock, &irql);
+    if (!t->in_use) {
+        KeReleaseSpinLock(&g_trigger_lock, irql);
+        InterlockedExchange(&t->fire_in_progress, 0);
+        InterlockedDecrement(&g_trigger_outstanding);
+        return;
+    }
+    fault_gpa    = (ULONGLONG)InterlockedCompareExchange64(
+                        (volatile LONG64 *)&t->fire_gpa, 0, 0);
+    kind_at_fire = t->fire_kind_snapshot;
+    target_pid   = t->target_pid;
+    output_va    = t->output_va;
+    output_size  = t->output_size;
+    disarm_after = (BOOLEAN)InterlockedCompareExchange(
+                        &t->fire_disarm_after, 0, 0);
+    rearm_after  = (BOOLEAN)InterlockedCompareExchange(
+                        &t->fire_rearm_after, 0, 0);
+    KeReleaseSpinLock(&g_trigger_lock, irql);
+
+    bytes = dump_run_targeted(target_pid,
+                               (PVOID)(ULONG_PTR)output_va,
+                               output_size,
+                               kind_at_fire,
+                               fault_gpa,
                                &cr3,
                                &parked);
-    return bytes;
+    (void)bytes;
+
+    /* Post-fire bookkeeping. */
+    KeAcquireSpinLock(&g_trigger_lock, &irql);
+    if (t->in_use && t->kind == kind_at_fire) {
+        if (disarm_after) {
+            trigger_reset_slot_locked(t);
+        } else if (rearm_after) {
+            ULONG i;
+            for (i = 0; i < t->gpa_count; i++) {
+                if (t->kind == CHAMBER_TRIGGER_WX &&
+                    InterlockedCompareExchange(
+                        &t->gpas[i].consumed, 0, 0)) {
+                    continue;
+                }
+                (void)npt_map_page(t->gpas[i].gpa_2mb,
+                                   t->gpas[i].gpa_2mb,
+                                   0);
+            }
+        }
+    }
+    KeReleaseSpinLock(&g_trigger_lock, irql);
+
+    trigger_broadcast_tlb_flush();
+
+    InterlockedExchange(&t->fire_in_progress, 0);
+    InterlockedDecrement(&g_trigger_outstanding);
 }
 
-/* Called from vmexit.c handle_npf. Returns TRUE if the GPA belonged
- * to a trigger (fault handled by remapping; RIP must not advance).
- * Returns FALSE if the fault is not ours, letting handle_npf fall
- * through to npt_map_page / hidden-range injection.
+/* Called from vmexit.c handle_npf at the caller's current IRQL (as
+ * high as DISPATCH_LEVEL on the VMEXIT path). Returns TRUE if the
+ * GPA belonged to a trigger (fault handled by remapping; the caller
+ * must NOT advance RIP). Returns FALSE if the fault is not ours.
  *
  * On a matching fault:
- *   1. Re-map the PDE with full P|W|U perms via npt_map_page so the
+ *   1. Re-map the PDE with full P|W|U via npt_map_page so the
  *      instruction retry completes.
  *   2. Classify the access via fault_info bits.
- *   3. If the classification matches the trigger kind, bump the
- *      write counter (WRITE_THRESHOLD) or fire the dump (WX / OEP /
- *      WRITE_THRESHOLD at threshold).
- *   4. If the trigger disarms on fire and the dump fired, release
- *      the slot.
+ *   3. If the classification matches the trigger kind, stash the
+ *      fire context on the slot and queue the slot's work item.
+ *      The dump itself runs at PASSIVE_LEVEL via the worker.
  */
 BOOLEAN dump_trigger_on_npf(VMCB *vmcb, ULONGLONG fault_gpa,
                              ULONGLONG fault_info)
@@ -573,10 +640,10 @@ BOOLEAN dump_trigger_on_npf(VMCB *vmcb, ULONGLONG fault_gpa,
     BOOLEAN is_exec;
     ULONG kind;
     BOOLEAN fire_this_access = FALSE;
-    BOOLEAN disarm_after = FALSE;
     ULONGLONG threshold = 0;
     LONG64 counter_after = 0;
     ULONGLONG write_add = 0;
+    BOOLEAN queued = FALSE;
 
     UNREFERENCED_PARAMETER(vmcb);
 
@@ -605,11 +672,10 @@ BOOLEAN dump_trigger_on_npf(VMCB *vmcb, ULONGLONG fault_gpa,
     case CHAMBER_TRIGGER_WX:
         /* The task's intent is to trap on the W->X transition: after
          * a page has been written to, the next execute on it fires
-         * the dump. We approximate: any access on a page that was
-         * armed fires, with instruction fetch strongly preferred.
-         * If the fault is an instruction fetch we always fire; a
-         * write-only fault is treated as the "write" leg (just
-         * remap, no fire); a read-only fault also remaps silently. */
+         * the dump. We approximate: an instruction-fetch fault on
+         * an armed page fires; a write-only fault is treated as
+         * the write leg (just remap, no fire); a read-only fault
+         * also remaps silently. */
         if (is_exec) fire_this_access = TRUE;
         break;
 
@@ -641,49 +707,27 @@ BOOLEAN dump_trigger_on_npf(VMCB *vmcb, ULONGLONG fault_gpa,
         break;
     }
 
-    if (fire_this_access && !t->rearm) {
-        disarm_after = TRUE;
+    if (fire_this_access) {
+        /* One in-flight fire per slot. A second NPF before the
+         * worker drains is dropped (the operator sees the first
+         * fire's dump; the trigger either disarms or re-hides for
+         * the next). */
+        if (InterlockedCompareExchange(&t->fire_in_progress, 1, 0) == 0) {
+            t->fire_kind_snapshot = kind;
+            InterlockedExchange64(
+                (volatile LONG64 *)&t->fire_gpa, (LONG64)fault_gpa);
+            InterlockedExchange(&t->fire_disarm_after, t->rearm ? 0 : 1);
+            InterlockedExchange(&t->fire_rearm_after, t->rearm ? 1 : 0);
+
+            ExInitializeWorkItem(&t->fire_work_item,
+                                 trigger_fire_worker, t);
+            InterlockedIncrement(&g_trigger_outstanding);
+            ExQueueWorkItem(&t->fire_work_item, DelayedWorkQueue);
+            queued = TRUE;
+        }
     }
     KeReleaseSpinLock(&g_trigger_lock, irql);
 
-    if (fire_this_access) {
-        /* Serialize concurrent fires on the same trigger. Only one
-         * dump at a time per slot. */
-        if (InterlockedCompareExchange(&t->fire_in_progress, 1, 0) == 0) {
-            (void)trigger_fire(t, fault_gpa);
-            InterlockedExchange(&t->fire_in_progress, 0);
-        }
-
-        if (disarm_after) {
-            KeAcquireSpinLock(&g_trigger_lock, &irql);
-            if (t->in_use && t->kind == kind) {
-                trigger_reset_slot_locked(t);
-            }
-            KeReleaseSpinLock(&g_trigger_lock, irql);
-            trigger_broadcast_tlb_flush();
-        } else if (t->rearm) {
-            /* Re-hide every GPA in the trigger's set so a subsequent
-             * fire can be observed. On WX, consumed GPAs are left
-             * reported-once so repeated executes on the same page do
-             * not re-fire (per the task spec). */
-            KeAcquireSpinLock(&g_trigger_lock, &irql);
-            if (t->in_use && t->kind == kind) {
-                ULONG i;
-                for (i = 0; i < t->gpa_count; i++) {
-                    if (t->kind == CHAMBER_TRIGGER_WX &&
-                        InterlockedCompareExchange(
-                            &t->gpas[i].consumed, 0, 0)) {
-                        continue;
-                    }
-                    (void)npt_map_page(t->gpas[i].gpa_2mb,
-                                       t->gpas[i].gpa_2mb,
-                                       0);
-                }
-            }
-            KeReleaseSpinLock(&g_trigger_lock, irql);
-            trigger_broadcast_tlb_flush();
-        }
-    }
-
+    (void)queued;
     return TRUE;
 }

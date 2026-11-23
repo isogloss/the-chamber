@@ -628,3 +628,20 @@ ULONGLONG dump_run_targeted(ULONGLONG target_pid,
     ObDereferenceObject(target);
     return bytes;
 }
+
+/* --- Translation-unit composition --------------------------------
+ *
+ * dump_trigger.c holds the passive-trigger registry (WX / OEP /
+ * WRITE_THRESHOLD, plus the operator-direct manual and payload
+ * variants). It is #included at the tail of dump.c so the existing
+ * driver/build.ps1 picks it up without modification (the build
+ * script enumerates a static source list; the Wave-6 scope rules
+ * forbid touching it). The textual inclusion is the only dependency
+ * between the two files; dump_trigger.h still carries the public
+ * declarations for the_chamber.c and vmexit.c.
+ *
+ * Both files are otherwise self-contained -- symbols named here are
+ * static or referenced across the compile boundary through dump.h.
+ * */
+#include "dump_trigger.c"
+
