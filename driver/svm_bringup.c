@@ -66,12 +66,26 @@ static NTSTATUS svm_preallocate_cpu(ULONG cpu_index) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    /* host_stack_va used to be a 16 KiB-per-CPU allocation that
-     * svm_build_vmcb wrote into VMCB.save.rsp, but vmrun.asm overwrites
-     * save.rsp with the caller's live RSP on every VMRUN so the stack
-     * was never used.  Leave the fields NULL/zero. */
-    ctx->host_stack_va   = NULL;
-    ctx->host_stack_size = 0;
+    /* Phase 2.0: dedicated host stack. svm_launch switches rsp to
+     * host_stack_top before CLGI so the vmrun-loop host side runs on
+     * memory the HV owns. Without this, VM_HSAVE_PA.host_rsp saves a
+     * pointer into the loader thread's kernel stack, which the OS
+     * reclaims for other calls after DriverEntry returns -- first
+     * VMEXIT then reads garbage.  16 KiB per CPU, 16-byte aligned. */
+    ctx->host_stack_size = 16 * 1024;
+    ctx->host_stack_va   = ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, ctx->host_stack_size,
+        POOLTAG("host_stack"));
+    if (!ctx->host_stack_va) {
+        MmFreeContiguousMemory(ctx->host_save_va);
+        ctx->host_save_va = NULL;
+        MmFreeContiguousMemory(ctx->vmcb_va);
+        ctx->vmcb_va = NULL;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    /* Top of stack, 16-byte aligned. Pool base is 16-byte aligned on
+     * x64 so (base + size) & ~0xF == (base + size). */
+    ctx->host_stack_top = (PUCHAR)ctx->host_stack_va + ctx->host_stack_size;
     return STATUS_SUCCESS;
 }
 
@@ -183,7 +197,7 @@ NTSTATUS svm_launch_all_cpus(void) {
          * reads guest_entered observes the in-progress state. */
         ctx->guest_entered = TRUE;
 
-        svm_launch(ctx);
+        svm_launch(ctx, ctx->host_stack_top);
 
         KeRevertToUserAffinityThreadEx(prev_aff);
     }
@@ -212,7 +226,12 @@ static ULONG_PTR ipi_offline(ULONG_PTR arg) {
 }
 
 static VOID svm_free_cpu(PER_CPU_CTX *ctx) {
-    if (ctx->host_stack_va) { MmFreeContiguousMemory(ctx->host_stack_va); ctx->host_stack_va = NULL; }
+    if (ctx->host_stack_va) {
+        ExFreePoolWithTag(ctx->host_stack_va, POOLTAG("host_stack"));
+        ctx->host_stack_va = NULL;
+        ctx->host_stack_top = NULL;
+        ctx->host_stack_size = 0;
+    }
     if (ctx->vmcb_va)        { MmFreeContiguousMemory(ctx->vmcb_va);        ctx->vmcb_va = NULL; }
     if (ctx->host_save_va)   { MmFreeContiguousMemory(ctx->host_save_va);   ctx->host_save_va = NULL; }
 }

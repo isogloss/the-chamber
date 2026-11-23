@@ -155,6 +155,13 @@ typedef struct _PER_CPU_CTX {
      * from the guest. handle_rdpmc also serves reads from the snapshot. */
     BOOLEAN     guest_pmc_armed[6];
     ULONGLONG   guest_pmc_snapshot[6];
+    /* Phase 2.0: top-of-stack pointer (16-byte aligned) for the host
+     * side of the vmrun loop. svm_launch switches rsp to this value
+     * before CLGI so VM_HSAVE_PA.host_rsp saves a pointer into memory
+     * the HV owns, not into the caller's kernel stack (which gets
+     * reclaimed once DriverEntry's load thread finishes). Base of the
+     * allocation is host_stack_va; size is host_stack_size. */
+    PVOID       host_stack_top;
 } PER_CPU_CTX, *PPER_CPU_CTX;
 
 typedef struct _CHAMBER_GLOBALS {

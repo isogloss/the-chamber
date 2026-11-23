@@ -40,6 +40,7 @@ EXTERN timing_update:PROC
 
 PUBLIC svm_launch
 
+; svm_launch(PER_CPU_CTX *ctx /*rcx*/, PVOID host_stack_top /*rdx*/)
 svm_launch PROC
     push rbx
     push rbp
@@ -50,22 +51,36 @@ svm_launch PROC
     push r14
     push r15
 
-    ; Allocate 16-byte stack frame:
-    ;   [rsp+0] = ctx pointer (host-side authoritative)
-    ;   [rsp+8] = guest R15 scratch (written on every VMEXIT)
-    ; sub rsp, 16 keeps rsp%16 == 8.
+    ; Allocate guest-wake frame on the CALLER'S stack:
+    ;   [caller_rsp + 0] = ctx pointer
+    ;   [caller_rsp + 8] = scratch (unused on guest-side wake)
+    ; The guest wakes here via guest_entry_point, which unwinds this
+    ; frame and the 8 non-volatiles then rets to svm_launch's caller.
     sub rsp, 16
-    mov [rsp], rcx                      ; stash ctx on stack
-    mov qword ptr [rsp + 8], 0          ; scratch slot init
+    mov [rsp], rcx                      ; [caller-80] = ctx
+    mov qword ptr [rsp + 8], 0
     mov rax, [rcx + VMCB_PA_OFFSET]     ; rax = guest vmcb_pa
 
     pushfq
-    pop rdx
-    mov [rax + 400h + 170h], rdx        ; VMCB.save.rflags
-    lea rdx, guest_entry_point
-    mov [rax + 400h + 178h], rdx        ; VMCB.save.rip = guest resume point
-    mov rdx, rsp
-    mov [rax + 400h + 1D8h], rdx        ; VMCB.save.rsp = current rsp
+    pop r8
+    mov [rax + 400h + 170h], r8         ; VMCB.save.rflags
+    lea r8, guest_entry_point
+    mov [rax + 400h + 178h], r8         ; VMCB.save.rip = guest resume point
+    mov r8, rsp
+    mov [rax + 400h + 1D8h], r8         ; VMCB.save.rsp = caller rsp - 16
+
+    ; Switch rsp to the dedicated host stack BEFORE CLGI/VMRUN so
+    ; VM_HSAVE_PA.host_rsp saves a pointer into HV-owned memory. The
+    ; caller's kernel stack is only safe while the caller's thread is
+    ; executing in it; once DriverEntry's load thread returns it the OS
+    ; reclaims the memory for other calls. The vmrun loop runs on the
+    ; dedicated stack forever; host_done halts the CPU because the
+    ; caller is in guest mode by then and cannot be returned to.
+    ; Reserve a 16-byte ctx+scratch frame on the dedicated stack.
+    sub rdx, 16                         ; rdx = host_stack_top - 16
+    mov [rdx], rcx                      ; dedicated [rsp] = ctx
+    mov qword ptr [rdx + 8], 0          ; dedicated scratch init
+    mov rsp, rdx                        ; switch stacks
 
     clgi
 
@@ -182,17 +197,20 @@ host_vmexit_loop:
     jmp host_vmexit_loop
 
 host_done:
+    ; Shutdown path. We are on the dedicated host stack; the caller is
+    ; in guest mode on its own thread stack and cannot be returned to
+    ; from here. Clear EFER.SVME on this CPU and halt. A proper clean
+    ; unload would require a per-CPU HV thread that can rendezvous on
+    ; a signal; that is a later phase. Shutdown today is one-way.
     stgi
-    add rsp, 16                         ; free ctx + scratch slot
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rdi
-    pop rsi
-    pop rbp
-    pop rbx
-    ret
+    mov ecx, 0C0000080h                 ; EFER
+    rdmsr
+    btr eax, 12                         ; clear SVME bit
+    wrmsr
+    cli
+host_halt_loop:
+    hlt
+    jmp host_halt_loop
 
 guest_entry_point:
     ; Guest wakes up here on first VMRUN.  Stack layout: 16-byte ctx+scratch

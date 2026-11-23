@@ -223,4 +223,4 @@ C_ASSERT(sizeof(VMCB) == 0x800);
 
 void     svm_build_vmcb(PER_CPU_CTX *ctx);
 void     vmexit_handler(PER_CPU_CTX *ctx);
-void     svm_launch(PER_CPU_CTX *ctx);  /* defined in vmrun.asm */
+void     svm_launch(PER_CPU_CTX *ctx, PVOID host_stack_top);  /* defined in vmrun.asm */
