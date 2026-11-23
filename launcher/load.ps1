@@ -125,7 +125,10 @@ if (-not ('TheChamber.Pinvoke' -as [type])) {
 
 # CTL_CODE(DeviceType, Function, Method, Access) =
 #   (DeviceType << 16) | (Access << 14) | (Function << 2) | Method
-# with DeviceType=0x8000, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0.
+# with DeviceType=0x8000, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0,
+# FILE_READ_ACCESS=1, FILE_WRITE_ACCESS=2. KICK/SHUTDOWN mutate device
+# state and require FILE_WRITE_ACCESS so the I/O manager's access-check
+# passes on a GENERIC_WRITE-opened handle.
 function New-CtlCode {
     param([uint32]$DeviceType, [uint32]$Function, [uint32]$Method = 0, [uint32]$Access = 0)
     return ([uint32](($DeviceType -shl 16) -bor ($Access -shl 14) -bor ($Function -shl 2) -bor $Method))
@@ -133,15 +136,15 @@ function New-CtlCode {
 
 $GENERIC_READ_WRITE = 0xC0000000
 $OPEN_EXISTING      = 3
-$IOCTL_STATUS   = New-CtlCode -DeviceType 0x8000 -Function 0x801   # 0x80002004
-$IOCTL_KICK     = New-CtlCode -DeviceType 0x8000 -Function 0x802   # 0x80002008
-$IOCTL_SHUTDOWN = New-CtlCode -DeviceType 0x8000 -Function 0x803   # 0x8000200C
+$IOCTL_STATUS   = New-CtlCode -DeviceType 0x8000 -Function 0x801 -Access 0   # 0x80002004
+$IOCTL_KICK     = New-CtlCode -DeviceType 0x8000 -Function 0x802 -Access 2   # 0x8000A008
+$IOCTL_SHUTDOWN = New-CtlCode -DeviceType 0x8000 -Function 0x803 -Access 2   # 0x8000A00C
 
 # Self-check: re-derive and assert. A mistyped literal here cost us a
 # watchdog kick in an earlier revision -- never again.
 if ($IOCTL_STATUS   -ne 0x80002004) { throw ("IOCTL_STATUS   recompute mismatch: 0x{0:X}" -f $IOCTL_STATUS) }
-if ($IOCTL_KICK     -ne 0x80002008) { throw ("IOCTL_KICK     recompute mismatch: 0x{0:X}" -f $IOCTL_KICK) }
-if ($IOCTL_SHUTDOWN -ne 0x8000200C) { throw ("IOCTL_SHUTDOWN recompute mismatch: 0x{0:X}" -f $IOCTL_SHUTDOWN) }
+if ($IOCTL_KICK     -ne 0x8000A008) { throw ("IOCTL_KICK     recompute mismatch: 0x{0:X}" -f $IOCTL_KICK) }
+if ($IOCTL_SHUTDOWN -ne 0x8000A00C) { throw ("IOCTL_SHUTDOWN recompute mismatch: 0x{0:X}" -f $IOCTL_SHUTDOWN) }
 
 $h = [TheChamber.Pinvoke+Native]::CreateFile(
     $symlink, $GENERIC_READ_WRITE, 0,

@@ -65,9 +65,11 @@ if (-not ('TheChamber.Pinvoke' -as [type])) {
 '@
 }
 
-# CTL_CODE(0x8000, 0x803, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0)
-$IOCTL_SHUTDOWN = [uint32]((0x8000 -shl 16) -bor (0x803 -shl 2))
-if ($IOCTL_SHUTDOWN -ne 0x8000200C) { throw ("IOCTL_SHUTDOWN recompute mismatch: 0x{0:X}" -f $IOCTL_SHUTDOWN) }
+# CTL_CODE(0x8000, 0x803, METHOD_BUFFERED=0, FILE_WRITE_ACCESS=2).
+# Driver requires FILE_WRITE_ACCESS for SHUTDOWN; the handle below opens
+# with GENERIC_READ|GENERIC_WRITE so the I/O manager's access-check passes.
+$IOCTL_SHUTDOWN = [uint32]((0x8000 -shl 16) -bor (2 -shl 14) -bor (0x803 -shl 2))
+if ($IOCTL_SHUTDOWN -ne 0x8000A00C) { throw ("IOCTL_SHUTDOWN recompute mismatch: 0x{0:X}" -f $IOCTL_SHUTDOWN) }
 
 $symlink = "\\.\$name"
 $h = [TheChamber.Pinvoke+Native]::CreateFile(
