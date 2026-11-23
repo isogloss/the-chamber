@@ -30,8 +30,14 @@ cannot do.
   change.
 
 - [`../../audit/detection_surface.md`](../../audit/detection_surface.md)
-  -- Per-class detection-surface audit of the current driver with
-  signal-strength rankings and prioritized gap list.
+  -- Entry point for the detection-surface audit.  Stub that points at
+  `phase1_done.md` for current state and at
+  `archived/2026-11-pre-phase1.md` for the historical per-class audit
+  that preceded Phase 1.
+
+- [`../../audit/phase1_done.md`](../../audit/phase1_done.md) --
+  Phase 1 completion marker with the exit-criteria map and the
+  file:line locus of every Phase 1 change.
 
 - [`../../audit/full_audit_v2.md`](../../audit/full_audit_v2.md) --
   Full-audit skeleton.
@@ -49,7 +55,10 @@ For a new operator joining the lab:
 3. `ceilings.md` -- what the design cannot do, so that scope stays
    realistic.
 4. `discipline.md` -- the operational checklist.
-5. `audit/detection_surface.md` -- the current state of the driver
-   and what still needs to be fixed before it is deployable.
+5. `audit/phase1_done.md` -- the current state of the driver as of
+   the Phase 1 completion marker, with the exit-criteria map.
 6. `audit/synthetic_values_table.md` -- the single source of truth
    for every spoofed value.
+7. `audit/detection_surface.md` -- entry point for the
+   detection-surface audit (pre-Phase-1 pass archived under
+   `audit/archived/2026-11-pre-phase1.md`).
