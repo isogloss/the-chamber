@@ -285,12 +285,12 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
      * host hypercall path (intercept vector 4). */
     ctl->intercept_vec4 |= IVEC4_VMRUN | IVEC4_VMMCALL;
 
-    /* AMD 15.9 Table 15-2: intercept_dr packs DR reads in bits 0-15 and
-     * DR writes in bits 16-31.  Trap DR0-DR3 (bits 0-3 for read, 16-19
-     * for write) because Phase 6.3 HW-breakpoint capture is out of scope
-     * for passive dump; without an intercept the guest reads host DR0-DR3
-     * and writes them through to the shared host DR state. */
-    ctl->intercept_dr = 0x000F000FU;
+    /* No DR intercepts.  Phase 6.3 HW-breakpoint capture is out of scope
+     * for passive dump; the HV has no use for guest DR0-DR3 state and
+     * intercepting without a handler case produced noisy #UD injections
+     * via the default arm (Wave 1.5 regression). Guest DR use remains
+     * the guest's concern. */
+    ctl->intercept_dr = 0;
 
     /* AMD 15.11 / 15.10.2: install the shared (all-zero) permission bitmaps. */
     svm_ensure_bitmaps();
