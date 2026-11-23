@@ -225,21 +225,38 @@ static void svm_ensure_bitmaps(void) {
                  * IVEC3_MSR; handle_msr services them. */
                 {
                     PUCHAR b = (PUCHAR)g_msrpm_va;
+                    /* Core SVM-state hiding. */
                     msrpm_set_intercept(b, 0xC0000080ULL);  /* EFER */
                     msrpm_set_intercept(b, 0xC0010117ULL);  /* VM_HSAVE_PA */
                     msrpm_set_intercept(b, 0xC0010114ULL);  /* VM_CR */
-                    /* Phase 2.1 PMU stealth: intercept every WRMSR to
-                     * PerfEvtSelCoreN (even MSRs; the odd PerfCtrCoreN
-                     * values are left passthrough and shadowed inside
-                     * the VMEXIT handler). Tracks which counters the
-                     * guest armed so handle_rdpmc can serve the matching
-                     * snapshot. */
+                    /* SMM shadow registers: guest reads must return a
+                     * bare-metal-looking default (0). */
+                    msrpm_set_intercept(b, 0xC0010112ULL);  /* SMM_ADDR */
+                    msrpm_set_intercept(b, 0xC0010113ULL);  /* SMM_MASK */
+                    /* TSC_RATIO: return 8.32 fixed-point 1.0 so a guest
+                     * that queries it reads the hardware default. */
+                    msrpm_set_intercept(b, 0xC0000104ULL);  /* TSC_RATIO */
+                    /* PMU: intercept every WRMSR to PerfEvtSelCoreN
+                     * (even MSRs; odd PerfCtrCoreN stays passthrough and
+                     * is shadowed inside the VMEXIT handler). Tracks
+                     * which counters the guest armed so handle_rdpmc
+                     * can serve the matching snapshot. */
                     msrpm_set_intercept(b, 0xC0010200ULL);  /* PerfEvtSelCore0 */
                     msrpm_set_intercept(b, 0xC0010202ULL);  /* PerfEvtSelCore1 */
                     msrpm_set_intercept(b, 0xC0010204ULL);  /* PerfEvtSelCore2 */
                     msrpm_set_intercept(b, 0xC0010206ULL);  /* PerfEvtSelCore3 */
                     msrpm_set_intercept(b, 0xC0010208ULL);  /* PerfEvtSelCore4 */
                     msrpm_set_intercept(b, 0xC001020AULL);  /* PerfEvtSelCore5 */
+                    /* MSRs NOT intercepted here (deliberately passthrough):
+                     *   0x48 SPEC_CTRL, 0x49 PRED_CMD       mitigation controls
+                     *   0xE7 MPERF, 0xE8 APERF              frequency readouts
+                     *   0x277 IA32_PAT                       guest-owned PAT
+                     *   0xC0000103 TSC_AUX                  RDTSCP tag
+                     *   0xC0010015 HWCR                     no SVM-state bits
+                     *   0xC0010201/03/05/07/09/0B PerfCtrCore0..5
+                     *   STAR/LSTAR/CSTAR/SFMASK/FS_BASE/GS_BASE/KernelGSBase
+                     * handle_msr still services them when another exit
+                     * route (e.g. out-of-window MSR) delivers them. */
                 }
             }
         }

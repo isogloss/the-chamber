@@ -226,6 +226,10 @@ static BOOLEAN handle_msr_allowlist_pass(ULONG msr)
     switch (msr) {
     case 0x00000010UL:   /* IA32_TIME_STAMP_COUNTER      */
     case 0x0000001BUL:   /* IA32_APIC_BASE               */
+    case 0x00000048UL:   /* SPEC_CTRL                    */
+    case 0x00000049UL:   /* PRED_CMD                     */
+    case 0x000000E7UL:   /* MPERF                        */
+    case 0x000000E8UL:   /* APERF                        */
     case 0x000000FEUL:   /* IA32_MTRRCAP                 */
     case 0x00000277UL:   /* IA32_PAT                     */
     case 0x000002FFUL:   /* IA32_MTRR_DEF_TYPE           */
@@ -237,6 +241,8 @@ static BOOLEAN handle_msr_allowlist_pass(ULONG msr)
     case 0xC0000100UL:   /* FS_BASE                      */
     case 0xC0000101UL:   /* GS_BASE                      */
     case 0xC0000102UL:   /* KERNEL_GS_BASE               */
+    case 0xC0000103UL:   /* TSC_AUX (RDTSCP tag)         */
+    case 0xC0010015UL:   /* HWCR (no SVM-state bits)     */
         return TRUE;
     default:
         return FALSE;
@@ -329,6 +335,31 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
         if (!is_write) {
             vmcb->save.rax   = 0;
             ctx->gpr_save[3] = 0;
+        }
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+
+    /* SMM_ADDR (0xC0010112), SMM_MASK (0xC0010113): hide SMM configuration;
+     * guest reads the bare-metal default of 0 and writes are absorbed. */
+    if (msr == 0xC0010112UL || msr == 0xC0010113UL) {
+        if (!is_write) {
+            vmcb->save.rax   = 0;
+            ctx->gpr_save[3] = 0;
+        }
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+
+    /* TSC_RATIO (0xC0000104): 8.32 fixed-point identity 1.0.  Integer
+     * part 1 goes in bits [39:32]; fraction + reserved are zero.  This
+     * is what stock Linux and Windows read back from an unprogrammed
+     * part; returning 0 would itself be an anomaly. */
+    if (msr == 0xC0000104UL) {
+        if (!is_write) {
+            ULONGLONG v = 0x0000000100000000ULL;
+            vmcb->save.rax   = (ULONGLONG)(ULONG)v;
+            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(v >> 32);
         }
         vmcb->save.rip = vmcb->ctl.next_rip;
         return;
