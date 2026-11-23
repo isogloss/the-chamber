@@ -40,6 +40,7 @@
 #include "the_chamber.h"
 #include "stealth.h"
 #include "timing.h"
+#include "npt.h"
 #include <wdmsec.h>   /* IoCreateDeviceSecure + SDDL_DEVOBJ_SYS_ALL_ADM_ALL */
 
 CHAMBER_GLOBALS g_chamber;
@@ -521,6 +522,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
         CHAMBER_LOG_ERR("svm_launch_all_cpus failed 0x%08x\n", st);
         goto fail;
     }
+
+    /* Phase 7.1: NPT-hide the HV's own image so guest reads of our
+     * code / data return #PF (when CHAMBER_HV_INTROSPECTION_RESIST is
+     * compiled in; no-op otherwise). Capture DllBase/SizeOfImage from
+     * the live DRIVER_OBJECT BEFORE stealth_apply scrambles section
+     * headers and zeros the PE prefix; DriverStart/DriverSize survive
+     * stealth_apply, but doing this first keeps the hide pass agnostic
+     * to stealth internals. */
+    (void)npt_hide_hv_image(Driver->DriverStart, Driver->DriverSize);
 
     /* Self-hide: rename our KLDR entry + null driver name.  Keep the
      * crash marker set across stealth_apply so a bugcheck from the

@@ -539,6 +539,25 @@ static void handle_npf(PER_CPU_CTX *ctx, VMCB *vmcb)
         return;
     }
 
+    /* Phase 7.1: if the fault lands inside a hidden range (HV image
+     * pages when CHAMBER_HV_INTROSPECTION_RESIST is compiled in), do
+     * NOT remap. Inject #PF into the guest so it sees a page fault at
+     * the probing instruction and must handle it; the PDE stays
+     * cleared so a retry refaults the same way. */
+    if (npt_is_hidden(fault_page)) {
+        /* AMD Table 15-5: event_inject, vector 14 (#PF), type 3
+         * (exception), ec-valid bit 11 set, valid bit 31 set. The
+         * error code (bits 32-63) matches an ordinary user-write PF
+         * (P=0, W/R per fault_info, U/S=1, RSVD=0). CR2 would normally
+         * hold the faulting GVA; we can't synthesize a GVA here (the
+         * VMEXIT reports a GPA) so leave CR2 alone -- some probers
+         * inspect it and see stale data, which is fine for passive
+         * defense. */
+        vmcb->ctl.event_inject = (1ULL << 31) | (1ULL << 11) |
+                                 (3ULL << 8) | 14ULL;
+        return;
+    }
+
     /* Grow the NPT on demand: install a 2 MB identity mapping covering
      * the faulting guest-physical address. Phase 1 grants full
      * Present|Writable|User permissions; Phase 6 may tighten this. */
