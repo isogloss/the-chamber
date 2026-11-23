@@ -175,7 +175,58 @@ static NTSTATUS crash_marker_clear(void)
     return STATUS_SUCCESS;
 }
 
-/* --- Watchdog --- */
+/* --- Watchdog ---
+ *
+ * Phase 7.3 extends the watchdog with:
+ *   - Consecutive-miss counter. A miss is one DPC fire that sees
+ *     elapsed time since last_kick > WATCHDOG_TIMEOUT_MS; a KICK
+ *     IOCTL resets the counter to 0.
+ *   - Auto-unload path. After WATCHDOG_MAX_MISSES misses the DPC
+ *     queues a PASSIVE_LEVEL work item that calls svm_shutdown_all_cpus.
+ *     The work item is required because svm_shutdown_all_cpus uses
+ *     affinity-switch logic that cannot run at DISPATCH_LEVEL (where
+ *     the DPC fires).
+ *
+ * The AMD-SVM unload sequence is EFER.SVME-clear per CPU (see
+ * svm_bringup.c svm_offline_cpu). There is no VMXOFF on AMD -- that's
+ * Intel VT-x terminology.
+ */
+
+/* PASSIVE_LEVEL work-item callback. Called once when the watchdog
+ * determines the operator agent is gone. Does the full SVM teardown
+ * (EFER.SVME clear per CPU, free VMCB / MSRPM / IOPM / NPT / host-save).
+ * Running IoAllocateWorkItem's callback at PASSIVE_LEVEL is documented;
+ * the DPC that queued it has already returned. */
+static IO_WORKITEM_ROUTINE watchdog_unload_worker;
+static void watchdog_unload_worker(PDEVICE_OBJECT DevObj, PVOID Ctx)
+{
+    UNREFERENCED_PARAMETER(DevObj);
+    UNREFERENCED_PARAMETER(Ctx);
+
+    CHAMBER_LOG_WARN("watchdog auto-unload: clearing EFER.SVME on all CPUs\n");
+
+    /* Full SVM teardown. svm_shutdown_all_cpus sets per-CPU
+     * shutdown_requested, broadcasts the offline IPI (which clears
+     * EFER.SVME), frees per-CPU structures, and nulls g_cpu_ctx. */
+    if (g_chamber.svm_initialized) {
+        (void)svm_shutdown_all_cpus();
+        g_chamber.svm_initialized = FALSE;
+    }
+    if (g_chamber.npt_initialized) {
+        npt_free_tables();
+        g_chamber.npt_initialized = FALSE;
+    }
+
+    /* Free the work item itself. We stashed its pointer in globals so
+     * the DPC could queue it exactly once; zero the pointer AFTER free
+     * so a late second queue attempt sees NULL. */
+    if (g_chamber.shutdown_work_item) {
+        PIO_WORKITEM wi = g_chamber.shutdown_work_item;
+        g_chamber.shutdown_work_item = NULL;
+        IoFreeWorkItem(wi);
+    }
+}
+
 static void watchdog_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2)
 {
     UNREFERENCED_PARAMETER(Dpc);
@@ -195,15 +246,54 @@ static void watchdog_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2)
     ULONGLONG delta_ms = delta_100ns / 10000ULL;
 
     if (delta_ms > WATCHDOG_TIMEOUT_MS) {
-        CHAMBER_LOG_WARN("watchdog timeout (%llu ms) -- requesting unload\n",
-                         delta_ms);
-        InterlockedExchange(&g_chamber.unload_requested, 1);
-        /* Signal any per-CPU shutdown flags so VMRUN loops exit */
-        if (g_cpu_ctx) {
-            for (ULONG i = 0; i < g_cpu_count; i++) {
-                InterlockedExchange(&g_cpu_ctx[i].shutdown_requested, 1);
+        ULONG miss;
+        KeAcquireSpinLock(&g_chamber.state_lock, &irql);
+        miss = ++g_chamber.miss_count;
+        KeReleaseSpinLock(&g_chamber.state_lock, irql);
+
+        CHAMBER_LOG_WARN("watchdog miss %u/%u (delta=%llu ms)\n",
+                         miss, WATCHDOG_MAX_MISSES, delta_ms);
+
+        if (miss >= WATCHDOG_MAX_MISSES) {
+            /* Signal per-CPU shutdown flags so VMRUN loops exit at
+             * their next VMEXIT. The work item below then does the
+             * actual EFER.SVME-clear sequence at PASSIVE_LEVEL. */
+            InterlockedExchange(&g_chamber.unload_requested, 1);
+            if (g_cpu_ctx) {
+                for (ULONG i = 0; i < g_cpu_count; i++) {
+                    InterlockedExchange(
+                        &g_cpu_ctx[i].shutdown_requested, 1);
+                }
+            }
+
+            /* Queue the PASSIVE-level unload path exactly once. The
+             * work item was allocated in DriverEntry. Null the pointer
+             * under the lock to make this one-shot even if the DPC
+             * refires. */
+            PIO_WORKITEM wi = NULL;
+            KeAcquireSpinLock(&g_chamber.state_lock, &irql);
+            if (g_chamber.shutdown_work_item &&
+                g_chamber.unload_requested) {
+                wi = g_chamber.shutdown_work_item;
+                /* Don't null here -- the worker frees it and nulls
+                 * on completion. We mark the DPC's intent via a
+                 * sentinel: raise miss_count beyond threshold so the
+                 * check above stays true but we only queue once. */
+                g_chamber.miss_count = WATCHDOG_MAX_MISSES + 1;
+            }
+            KeReleaseSpinLock(&g_chamber.state_lock, irql);
+
+            if (wi && miss == WATCHDOG_MAX_MISSES) {
+                IoQueueWorkItem(wi, watchdog_unload_worker,
+                                DelayedWorkQueue, NULL);
             }
         }
+    } else {
+        /* Successful kick observed since the last DPC. Reset the
+         * miss counter so a transient hiccup doesn't accumulate. */
+        KeAcquireSpinLock(&g_chamber.state_lock, &irql);
+        g_chamber.miss_count = 0;
+        KeReleaseSpinLock(&g_chamber.state_lock, irql);
     }
 }
 
@@ -211,6 +301,14 @@ static void start_watchdog(void)
 {
     KeInitializeTimer(&g_chamber.watchdog_timer);
     KeInitializeDpc(&g_chamber.watchdog_dpc, watchdog_dpc_routine, NULL);
+
+    /* Phase 7.3: pre-allocate the work item at PASSIVE_LEVEL so the
+     * DPC can queue it without allocating. g_chamber.device_object is
+     * required; it was created in DriverEntry before start_watchdog. */
+    if (g_chamber.device_object) {
+        g_chamber.shutdown_work_item =
+            IoAllocateWorkItem(g_chamber.device_object);
+    }
 
     LARGE_INTEGER due;
     due.QuadPart = -(LONGLONG)(5000 * 10000);  /* first fire in 5 s */
@@ -221,6 +319,13 @@ static void stop_watchdog(void)
 {
     KeCancelTimer(&g_chamber.watchdog_timer);
     KeRemoveQueueDpc(&g_chamber.watchdog_dpc);
+    /* If the auto-unload path never fired, free the work item here.
+     * If it did fire, the worker already freed it and nulled the
+     * pointer -- null-check before free. */
+    if (g_chamber.shutdown_work_item) {
+        IoFreeWorkItem(g_chamber.shutdown_work_item);
+        g_chamber.shutdown_work_item = NULL;
+    }
 }
 
 static void reset_watchdog(void)
@@ -231,6 +336,10 @@ static void reset_watchdog(void)
     KIRQL irql;
     KeAcquireSpinLock(&g_chamber.state_lock, &irql);
     g_chamber.last_kick_time = now;
+    /* Phase 7.3: a successful kick zeros the miss counter so a
+     * transient agent stall does not accumulate toward the auto-
+     * unload threshold. */
+    g_chamber.miss_count = 0;
     KeReleaseSpinLock(&g_chamber.state_lock, irql);
     InterlockedIncrement(&g_chamber.kick_counter);
 }
