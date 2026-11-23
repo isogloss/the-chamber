@@ -56,6 +56,99 @@ extern USHORT svm_read_gs(void);
 extern USHORT svm_read_ldtr(void);
 extern USHORT svm_read_tr(void);
 
+/* Long-mode FS/GS base MSRs (IA32_FS_BASE / IA32_GS_BASE). */
+#define MSR_IA32_FS_BASE     0xC0000100ULL
+#define MSR_IA32_GS_BASE     0xC0000101ULL
+
+/* Raw 8-byte GDT entry (code/data) and 16-byte TSS/LDT entry layout.
+ * AMD APM Vol 2 §4.8, Intel SDM Vol 3A §3.4.5. */
+#pragma pack(push, 1)
+typedef struct _GDT_ENTRY64 {
+    USHORT limit_low;
+    USHORT base_low;
+    UCHAR  base_mid;
+    UCHAR  access;       /* P|DPL|S|type bits */
+    UCHAR  flags_limit;  /* G|D/B|L|AVL|limit_high */
+    UCHAR  base_high;
+} GDT_ENTRY64;
+#pragma pack(pop)
+
+/* Decode one 8-byte GDT entry into VMCB_SEG (attrib / limit / base).
+ * attrib: AMD APM Vol 2 Table 15-2 packs the 12 descriptor bits:
+ *   bits 0-3  type
+ *   bit  4    S
+ *   bits 5-6  DPL
+ *   bit  7    P
+ *   bit  8    AVL
+ *   bit  9    L
+ *   bit 10    D/B
+ *   bit 11    G
+ * Byte 5 of the GDT holds P|DPL|S|type (bits 7..0 of the first attrib byte).
+ * Byte 6 nibble high holds G|D/B|L|AVL (bits 4..7 of the second attrib byte). */
+static void svm_decode_seg(USHORT selector, PVOID gdt_base, VMCB_SEG *out) {
+    ULONG idx = (ULONG)(selector >> 3) & 0x1FFFU;
+    GDT_ENTRY64 *e;
+    ULONG lim;
+    ULONGLONG base;
+    USHORT attrib;
+
+    out->selector = selector;
+    out->attrib   = 0;
+    out->limit    = 0;
+    out->base     = 0;
+
+    if (selector == 0 || gdt_base == NULL) {
+        return;
+    }
+
+    e = (GDT_ENTRY64 *)((UCHAR *)gdt_base + ((SIZE_T)idx * sizeof(GDT_ENTRY64)));
+    lim  = (ULONG)e->limit_low | (((ULONG)(e->flags_limit & 0x0Fu)) << 16);
+    base = (ULONGLONG)e->base_low
+         | ((ULONGLONG)e->base_mid  << 16)
+         | ((ULONGLONG)e->base_high << 24);
+    attrib = (USHORT)((e->access & 0xFFu) | (((USHORT)(e->flags_limit & 0xF0u)) << 4));
+    if ((e->flags_limit & 0x80u) != 0) {
+        /* G=1 means limit is in 4 KiB units: hardware reports limit_bytes =
+         * (limit * 4096) + 0xFFF, but VMCB wants the raw 20-bit field. The
+         * VMCB_SEG.limit is 32 bits and holds the raw limit value. */
+    }
+    out->limit  = lim;
+    out->base   = base;
+    out->attrib = attrib;
+}
+
+/* Long-mode system descriptor (TR, LDTR) is 16 bytes: the base straddles
+ * the next 8-byte slot. */
+static void svm_decode_sys_seg(USHORT selector, PVOID gdt_base, VMCB_SEG *out) {
+    ULONG idx = (ULONG)(selector >> 3) & 0x1FFFU;
+    GDT_ENTRY64 *lo;
+    ULONG  *hi;
+    ULONG   lim;
+    ULONGLONG base;
+    USHORT  attrib;
+
+    out->selector = selector;
+    out->attrib   = 0;
+    out->limit    = 0;
+    out->base     = 0;
+
+    if (selector == 0 || gdt_base == NULL) {
+        return;
+    }
+
+    lo = (GDT_ENTRY64 *)((UCHAR *)gdt_base + ((SIZE_T)idx * sizeof(GDT_ENTRY64)));
+    hi = (ULONG *)((UCHAR *)gdt_base + ((SIZE_T)idx * sizeof(GDT_ENTRY64)) + 8);
+    lim  = (ULONG)lo->limit_low | (((ULONG)(lo->flags_limit & 0x0Fu)) << 16);
+    base = (ULONGLONG)lo->base_low
+         | ((ULONGLONG)lo->base_mid  << 16)
+         | ((ULONGLONG)lo->base_high << 24)
+         | (((ULONGLONG)hi[0]) << 32);
+    attrib = (USHORT)((lo->access & 0xFFu) | (((USHORT)(lo->flags_limit & 0xF0u)) << 4));
+    out->limit  = lim;
+    out->base   = base;
+    out->attrib = attrib;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Permission bitmaps                                                        */
 /* ------------------------------------------------------------------------- */
@@ -200,16 +293,6 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
 
     /* ==================== State-save area (Table 15-3) ================== */
 
-    /* Segment selectors (AMD 15.5.1) via the companion assembly readers. */
-    save->es.selector   = svm_read_es();     /* AMD 15.5.1 ES selector   */
-    save->cs.selector   = svm_read_cs();     /* AMD 15.5.1 CS selector   */
-    save->ss.selector   = svm_read_ss();     /* AMD 15.5.1 SS selector   */
-    save->ds.selector   = svm_read_ds();     /* AMD 15.5.1 DS selector   */
-    save->fs.selector   = svm_read_fs();     /* AMD 15.5.1 FS selector   */
-    save->gs.selector   = svm_read_gs();     /* AMD 15.5.1 GS selector   */
-    save->ldtr.selector = svm_read_ldtr();   /* AMD 15.5.1 LDTR selector */
-    save->tr.selector   = svm_read_tr();     /* AMD 15.5.1 TR selector   */
-
     /* GDTR / IDTR base + limit (AMD 15.5.1) via sgdt / sidt. */
     _sgdt(&gdtr);
     save->gdtr.base  = gdtr.base;            /* AMD 15.5.1 GDTR base  */
@@ -217,6 +300,21 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
     __sidt(&idtr);
     save->idtr.base  = idtr.base;            /* AMD 15.5.1 IDTR base  */
     save->idtr.limit = idtr.limit;           /* AMD 15.5.1 IDTR limit */
+
+    /* Segment selector + attrib/limit/base (AMD 15.5.1). The selector alone
+     * fails VMRUN consistency checks (CS P=0/L=0 rejected) and GS.Base=0
+     * destroys the KPCR. Walk the GDT we just captured to decode each
+     * descriptor; FS/GS base come from the long-mode base MSRs. */
+    svm_decode_seg(svm_read_es(), (PVOID)gdtr.base, &save->es);
+    svm_decode_seg(svm_read_cs(), (PVOID)gdtr.base, &save->cs);
+    svm_decode_seg(svm_read_ss(), (PVOID)gdtr.base, &save->ss);
+    svm_decode_seg(svm_read_ds(), (PVOID)gdtr.base, &save->ds);
+    svm_decode_seg(svm_read_fs(), (PVOID)gdtr.base, &save->fs);
+    svm_decode_seg(svm_read_gs(), (PVOID)gdtr.base, &save->gs);
+    save->fs.base = __readmsr(MSR_IA32_FS_BASE);
+    save->gs.base = __readmsr(MSR_IA32_GS_BASE);
+    svm_decode_sys_seg(svm_read_ldtr(), (PVOID)gdtr.base, &save->ldtr);
+    svm_decode_sys_seg(svm_read_tr(),   (PVOID)gdtr.base, &save->tr);
 
     /* Control registers (AMD 15.5.1). */
     save->cr0 = __readcr0();                 /* AMD 15.5.1 CR0 */
