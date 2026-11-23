@@ -11,7 +11,31 @@
  *
  * SVM/NPT/VMEXIT cluster implementations live in separate .c files and are
  * called via the externs declared in the_chamber.h.
- */
+ *
+ * --- \Driver directory discoverability note ----------------------------
+ *
+ * The \Driver\<name> object-directory entry that IoCreateDeviceSecure
+ * registers is still reachable to anything walking \Driver with
+ * ObjectDirectoryInformation. The master plan's "no \Driver entry at all"
+ * alternative (VMMCALL-only interface) is not fully applicable here
+ * because KICK / SHUTDOWN / STATUS must be reachable from user mode via
+ * IOCTL, which requires a DEVICE_OBJECT.
+ *
+ * Instead:
+ *   - DEVICE_TYPE is FILE_DEVICE_UNKNOWN (no device-type fingerprint).
+ *   - No additional \GLOBAL?? symlinks are created at runtime beyond the
+ *     one already produced from g_chamber_cfg.symlink_path. That single
+ *     symlink's name is patched per install by the launcher to a random
+ *     string, written to last_install.txt; nothing in the driver's
+ *     release binary reveals it.
+ *   - The device path itself (g_chamber_cfg.device_path) is likewise
+ *     launcher-randomized.
+ *
+ * Discovery therefore requires enumerating \Driver (not grepping strings)
+ * AND knowing which launcher-random \GLOBAL?? symlink maps to it. An
+ * adversary with ring-0 code and a willingness to walk the object
+ * namespace finds us; a surface scanner relying on brand strings or
+ * known-device-names does not. */
 
 #include "the_chamber.h"
 #include "stealth.h"
