@@ -24,6 +24,20 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb);
 static void handle_vmmcall(PER_CPU_CTX *ctx, VMCB *vmcb);
 static void handle_npf(PER_CPU_CTX *ctx, VMCB *vmcb);
 
+/* AMD Table 15-5 event_inject layout:
+ *   bits 0-7   : vector (6 = #UD)
+ *   bits 8-10  : type  (3 = exception)
+ *   bit  11    : error-code valid
+ *   bit  31    : valid
+ *   bits 32-63 : error code
+ *
+ * Inject #UD at current RIP without advancing it; the processor
+ * re-fetches the faulting instruction after guest resume. */
+static void vmexit_inject_ud(VMCB *vmcb)
+{
+    vmcb->ctl.event_inject = (1ULL << 31) | (3ULL << 8) | 6ULL;
+}
+
 /* ------------------------------------------------------------------ */
 /* Top-level dispatcher.                                              */
 /* ------------------------------------------------------------------ */
@@ -56,9 +70,17 @@ void vmexit_handler(PER_CPU_CTX *ctx)
         break;
 
     default:
+        /* next_rip is architecturally defined ONLY for the decoded
+         * intercepts (CPUID / IOIO / MSR / VMMCALL / INVD / INVLPG /
+         * HLT / MONITOR / MWAIT / RDTSC / RDTSCP).  For VMEXIT_INVALID
+         * (-1), fault-class exits, and anything else, advancing RIP
+         * to next_rip jumps the guest into undefined memory and
+         * infinite-loops via immediate re-exit.  Inject #UD at the
+         * current RIP instead so the guest sees a deterministic
+         * invalid-opcode fault at the responsible instruction. */
         CHAMBER_LOG("unhandled VMEXIT code=%llx info1=%llx info2=%llx\n",
                     exit_code, vmcb->ctl.exit_info_1, vmcb->ctl.exit_info_2);
-        vmcb->save.rip = vmcb->ctl.next_rip;
+        vmexit_inject_ud(vmcb);
         break;
     }
 
@@ -84,7 +106,7 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
 
     if (leaf == 1) {
         /* Clear the hypervisor-present bit (ECX[31]). */
-        regs[2] &= ~(1 << 31);
+        regs[2] &= ~(1u << 31);
     }
 
     if (leaf >= 0x40000000 && leaf <= 0x4FFFFFFF) {
@@ -124,50 +146,125 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
 /* MSR interception (AMD 15.11).                                      */
 /* ------------------------------------------------------------------ */
 
+/* MSRs we service on behalf of the guest with explicit host-visible side
+ * effects.  Every other MSR path returns 0 on RDMSR and absorbs WRMSR
+ * so a guest sweep of the MSR space cannot bugcheck the host. */
+static BOOLEAN handle_msr_allowlist_pass(ULONG msr)
+{
+    switch (msr) {
+    case 0x00000010ULL:   /* IA32_TIME_STAMP_COUNTER      */
+    case 0x0000001BULL:   /* IA32_APIC_BASE               */
+    case 0x000000FEULL:   /* IA32_MTRRCAP                 */
+    case 0x00000277ULL:   /* IA32_PAT                     */
+    case 0x000002FFULL:   /* IA32_MTRR_DEF_TYPE           */
+    case 0xC0000080ULL:   /* IA32_EFER                    */
+    case 0xC0000081ULL:   /* STAR                         */
+    case 0xC0000082ULL:   /* LSTAR                        */
+    case 0xC0000083ULL:   /* CSTAR                        */
+    case 0xC0000084ULL:   /* SFMASK                       */
+    case 0xC0000100ULL:   /* FS_BASE                      */
+    case 0xC0000101ULL:   /* GS_BASE                      */
+    case 0xC0000102ULL:   /* KERNEL_GS_BASE               */
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+/* EFER writes must update VMCB.save.efer, not the host's physical EFER.
+ * At VMEXIT the CPU is in host context, so WRMSR mutates host policy.
+ * Whitelist only the bits AMD permits the guest to flip, force SVME on. */
+#define EFER_WRITABLE_MASK (EFER_SVME | 0x1ULL /*SCE*/ | (1ULL<<8) /*LME*/ | \
+                            (1ULL<<10) /*LMA*/ | (1ULL<<11) /*NXE*/ |        \
+                            (1ULL<<12) /*LMSLE*/ | (1ULL<<13) /*FFXSR*/ |    \
+                            (1ULL<<15) /*TCE*/)
+
+/* VMCB clean-bits group 1 ("Interrupts" on AMD APM Table 15-5 but on
+ * current Zen the state-save clean group is group 1). Any mutation of
+ * vmcb.save.efer (or other save-area fields hardware caches) must clear
+ * it so VMRUN reloads the save area on the next entry. */
+#define VMCB_CLEAN_BIT_CR    (1U << 5)
+
 static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
 {
-    BOOLEAN is_write = (vmcb->ctl.exit_info_1 & 1) != 0;
-    ULONG msr = (ULONG)ctx->gpr_save[2];   /* rcx */
-    ULONGLONG value;
+    BOOLEAN   is_write = (vmcb->ctl.exit_info_1 & 1) != 0;
+    ULONG     msr = (ULONG)ctx->gpr_save[2];   /* rcx */
+    ULONGLONG value = 0;
 
-    if (msr >= 0x40000000 && msr <= 0x400000FF) {
-        /* Hyper-V enlightenment MSR range: swallow it. */
-        if (is_write) {
-            /* Absorb the write; take no action. */
-        } else {
-            vmcb->save.rax = 0;       /* eax */
-            ctx->gpr_save[3] = 0;     /* edx */
-        }
-    } else if (msr == (ULONG)SVM_MSR_EFER) {
-        if (is_write) {
-            /* Guest can write EFER but must NEVER clear SVME on the real MSR,
-             * or the host loses virtualization. OR SVME back in before commit. */
-            value = (ULONGLONG)(ULONG)vmcb->save.rax |
-                    ((ULONGLONG)(ULONG)ctx->gpr_save[3] << 32);
-            value |= EFER_SVME;
-            __writemsr(msr, value);
-        } else {
-            value = __readmsr(msr) & ~EFER_SVME;   /* mask SVME out of guest view */
-            vmcb->save.rax = (ULONGLONG)(ULONG)value;
-            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
-        }
-    } else if (msr == (ULONG)SVM_MSR_VM_HSAVE_PA || msr == (ULONG)SVM_MSR_VM_CR) {
-        /* Hide our SVM host-save pointer and VM control from the guest. */
-        if (is_write) {
-            /* Absorb write. */
-        } else {
-            vmcb->save.rax = 0;
+    /* Paravirt MSR bands that must NEVER reach __readmsr / __writemsr:
+     *   0x40000000..0x400001FF - Hyper-V enlightenment + crash +
+     *                            re-enlightenment + synthetic debug
+     *   0x4B564D00..0x4B564DFF - KVM
+     * Absorb writes; return zero on reads. */
+    if ((msr >= 0x40000000U && msr <= 0x400001FFU) ||
+        (msr >= 0x4B564D00U && msr <= 0x4B564DFFU)) {
+        if (!is_write) {
+            vmcb->save.rax   = 0;
             ctx->gpr_save[3] = 0;
         }
-    } else {
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+
+    if (msr == (ULONG)SVM_MSR_EFER) {
+        if (is_write) {
+            /* Update VMCB.save.efer only; do NOT mutate the host's
+             * physical EFER.  Force SVME on (otherwise VMRUN rejects the
+             * VMCB) and mask off reserved/bogus bits. */
+            value = (ULONGLONG)(ULONG)vmcb->save.rax |
+                    ((ULONGLONG)(ULONG)ctx->gpr_save[3] << 32);
+            value &= EFER_WRITABLE_MASK;
+            value |= EFER_SVME;
+            vmcb->save.efer = value;
+            vmcb->ctl.vmcb_clean_bits &= ~VMCB_CLEAN_BIT_CR;
+        } else {
+            /* Report the guest's stored EFER view with SVME masked out. */
+            value = vmcb->save.efer & ~EFER_SVME;
+            vmcb->save.rax   = (ULONGLONG)(ULONG)value;
+            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
+        }
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+
+    if (msr == (ULONG)SVM_MSR_VM_HSAVE_PA || msr == (ULONG)SVM_MSR_VM_CR) {
+        /* Hide our SVM host-save pointer and VM control from the guest. */
+        if (!is_write) {
+            vmcb->save.rax   = 0;
+            ctx->gpr_save[3] = 0;
+        }
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+
+    if (!handle_msr_allowlist_pass(msr)) {
+        /* Unknown MSR: absorb write, return 0 on read.  Never let the
+         * guest choose which MSR the host RDMSRs / WRMSRs. */
+        if (!is_write) {
+            vmcb->save.rax   = 0;
+            ctx->gpr_save[3] = 0;
+        }
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+
+    /* Allowed MSR: wrap __readmsr / __writemsr in SEH so a #GP from a
+     * microarch-reserved encoding reflects as absorb/zero instead of a
+     * host bugcheck. */
+    __try {
         if (is_write) {
             value = (ULONGLONG)(ULONG)vmcb->save.rax |
                     ((ULONGLONG)(ULONG)ctx->gpr_save[3] << 32);
             __writemsr(msr, value);
         } else {
             value = __readmsr(msr);
-            vmcb->save.rax = (ULONGLONG)(ULONG)value;
+            vmcb->save.rax   = (ULONGLONG)(ULONG)value;
             ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (!is_write) {
+            vmcb->save.rax   = 0;
+            ctx->gpr_save[3] = 0;
         }
     }
 
