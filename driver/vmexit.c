@@ -7,6 +7,19 @@
  * GPR save index map (see the_chamber.h):
  *   0=rax 1=rbx 2=rcx 3=rdx 4=rsi 5=rdi 6=rbp 7=rsp 8..15=r8..r15
  * rax lives authoritatively in vmcb->save.rax (loaded/stored by VMRUN).
+ *
+ * No-migration rule (RDTSCP consistency): the handler runs on the physical
+ * CPU that trapped. Nothing here issues an IPI, queues a DPC that migrates
+ * work to another CPU, or otherwise causes the guest to resume on a
+ * different CPU than the one that VMEXITed. Guest RDTSCP therefore
+ * reads back a stable TSC_AUX across intercepts, as it would on bare
+ * metal with a pinned thread.
+ *
+ * No-inline-patch rule: this file never patches guest instructions. All
+ * hooks (when Phase 6 adds them) go through NPT split-view -- the HV
+ * swaps the physical page under the guest's read instead of modifying
+ * its text. Keeps the guest-visible code bytes stable, which matters for
+ * PatchGuard's tracked-module hashes and for integrity-check probes.
  */
 
 #include <ntddk.h>
