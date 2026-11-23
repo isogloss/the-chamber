@@ -46,3 +46,24 @@ Thumbs.db
 
 # BCD snapshots (machine-specific)
 recovery/*.bcd
+
+# Phase 8 CI artifacts
+pentest/ci/diff.json
+# Phase 8 timestamped run output (baseline.json is committed; per-run output is not)
+pentest/results/**/*
+!pentest/results/.gitignore
+
+# Phase 8 corpus binaries (never commit samples, only MANIFEST + logs)
+pentest/corpus/themida/*
+!pentest/corpus/themida/.gitkeep
+pentest/corpus/vmprotect/*
+!pentest/corpus/vmprotect/.gitkeep
+pentest/corpus/enigma/*
+!pentest/corpus/enigma/.gitkeep
+pentest/corpus/custom/*
+!pentest/corpus/custom/.gitkeep
+
+# Probe compile outputs
+pentest/probes/**/*.exe
+pentest/probes/**/*.obj
+pentest/probes/**/*.pdb
