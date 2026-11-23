@@ -84,8 +84,20 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
         regs[2] &= ~(1 << 31);
     }
 
-    if (leaf >= 0x40000000 && leaf <= 0x40000010) {
-        /* Hide the hypervisor CPUID vendor/feature range. */
+    if (leaf >= 0x40000000 && leaf <= 0x4FFFFFFF) {
+        /* Phase 1.1: widen the hypervisor-brand zero band to the full
+         * 0x40000000..0x4FFFFFFF reserved range.
+         *
+         * Rationale: the VMware/hypervisor convention is that this entire
+         * CPUID range is dedicated to hypervisor use. Mainstream hypervisors
+         * (Hyper-V, KVM, Xen, VMware, QEMU-KVM) all follow it, and AMD Zen 4
+         * bare metal returns all-zeros for every leaf in the band (observed
+         * behavior; not APM-mandated). VMAware and pafish probe specific
+         * leaves such as 0x40000080 and 0x40000100 that lie well above the
+         * previous 0x40000010 ceiling, which left a trivial detection vector:
+         * any non-zero value returned by the native host __cpuidex in that
+         * range would fingerprint us as a hypervisor. Zeroing the whole band
+         * mirrors bare-metal behavior and closes that gap. */
         regs[0] = 0;
         regs[1] = 0;
         regs[2] = 0;
