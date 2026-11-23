@@ -132,6 +132,14 @@ typedef struct _PER_CPU_CTX {
      * / TIMING_HOST_INTERVAL_END EQUs in vmrun.asm. */
     ULONGLONG   host_interval_start;    /* offset 192 (0xC0) */
     ULONGLONG   host_interval_end;      /* offset 200 (0xC8) */
+    UCHAR       pad_c8[256 - 208];       /* pad to 16-aligned FXSAVE at 256 */
+    /* FXSAVE64 scratch area: 512 bytes, 16-byte aligned (offset 256 =
+     * 16*16; pool base is 16-aligned on x64 so this is 16-aligned). The
+     * vmrun.asm epilogue FXSAVE64 saves guest x87/SSE state here across
+     * the C handler; AVX-512/XSAVE upgrades require 64-byte alignment and
+     * a larger buffer. Offset 256 must match the FXSAVE_AREA EQU in
+     * vmrun.asm. */
+    UCHAR       fxsave_area[512];       /* offset 256 (0x100) */
 } PER_CPU_CTX, *PPER_CPU_CTX;
 
 typedef struct _CHAMBER_GLOBALS {

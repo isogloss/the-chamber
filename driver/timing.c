@@ -74,12 +74,21 @@
  * hardware keeps serving the stale cached control area. */
 #define VMCB_CLEAN_BIT_TSC (1U << 0)
 
+/* Clean-bits sentinel: writing ~0u declares every group clean.  Helpers
+ * then clear specific groups whose fields they mutate. */
+#define VMCB_CLEAN_ALL     (~0u)
+
 /* Phase 1.3: compile-time sanity check that the asm EQUs in vmrun.asm
  * match the C struct layout. If this fires, vmrun.asm's timing captures
  * are writing into unrelated fields and every guest tsc_offset is
  * garbage -- a one-line correctness disaster. */
+C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, vmcb_pa)             ==   8);
+C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, host_save_pa)        ==  24);
+C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, shutdown_requested)  ==  52);
+C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, gpr_save)            ==  64);
 C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, host_interval_start) == 192);
 C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, host_interval_end)   == 200);
+C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, fxsave_area)         == 256);
 
 /* Phase 1.3: ONE global accumulator shared by every CPU. */
 volatile LONG64 g_total_accumulated_cycles = 0;
@@ -89,6 +98,12 @@ volatile LONG64 g_total_accumulated_cycles = 0;
  * and writes are atomic on x86_64 so no interlock is required for the
  * write-once, read-many access pattern. */
 ULONGLONG g_fixed_vmexit_cost = 800;
+
+/* Trailing host cycles between the TIMING_HOST_INTERVAL_END capture and
+ * the next VMRUN (reload-GPR sled + jmp).  Historically these cycles
+ * leaked to guest-visible RDTSC; charging them here keeps the guest
+ * seeing bare-metal-looking deltas across intercepts. */
+ULONGLONG g_timing_tail_cycles = 200;
 
 void timing_update(PER_CPU_CTX *ctx) {
     ULONGLONG host_cycles;
@@ -108,6 +123,7 @@ void timing_update(PER_CPU_CTX *ctx) {
     }
     host_cycles  = ctx->host_interval_end - ctx->host_interval_start;
     host_cycles += g_fixed_vmexit_cost;
+    host_cycles += g_timing_tail_cycles;
 
     /* InterlockedAdd64 returns the post-add value. A separate load would
      * see any number of intervening adds from other CPUs and race with
