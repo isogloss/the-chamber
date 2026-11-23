@@ -66,18 +66,12 @@ static NTSTATUS svm_preallocate_cpu(ULONG cpu_index) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    /* host stack: 16 KiB */
-    {
-        ULONGLONG stack_pa;
-        ctx->host_stack_va = alloc_contiguous(16 * 1024, &stack_pa);
-        if (!ctx->host_stack_va) {
-            MmFreeContiguousMemory(ctx->vmcb_va);
-            MmFreeContiguousMemory(ctx->host_save_va);
-            ctx->vmcb_va = NULL; ctx->host_save_va = NULL;
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-    }
-    ctx->host_stack_size = 16 * 1024;
+    /* host_stack_va used to be a 16 KiB-per-CPU allocation that
+     * svm_build_vmcb wrote into VMCB.save.rsp, but vmrun.asm overwrites
+     * save.rsp with the caller's live RSP on every VMRUN so the stack
+     * was never used.  Leave the fields NULL/zero. */
+    ctx->host_stack_va   = NULL;
+    ctx->host_stack_size = 0;
     return STATUS_SUCCESS;
 }
 

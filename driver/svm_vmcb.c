@@ -353,8 +353,9 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
     /* AMD 15.5.1: RIP is patched by vmrun.asm to the guest entry point. */
     save->rip = 0;
 
-    /* AMD 15.5.1: guest RSP = top of this CPU's private host stack. */
-    save->rsp = (ULONGLONG)((ULONG_PTR)ctx->host_stack_va + ctx->host_stack_size);
+    /* vmrun.asm overwrites save->rsp with the caller's live RSP before
+     * every VMRUN, so this initial value is only a placeholder. */
+    save->rsp = 0;
 
     /* AMD 15.15.1: on a full VMCB write set vmcb_clean_bits = ~0u so
      * hardware reloads nothing it has cached; update paths then clear
