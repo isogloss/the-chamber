@@ -1,15 +1,24 @@
 /* dump.c -- Phase 6.2 pause-the-world snapshot.
  *
+ * KNOWN BUG: the "pause" is best-effort, not actual. KeIpiGenericCall is
+ * a rendezvous primitive that waits for every callback to return before
+ * returning to the originator; a spin inside the callback deadlocks the
+ * whole broadcast. ipi_park_if_target_cr3 therefore only records how
+ * many matching vCPUs were seen and returns immediately. The VAD walk
+ * then races any matching vCPU that is still running. For a passive
+ * dump of an unpacked PE the race window is narrow (a single walk takes
+ * microseconds) but non-zero. A proper freeze requires a different
+ * primitive -- targeted DPC per matching CPU with in-DPC spin, or
+ * dedicated per-CPU HV rendezvous threads that signal on a condition.
+ * Flagged as Wave-3 follow-up in audit/wave3_done.md.
+ *
  * See dump.h for the user-mode interface and the IRQL / handle discipline
  * constraints. Implementation notes:
  *
- *   - Park-only IPI. KeIpiGenericCall runs its worker at IPI_LEVEL. At
- *     that IRQL the ONLY thing we can safely do is spin: no allocations,
- *     no attaches, no VAD walks. The worker reads the current guest CR3
- *     from the per-CPU VMCB state-save area and compares to the target;
- *     on match it increments a per-CPU "parked" counter and spin-waits
- *     on g_pause_active. When the originating CPU clears g_pause_active,
- *     the worker returns from the IPI and the vCPU resumes in guest.
+ *   - Park-only IPI (see KNOWN BUG above). The worker reads current
+ *     guest CR3 from the per-CPU VMCB state-save area, compares to
+ *     target, and on match increments g_parked_count. No spin, no
+ *     actual pause.
  *
  *   - VAD walk on the originator. After KeIpiGenericCall returns, the
  *     caller holds a reference on the target EPROCESS and can
@@ -132,17 +141,17 @@ static ULONG_PTR ipi_park_if_target_cr3(ULONG_PTR arg)
         return 0;
     }
 
+    /* Record that this CPU was running the target at broadcast time; the
+     * originator reads g_parked_count after KeIpiGenericCall returns to
+     * know how many vCPUs it raced. KeIpiGenericCall is a RENDEZVOUS
+     * primitive -- every callback must return before the broadcast
+     * returns to the originator, so we CANNOT spin here (spinning
+     * deadlocks the originator inside KeIpiGenericCall and hangs the
+     * system). A real freeze requires a different primitive (targeted
+     * DPC with in-DPC spin, or per-CPU kernel threads that rendezvous
+     * on a signal) -- see dump.c top-of-file BUG note. Today the walk
+     * runs with a small race window against matching vCPUs. */
     InterlockedIncrement(&g_parked_count);
-
-    /* Spin until the originator clears g_pause_active. _mm_pause is the
-     * x86 PAUSE hint; it slows the spin and yields SMT resources to the
-     * sibling thread without releasing the CPU. We can't KeDelayExecution
-     * at IPI_LEVEL, so a tight PAUSE spin is the only option. */
-    while (InterlockedCompareExchange(&g_pause_active, 0, 0) != 0) {
-        _mm_pause();
-    }
-
-    InterlockedDecrement(&g_parked_count);
     return 0;
 }
 

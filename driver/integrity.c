@@ -1,5 +1,18 @@
 /* integrity.c -- Phase 7.2 implementation.
  *
+ * KNOWN INCOMPATIBILITY: Phase 7.2 and Phase 7.1 cannot both be enabled
+ * in the same build. §7.1 npt_hide_hv_image clears present/writable/
+ * user on every NPT PDE covering DriverStart..+DriverSize, which
+ * includes the pages hosting integrity_dpc_routine itself and
+ * chamber_emit_integrity_vmmcall. The DPC runs in guest context, so
+ * the kernel's dispatch of the DPC function causes an NPF; handle_npf
+ * sees npt_is_hidden and injects #PF at the DPC's RIP, which is
+ * terminal (IRQL_NOT_LESS_OR_EQUAL or PAGE_FAULT_IN_NONPAGED_AREA at
+ * DISPATCH_LEVEL). Resolving this requires either (a) excluding
+ * specific guest-callable function pages from the §7.1 hide set, or
+ * (b) issuing the integrity VMMCALL from an untouched helper page.
+ * Flagged as Wave-3 follow-up in audit/wave3_done.md.
+ *
  * See integrity.h for the interface and ordering constraints. Notes on
  * implementation choices:
  *
