@@ -126,7 +126,6 @@ compute_wsz_override(PCUNICODE_STRING key_path, PCUNICODE_STRING value_name,
                      WCHAR *out_buf, ULONG out_chars)
 {
     UCHAR ov[32];
-    WCHAR wtmp[80];
     ULONG wchars;
 
     /* --- Cryptography\MachineGuid --- */
