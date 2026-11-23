@@ -58,4 +58,21 @@ void     npt_free_tables(void);
 NTSTATUS npt_hide_range(ULONGLONG start_pa, SIZE_T size);
 NTSTATUS npt_unhide_range(ULONGLONG start_pa, SIZE_T size);
 
+/* Phase 1.6 fault-recovery mapping. gpa/hpa are rounded down to a 2 MB
+ * boundary and a large PDE is installed (or updated). `flags` is the
+ * low-bits permission mask (NPT_PRESENT | NPT_WRITABLE | NPT_USER).
+ * Called from handle_npf() to grow the NPT on demand when a fault hits
+ * a region MmGetPhysicalMemoryRanges() did not report at init time. */
+NTSTATUS npt_map_page(ULONGLONG gpa, ULONGLONG hpa, ULONGLONG flags);
+
+/* Phase 1.6 NPT monitor hooks. Phase 6 will implement the real
+ * execute-only / read-only / write-trap plumbing for tracing specific
+ * pages; the Phase 1 handler must compile against these symbols. The
+ * stubs in npt.c always return NULL / do nothing. */
+typedef struct _NPT_MONITOR NPT_MONITOR;
+NPT_MONITOR *npt_monitor_find(ULONGLONG gpa_page);
+void         npt_monitor_handle_fault(NPT_MONITOR *mon,
+                                      VMCB       *vmcb,
+                                      ULONGLONG   fault_info);
+
 #endif /* THE_CHAMBER_NPT_H */
