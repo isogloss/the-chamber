@@ -1,52 +1,26 @@
-PUBLIC svm_read_cs
-PUBLIC svm_read_ds
-PUBLIC svm_read_es
-PUBLIC svm_read_ss
-PUBLIC svm_read_fs
-PUBLIC svm_read_gs
-PUBLIC svm_read_tr
-PUBLIC svm_read_ldtr
+; asm_helpers.asm -- small assembly thunks the C code cannot express.
+;
+; MSVC x64 does not provide inline asm and has no __svm_vmmcall intrinsic
+; that controls RAX and RBX simultaneously. This file holds the kernel-side
+; VMMCALL emitters that the HV's own guest-side threads use to hand off to
+; the root-context handler.
 
 .code
 
-svm_read_cs PROC
-    mov ax, cs
-    ret
-svm_read_cs ENDP
+PUBLIC chamber_emit_integrity_vmmcall
 
-svm_read_ds PROC
-    mov ax, ds
+; void chamber_emit_integrity_vmmcall(ULONG code /*rcx*/, ULONGLONG magic /*rdx*/)
+;
+; MS x64 fastcall: first integer arg in RCX, second in RDX.
+; VMMCALL dispatch protocol: RAX = hypercall code, RBX = magic. RBX is
+; non-volatile, save and restore.
+chamber_emit_integrity_vmmcall PROC
+    push rbx
+    mov  rax, rcx
+    mov  rbx, rdx
+    vmmcall
+    pop  rbx
     ret
-svm_read_ds ENDP
-
-svm_read_es PROC
-    mov ax, es
-    ret
-svm_read_es ENDP
-
-svm_read_ss PROC
-    mov ax, ss
-    ret
-svm_read_ss ENDP
-
-svm_read_fs PROC
-    mov ax, fs
-    ret
-svm_read_fs ENDP
-
-svm_read_gs PROC
-    mov ax, gs
-    ret
-svm_read_gs ENDP
-
-svm_read_tr PROC
-    str ax
-    ret
-svm_read_tr ENDP
-
-svm_read_ldtr PROC
-    sldt ax
-    ret
-svm_read_ldtr ENDP
+chamber_emit_integrity_vmmcall ENDP
 
 END

@@ -79,4 +79,10 @@ void     integrity_shutdown(void);
  * compare and set integrity_failed on mismatch. */
 void     integrity_handle_hcall(void);
 
+/* asm_helpers.asm thunk: issues VMMCALL with RAX = code, RBX = magic.
+ * MSVC x64 has no inline asm and __svm_vmmcall controls only one
+ * register, so the guest-side DPC calls this asm function to hand off
+ * into handle_vmmcall. */
+void     chamber_emit_integrity_vmmcall(ULONG code, ULONGLONG magic);
+
 #endif /* THE_CHAMBER_INTEGRITY_H */

@@ -422,8 +422,9 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
  * is a trivial detection vector. We respond only to a shared-secret magic
  * value. Any other VMMCALL gets an injected #UD (invalid opcode exception),
  * which is what bare metal would deliver on a legitimate VMMCALL attempt
- * (VMMCALL raises #UD when SVME is clear in EFER). */
-#define THE_CHAMBER_HYPERCALL_MAGIC   0x5452484D4648434AULL  /* "JCHFMHRT" */
+ * (VMMCALL raises #UD when SVME is clear in EFER). The magic value itself
+ * (THE_CHAMBER_HYPERCALL_MAGIC) lives in the_chamber.h so integrity.c and
+ * dump.c share the same definition. */
 #define THE_CHAMBER_HCALL_VERSION     1
 #define THE_CHAMBER_HCALL_SHUTDOWN    2
 /* CHAMBER_HCALL_DUMP_CR3 (3) is defined in dump.h and dispatched below. */

@@ -149,16 +149,14 @@ static void integrity_dpc_routine(PKDPC Dpc, PVOID Ctx,
      * VMMCALL with RAX/RBX set, and switch to that unconditionally.
      * Documented in CHAMBER_HCALL_SELF_INTEGRITY's comment in
      * vmexit.c. */
-#ifdef CHAMBER_HV_INTROSPECTION_RESIST
-    /* With HV pages hidden, direct read from "guest" context NPFs.
-     * Operator must wire up the real VMMCALL path (asm thunk in
-     * asm_helpers.asm) before enabling both §7.1 and §7.2. For now,
-     * skip the check -- better to not run than to NPF ourselves. */
-    InterlockedExchange((volatile LONG *)&g_integrity_status->hv_responded, 1);
-    return;
-#else
-    integrity_handle_hcall();
-#endif
+    /* Dispatch via the asm thunk in asm_helpers.asm. The thunk sets
+     * RAX = hcall code and RBX = magic, then emits VMMCALL. The HV's
+     * handle_vmmcall validates the magic and dispatches to
+     * integrity_handle_hcall in root context -- that path works even
+     * with HV introspection resistance enabled, because the HV's own
+     * kernel VA mapping of its code is unaffected by NPT hiding. */
+    chamber_emit_integrity_vmmcall(CHAMBER_HCALL_SELF_INTEGRITY,
+                                   THE_CHAMBER_HYPERCALL_MAGIC);
 
     /* After the hcall, hv_responded must be 1. */
     if (InterlockedCompareExchange((volatile LONG *)

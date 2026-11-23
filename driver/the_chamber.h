@@ -192,6 +192,11 @@ typedef struct _CHAMBER_GLOBALS {
  * missed kick = one miss. */
 #define WATCHDOG_MAX_MISSES 5
 
+/* VMMCALL hypercall shared-secret magic. handle_vmmcall validates
+ * RBX against this value before dispatching to any hcall. Referenced
+ * by integrity.c, dump.c, and vmexit.c so hoisted here. */
+#define THE_CHAMBER_HYPERCALL_MAGIC   0x5452484D4648434AULL
+
 /* --- Externs implemented by the SVM/NPT/VMEXIT clusters --- */
 extern PER_CPU_CTX *g_cpu_ctx;
 extern ULONG        g_cpu_count;
