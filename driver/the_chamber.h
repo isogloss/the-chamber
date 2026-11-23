@@ -1,5 +1,5 @@
-/* the_chamber.h -- shared header for the THE_CHAMBER AMD SVM ring-0
- * instrumentation driver. Declares IOCTL codes, global state, and the
+/* the_chamber.h -- shared header for the AMD SVM ring-0 instrumentation
+ * driver. Declares IOCTL codes, global state, logging, pool tag, and the
  * canonical structures the SVM/NPT/VMEXIT clusters fill in.
  *
  * All ring-0; must be built with WDK kernel headers only.
@@ -12,10 +12,71 @@
 #include <wdm.h>
 #include <intrin.h>
 
-#define THE_CHAMBER_POOL_TAG  'nMvH'   /* pool tag reads as "HvMn" in poolmon */
-#define THE_CHAMBER_DEVICE_NAME  L"\\Device\\WinHvMon"
-#define THE_CHAMBER_SYMLINK      L"\\DosDevices\\WinHvMon"
-#define THE_CHAMBER_MARKER_PATH  L"\\??\\C:\\Windows\\System32\\config\\winhvmon.dat"
+/* -----------------------------------------------------------------------
+ * Phase 1.7: debug-only logging.
+ * CHAMBER_LOG expands to DbgPrintEx under CHAMBER_DEBUG; in release the
+ * macro collapses to a no-op so the .rdata section carries no branded
+ * strings. Replace every DbgPrintEx call with CHAMBER_LOG / _WARN / _ERR.
+ * ----------------------------------------------------------------------- */
+#ifdef CHAMBER_DEBUG
+#define CHAMBER_LOG(...)      DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,    __VA_ARGS__)
+#define CHAMBER_LOG_WARN(...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL, __VA_ARGS__)
+#define CHAMBER_LOG_ERR(...)  DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,   __VA_ARGS__)
+#else
+#define CHAMBER_LOG(...)      ((void)0)
+#define CHAMBER_LOG_WARN(...) ((void)0)
+#define CHAMBER_LOG_ERR(...)  ((void)0)
+#endif
+
+/* -----------------------------------------------------------------------
+ * Phase 1.7: compile-time pool tag.
+ * Override by passing /D"CHAMBER_POOL_TAG=0x......" at the compile line.
+ * Default is a neutral 4-byte alphanumeric that resembles common minifilter
+ * tags in poolmon output (poolmon prints bytes in memory order, which is
+ * the reverse of the multichar C literal under MSVC/x64 little-endian).
+ * POOLTAG(x) ignores x but keeps it in source for human-readable context.
+ * ----------------------------------------------------------------------- */
+#ifndef CHAMBER_POOL_TAG
+#define CHAMBER_POOL_TAG  'FsFl'
+#endif
+#define POOLTAG(x) ((ULONG)CHAMBER_POOL_TAG)
+
+/* Backwards-compat shim: svm_bringup.c and other sites referenced the old
+ * THE_CHAMBER_POOL_TAG name. Keep one indirection point so no site has to
+ * change when the tag macro name itself changes. */
+#define THE_CHAMBER_POOL_TAG CHAMBER_POOL_TAG
+
+/* -----------------------------------------------------------------------
+ * Phase 1.7: runtime-patchable config blob.
+ *
+ * Every string that would otherwise leak a brand name through the binary
+ * (device path, DOS symlink, marker-file path) lives in this struct, which
+ * the launcher patches with a per-install random name after a successful
+ * build but before signing. The struct is placed in a dedicated writable
+ * section (".cfg") so the launcher can locate it by section name and by
+ * the magic signature.
+ *
+ * The defaults below look like a generic storage-filter driver; the
+ * launcher overwrites them anyway. Nothing else in the driver should hold
+ * device / symlink / marker strings.
+ * ----------------------------------------------------------------------- */
+
+#define CHAMBER_CFG_MAGIC_V1     0x5F474643UL   /* "CFG_" launcher marker */
+#define CHAMBER_CFG_DEVICE_MAX   64
+#define CHAMBER_CFG_SYMLINK_MAX  64
+#define CHAMBER_CFG_MARKER_MAX   128
+
+typedef struct _CHAMBER_CFG {
+    ULONG magic;                                 /* CHAMBER_CFG_MAGIC_V1 */
+    ULONG version;
+    WCHAR device_path [CHAMBER_CFG_DEVICE_MAX];  /* L"\\Device\\<name>" */
+    WCHAR symlink_path[CHAMBER_CFG_SYMLINK_MAX]; /* L"\\DosDevices\\<name>" */
+    WCHAR marker_path [CHAMBER_CFG_MARKER_MAX];  /* L"\\??\\C:\\...\\<name>.dat" */
+    ULONG pool_tag_override;                     /* 0 => use CHAMBER_POOL_TAG */
+    ULONG reserved[16];
+} CHAMBER_CFG;
+
+extern CHAMBER_CFG g_chamber_cfg;
 
 #define THE_CHAMBER_VERSION  0x00010000UL  /* 1.0.0 */
 #define WATCHDOG_TIMEOUT_MS  60000

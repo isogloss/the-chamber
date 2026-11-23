@@ -15,7 +15,7 @@ Write-Host "=== THE_CHAMBER install ===" -ForegroundColor Cyan
 # 1. Build the driver (compile + link + sign)
 Write-Host "Step 1/4: Building driver..." -ForegroundColor White
 & "$root\driver\build.ps1"
-$sys = "$root\driver\winhvmon.sys"
+$sys = "$root\driver\build_output.sys"
 if (-not (Test-Path $sys)) { throw "Build did not produce $sys" }
 
 # 2. Create SCM service (DEMAND_START — never auto-loads at boot)

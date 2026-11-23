@@ -107,8 +107,12 @@ foreach ($asmName in @('vmrun.asm','asm_helpers.asm')) {
 }
 
 # --- Link ---
-$sys = Join-Path $driver 'winhvmon.sys'
-$linkFlags = "/NOLOGO /SUBSYSTEM:NATIVE,10.0 /DRIVER /ENTRY:DriverEntry /MACHINE:X64 /INCREMENTAL:NO /NODEFAULTLIB /OPT:REF /OPT:ICF /RELEASE /PDBALTPATH:winhvmon.pdb /DEBUG:NONE"
+# Phase 1.7: the build-time filename is a generic placeholder. The launcher
+# (install_service.ps1) copies the file to a per-install random name before
+# patching the .cfg section and signing. Nothing on-disk after install
+# carries this placeholder name.
+$sys = Join-Path $driver 'build_output.sys'
+$linkFlags = "/NOLOGO /SUBSYSTEM:NATIVE,10.0 /DRIVER /ENTRY:DriverEntry /MACHINE:X64 /INCREMENTAL:NO /NODEFAULTLIB /OPT:REF /OPT:ICF /RELEASE /PDBALTPATH:build_output.pdb /DEBUG:NONE"
 $libs = @(
     (Join-Path $wdkLib 'ntoskrnl.lib'),
     (Join-Path $wdkLib 'hal.lib'),
@@ -133,7 +137,7 @@ if (-not (Test-Path $pfx)) {
     Write-Host "=== Generating self-signed test cert ==="
     New-Item -ItemType Directory -Path (Split-Path $pfx) -Force | Out-Null
     $cert = New-SelfSignedCertificate `
-        -Subject 'CN=WinHvMon Test' `
+        -Subject 'CN=Driver Build Test' `
         -Type CodeSigningCert `
         -KeyUsage DigitalSignature `
         -KeyExportPolicy Exportable `

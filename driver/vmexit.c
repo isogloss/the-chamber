@@ -56,9 +56,8 @@ void vmexit_handler(PER_CPU_CTX *ctx)
         break;
 
     default:
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                   "WinHvMon: unhandled VMEXIT code=%llx info1=%llx info2=%llx\n",
-                   exit_code, vmcb->ctl.exit_info_1, vmcb->ctl.exit_info_2);
+        CHAMBER_LOG("unhandled VMEXIT code=%llx info1=%llx info2=%llx\n",
+                    exit_code, vmcb->ctl.exit_info_1, vmcb->ctl.exit_info_2);
         vmcb->save.rip = vmcb->ctl.next_rip;
         break;
     }
@@ -289,6 +288,5 @@ static void handle_npf(PER_CPU_CTX *ctx, VMCB *vmcb)
 
 void vmexit_cleanup(void)
 {
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "WinHvMon: final vmexit count = %llu\n", g_vmexit_count);
+    CHAMBER_LOG("final vmexit count = %llu\n", g_vmexit_count);
 }
