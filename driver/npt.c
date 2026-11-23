@@ -489,6 +489,15 @@ NTSTATUS npt_map_page(ULONGLONG gpa, ULONGLONG hpa, ULONGLONG flags)
     pdpt_i  = (ULONG)((gpa_2mb >> 30) & 0x1FF);
     pd_i    = (ULONG)((gpa_2mb >> 21) & 0x1FF);
 
+    /* npt_init preallocates every PDPT and PD under PML4[0] (the first
+     * NPT_MAX_PHYS_GB of address space).  Addresses in any other PML4
+     * slot (>= 512 GB) would require an allocation at DISPATCH_LEVEL
+     * under the hide-lock, which the WDK forbids.  Passive-dump guests
+     * never see >512 GB of address space -- reject the fault instead. */
+    if (pml4_i != 0) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
     /* The side table is guarded by g_npt_hide_lock to keep the PDPT /
      * PD allocation and the final PDE write atomic against a concurrent
      * npt_hide_range() / npt_unhide_range() on the same PDE. */
