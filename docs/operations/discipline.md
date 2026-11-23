@@ -636,10 +636,15 @@ Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting
                  -Name "DumpType" -Value 2   # 2 = Full dump
 
 # Pagefile must be at least RAM + 257 MB and on the system drive for the
-# complete-memory-dump writer to succeed.
-wmic computersystem set AutomaticManagedPagefile=False
-wmic pagefileset where "name='C:\\pagefile.sys'" set \
-    InitialSize=36864,MaximumSize=36864    # for a 32 GB RAM box
+# complete-memory-dump writer to succeed.  wmic.exe is removed from the
+# default install on Windows 11 24H2 (moved to Feature-on-Demand); the
+# CIM cmdlets below are the supported replacement.
+Set-CimInstance -Query "SELECT * FROM Win32_ComputerSystem" `
+                -Property @{ AutomaticManagedPagefile = $false }
+
+# Set InitialSize + MaximumSize in MB; values below sized for a 32 GB RAM box.
+Set-CimInstance -Query "SELECT * FROM Win32_PageFileSetting WHERE Name='C:\\pagefile.sys'" `
+                -Property @{ InitialSize = 36864; MaximumSize = 36864 }
 ```
 
 `wer.exe` itself is a WER-side tool for user-mode faults; the
