@@ -434,10 +434,16 @@ and performance-costly:
 
 - `IBRS` / `STIBP` / `SSBD` enabled on the HV path (slows VMEXIT
   significantly).
-- AMD cache partitioning via QoS (`MSR 0xC0000300` family) to restrict
-  the HV handler to a dedicated L3 slice -- 7700X supports this via
-  AMD CBS CPU QoS features; carries a throughput cost and complicates
-  the VMCB layout.
+- AMD Platform QoS cache partitioning (family-19h PPR, server parts)
+  -- restrict the HV handler to a dedicated L3 slice via L3 CAT-style
+  class-of-service masks.  **Not documented on client 7700X**: the
+  PQE control interface is EPYC-only on family 19h and is not surfaced
+  through CBS / AGESA on consumer boards; earlier drafts of this doc
+  cited `MSR 0xC0000300` as the control port, but no publicly
+  documented MSR in that family exposes PQE on client Zen 4, and
+  writing to it on a 7700X raises #GP.  Leave this mitigation out of
+  the response set until a concrete path is published, or move to an
+  EPYC-class host where the interface is real.
 - Speculative barriers (`lfence` / `sfence`) sprinkled through the
   handler at every indirect branch or every memory load that depends
   on guest-controlled data.  Costs a measurable fraction of handler
