@@ -186,6 +186,26 @@ extern BOOLEAN         g_chamber_cfg_v2_valid; /* TRUE after DriverEntry version
 #define IOCTL_THE_CHAMBER_KICK      CTL_CODE(0x8000, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 #define IOCTL_THE_CHAMBER_SHUTDOWN  CTL_CODE(0x8000, 0x803, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
+/* Passive-dump operator interface. The pause primitive and the trigger
+ * registry live in dump.c / dump_trigger.c; the IOCTL dispatcher in
+ * the_chamber.c just marshals the input buffer and calls through. All
+ * of these are FILE_WRITE_ACCESS so a plain-read open cannot arm /
+ * initiate a dump. */
+#define IOCTL_THE_CHAMBER_DUMP_NOW \
+    CTL_CODE(0x8000, 0x820, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_ARM_WX \
+    CTL_CODE(0x8000, 0x821, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_ARM_OEP \
+    CTL_CODE(0x8000, 0x822, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_ARM_WRITE_THRESHOLD \
+    CTL_CODE(0x8000, 0x823, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_DUMP_ON_PAYLOAD \
+    CTL_CODE(0x8000, 0x824, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_DISARM_TRIGGERS \
+    CTL_CODE(0x8000, 0x825, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_QUERY_DUMP_HISTORY \
+    CTL_CODE(0x8000, 0x826, METHOD_BUFFERED, FILE_READ_ACCESS)
+
 typedef struct _CHAMBER_STATUS {
     ULONG   version;
     ULONG   cpu_count;
@@ -193,6 +213,82 @@ typedef struct _CHAMBER_STATUS {
     ULONG   reserved;
     ULONGLONG vmexit_count;
 } CHAMBER_STATUS, *PCHAMBER_STATUS;
+
+/* --- Operator IOCTL argument structs ---------------------------------
+ * All passed via METHOD_BUFFERED; sizes are bounded and the dispatcher
+ * checks the full struct before passing through. Addresses are operator-
+ * context VAs; the HV switches to target context for the walk.
+ * Reserved fields are zero-initialized by the dispatcher.
+ */
+typedef struct _CHAMBER_DUMP_NOW_REQ {
+    ULONGLONG target_pid;        /* PID to dump; resolved via PsLookup */
+    ULONGLONG output_buffer_va;  /* operator VA receiving TLV stream */
+    ULONGLONG output_buffer_size;/* byte capacity */
+} CHAMBER_DUMP_NOW_REQ, *PCHAMBER_DUMP_NOW_REQ;
+
+typedef struct _CHAMBER_ARM_WX_REQ {
+    ULONGLONG target_pid;        /* PID whose user AS gets W/noX NPT marking */
+    ULONGLONG output_buffer_va;  /* operator VA for the eventual dump */
+    ULONGLONG output_buffer_size;
+    ULONG     rearm;             /* 1 = re-arm after each fire */
+    ULONG     reserved;
+} CHAMBER_ARM_WX_REQ, *PCHAMBER_ARM_WX_REQ;
+
+typedef struct _CHAMBER_ARM_OEP_REQ {
+    ULONGLONG target_pid;        /* PID; the covering 2 MB PDE is X=0 */
+    ULONGLONG suspected_oep_gva; /* guest VA where the OEP is expected */
+    ULONGLONG output_buffer_va;
+    ULONGLONG output_buffer_size;
+    ULONG     rearm;
+    ULONG     reserved;
+} CHAMBER_ARM_OEP_REQ, *PCHAMBER_ARM_OEP_REQ;
+
+typedef struct _CHAMBER_ARM_WRITE_THRESHOLD_REQ {
+    ULONGLONG target_pid;        /* PID whose writable user pages are W=0 */
+    ULONGLONG threshold_bytes;   /* dump fires when counter reaches this */
+    ULONGLONG output_buffer_va;
+    ULONGLONG output_buffer_size;
+    ULONG     rearm;
+    ULONG     reserved;
+} CHAMBER_ARM_WRITE_THRESHOLD_REQ, *PCHAMBER_ARM_WRITE_THRESHOLD_REQ;
+
+typedef struct _CHAMBER_DISARM_REQ {
+    ULONGLONG target_pid;        /* 0 = disarm all triggers */
+    ULONG     trigger_mask;      /* bitmask of CHAMBER_TRIGGER_*; 0 = all */
+    ULONG     reserved;
+} CHAMBER_DISARM_REQ, *PCHAMBER_DISARM_REQ;
+
+/* Trigger kind bits used by CHAMBER_DISARM_REQ.trigger_mask and by the
+ * history record so the operator can filter by cause. */
+#define CHAMBER_TRIGGER_MANUAL           (1UL << 0)
+#define CHAMBER_TRIGGER_WX               (1UL << 1)
+#define CHAMBER_TRIGGER_OEP              (1UL << 2)
+#define CHAMBER_TRIGGER_WRITE_THRESHOLD  (1UL << 3)
+#define CHAMBER_TRIGGER_PAYLOAD          (1UL << 4)
+#define CHAMBER_TRIGGER_ANY              (0xFFFFFFFFUL)
+
+/* QUERY_DUMP_HISTORY output: a fixed-size ring of recent dumps. The
+ * dispatcher caps the copy at the operator's output buffer so a smaller
+ * buffer reads the N newest entries. */
+#define CHAMBER_DUMP_HISTORY_MAX  32
+
+typedef struct _CHAMBER_DUMP_RECORD {
+    ULONGLONG seq;               /* monotonic dump sequence number */
+    ULONGLONG target_pid;
+    ULONGLONG target_cr3;
+    ULONGLONG trigger_gpa;       /* GPA that caused the trigger, or 0 */
+    ULONGLONG bytes_written;
+    ULONGLONG timestamp_100ns;   /* KeQuerySystemTimePrecise snapshot */
+    ULONG     trigger_kind;      /* CHAMBER_TRIGGER_* */
+    ULONG     parked_cpus;       /* count of CPUs parked for this dump */
+} CHAMBER_DUMP_RECORD, *PCHAMBER_DUMP_RECORD;
+
+typedef struct _CHAMBER_DUMP_HISTORY {
+    ULONGLONG total_dumps;       /* lifetime count (may exceed records[]) */
+    ULONG     record_count;      /* records populated in this response */
+    ULONG     reserved;
+    CHAMBER_DUMP_RECORD records[CHAMBER_DUMP_HISTORY_MAX];
+} CHAMBER_DUMP_HISTORY, *PCHAMBER_DUMP_HISTORY;
 
 /* --- Canonical AMD SVM types --- */
 /* The SVM cluster (svm.h) fills in the exact layouts per AMD manual Vol 2
