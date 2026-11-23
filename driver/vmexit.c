@@ -29,6 +29,8 @@
 #include "svm.h"
 #include "timing.h"
 #include "npt.h"
+#include "dump.h"
+#include "integrity.h"
 
 volatile ULONGLONG g_vmexit_count = 0;
 
@@ -424,6 +426,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
 #define THE_CHAMBER_HYPERCALL_MAGIC   0x5452484D4648434AULL  /* "JCHFMHRT" */
 #define THE_CHAMBER_HCALL_VERSION     1
 #define THE_CHAMBER_HCALL_SHUTDOWN    2
+/* CHAMBER_HCALL_DUMP_CR3 (3) is defined in dump.h and dispatched below. */
 
 static void inject_ud(VMCB *vmcb) {
     /* AMD Table 15-5: event_inject layout:
@@ -457,6 +460,50 @@ static void handle_vmmcall(PER_CPU_CTX *ctx, VMCB *vmcb)
     case THE_CHAMBER_HCALL_SHUTDOWN:
         InterlockedExchange(&ctx->shutdown_requested, 1);
         break;
+    case CHAMBER_HCALL_SELF_INTEGRITY:
+        /* Phase 7.2 code-integrity self-check. First call latches the
+         * known-good hash; subsequent calls compare and set the
+         * failure flag on mismatch. HV code is mapped in root
+         * context's kernel VA without NPT translation, so reading it
+         * here is a plain pool-memory access.
+         *
+         * NOTE: integrity.c's DPC currently can bypass this handler
+         * and call integrity_handle_hcall() directly when
+         * CHAMBER_HV_INTROSPECTION_RESIST is OFF, avoiding the need
+         * for a kernel-side VMMCALL emitter. Future work: write an
+         * asm thunk in asm_helpers.asm that emits VMMCALL with RAX =
+         * code and RBX = magic, and make the DPC use it
+         * unconditionally. */
+        integrity_handle_hcall();
+        break;
+    case CHAMBER_HCALL_DUMP_CR3: {
+        /* Phase 6.2 pause-the-world capture. Operator calling convention
+         * (also documented in dump.h):
+         *
+         *   rax = CHAMBER_HCALL_DUMP_CR3
+         *   rbx = THE_CHAMBER_HYPERCALL_MAGIC (checked above)
+         *   rcx = target PID
+         *   rdx = output buffer VA (operator AS)
+         *   rsi = output buffer size (bytes)
+         *
+         * Return value in rax: bytes written, or 0 on error.
+         *
+         * IRQL: the VMMCALL handler runs at the IRQL the guest VMMCALL'd
+         * at. For a user-mode operator thread that is PASSIVE_LEVEL,
+         * which is what dump_snapshot_pause_target requires (it uses
+         * KeStackAttachProcess and ZwQueryVirtualMemory). An operator
+         * that issues VMMCALL from a DISPATCH-level DPC gets 0 back and
+         * is expected to retry from PASSIVE context -- we do NOT queue
+         * a passive work item internally because userland sees the
+         * VMMCALL as synchronous and expects the result in rax on the
+         * instruction's return. */
+        CHAMBER_DUMP_REQ req;
+        req.target_pid         = ctx->gpr_save[2];  /* rcx */
+        req.output_buffer_va   = ctx->gpr_save[3];  /* rdx */
+        req.output_buffer_size = ctx->gpr_save[4];  /* rsi */
+        vmcb->save.rax = dump_snapshot_pause_target(&req);
+        break;
+    }
     default:
         inject_ud(vmcb);
         return;
@@ -506,6 +553,25 @@ static void handle_npf(PER_CPU_CTX *ctx, VMCB *vmcb)
          * page, the monitor does whatever it needs (toggle perms,
          * single-step, log) and we retry -- NO rip advance. */
         npt_monitor_handle_fault(mon, vmcb, fault_info);
+        return;
+    }
+
+    /* Phase 7.1: if the fault lands inside a hidden range (HV image
+     * pages when CHAMBER_HV_INTROSPECTION_RESIST is compiled in), do
+     * NOT remap. Inject #PF into the guest so it sees a page fault at
+     * the probing instruction and must handle it; the PDE stays
+     * cleared so a retry refaults the same way. */
+    if (npt_is_hidden(fault_page)) {
+        /* AMD Table 15-5: event_inject, vector 14 (#PF), type 3
+         * (exception), ec-valid bit 11 set, valid bit 31 set. The
+         * error code (bits 32-63) matches an ordinary user-write PF
+         * (P=0, W/R per fault_info, U/S=1, RSVD=0). CR2 would normally
+         * hold the faulting GVA; we can't synthesize a GVA here (the
+         * VMEXIT reports a GPA) so leave CR2 alone -- some probers
+         * inspect it and see stale data, which is fine for passive
+         * defense. */
+        vmcb->ctl.event_inject = (1ULL << 31) | (1ULL << 11) |
+                                 (3ULL << 8) | 14ULL;
         return;
     }
 

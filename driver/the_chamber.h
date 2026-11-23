@@ -175,7 +175,22 @@ typedef struct _CHAMBER_GLOBALS {
     LARGE_INTEGER    last_kick_time;
     BOOLEAN          svm_initialized;
     BOOLEAN          npt_initialized;
+    /* Phase 7.3: consecutive-miss counter for the watchdog DPC. Every
+     * miss increments; a successful IOCTL_THE_CHAMBER_KICK zeros it.
+     * After WATCHDOG_MAX_MISSES consecutive misses the DPC queues a
+     * PASSIVE_LEVEL work item that calls svm_shutdown_all_cpus to
+     * clear EFER.SVME on every CPU (the AMD-SVM equivalent of VMXOFF).
+     * Prevents the HV from running orphaned if the operator agent
+     * crashes mid-session. */
+    ULONG            miss_count;
+    PIO_WORKITEM     shutdown_work_item;
 } CHAMBER_GLOBALS, *PCHAMBER_GLOBALS;
+
+/* Phase 7.3 threshold. 5 consecutive missed kicks at the watchdog
+ * timeout interval triggers auto-unload. Each kick is nominally every
+ * 60 s (WATCHDOG_TIMEOUT_MS); the DPC itself re-arms every 5 s so one
+ * missed kick = one miss. */
+#define WATCHDOG_MAX_MISSES 5
 
 /* --- Externs implemented by the SVM/NPT/VMEXIT clusters --- */
 extern PER_CPU_CTX *g_cpu_ctx;

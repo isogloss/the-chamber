@@ -463,6 +463,99 @@ NTSTATUS npt_hide_range(ULONGLONG start_pa, SIZE_T size)
     return status;
 }
 
+/* Advisory predicate: is the 2 MB PA covering `pa_byte` currently
+ * marked hidden? Returned under no lock (see npt.h). */
+BOOLEAN npt_is_hidden(ULONGLONG pa_byte)
+{
+    ULONGLONG pa_2mb = pa_byte & ~(NPT_PAGE_SIZE_2MB - 1);
+    ULONG i;
+
+    for (i = 0; i < g_npt_hide_count; i++) {
+        if (g_npt_hide_table[i].pa == pa_2mb) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 7.1: HV-image NPT hide.                                      */
+/*                                                                    */
+/* Walk every 4 KiB page covering the driver's loaded image, resolve  */
+/* each page's host physical address via MmGetPhysicalAddress, and    */
+/* feed the 2 MB-aligned PAs through npt_hide_range so the covering   */
+/* NPT PDE loses P/W/U. Guest reads of those GPAs then take an NPF;   */
+/* with the compile-time flag CHAMBER_HV_INTROSPECTION_RESIST set,    */
+/* handle_npf refuses to remap the range (returns without advancing   */
+/* RIP and with the PDE still cleared), so the guest sees zeros or    */
+/* faults at those GPAs. Operator opts in -- flag is OFF by default.  */
+/*                                                                    */
+/* The driver image is in nonpaged pool but its VA range is           */
+/* contiguous; the PA range is discontiguous because non-paged pool   */
+/* comes from the OS's own allocator. We therefore have to query      */
+/* each page's PA individually rather than assume contiguity.         */
+/* ------------------------------------------------------------------ */
+
+NTSTATUS npt_hide_hv_image(PVOID hv_dll_base, ULONG hv_size_of_image)
+{
+#ifdef CHAMBER_HV_INTROSPECTION_RESIST
+    PUCHAR  va;
+    PUCHAR  end;
+    ULONGLONG last_2mb_pa = ~0ULL;
+    NTSTATUS st;
+    NTSTATUS first_err = STATUS_SUCCESS;
+
+    if (!hv_dll_base || hv_size_of_image == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (g_npt_pml4_va == NULL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    va  = (PUCHAR)hv_dll_base;
+    end = va + hv_size_of_image;
+
+    /* Walk one 4 KiB page at a time; dedupe hides at 2 MB granularity
+     * because the NPT leaf is 2 MB. The idempotence check inside
+     * npt_hide_range also catches repeats but the local dedupe spares
+     * the spinlock acquire/release per page. */
+    for (; va < end; va += PAGE_SIZE) {
+        PHYSICAL_ADDRESS pa = MmGetPhysicalAddress(va);
+        ULONGLONG this_2mb;
+
+        if (pa.QuadPart == 0) {
+            /* Page not currently backed. Skip; it is not in the NPT
+             * identity map either. If the OS later pages it in to
+             * another host PA, that PA won't be hidden -- limitation
+             * of static hiding. HV code is in non-paged pool so this
+             * is not a concern for our image. */
+            continue;
+        }
+
+        this_2mb = (ULONGLONG)pa.QuadPart & ~(NPT_PAGE_SIZE_2MB - 1);
+        if (this_2mb == last_2mb_pa) {
+            continue;
+        }
+        last_2mb_pa = this_2mb;
+
+        st = npt_hide_range(this_2mb, NPT_PAGE_SIZE_2MB);
+        if (!NT_SUCCESS(st) && NT_SUCCESS(first_err)) {
+            first_err = st;
+        }
+    }
+
+    /* Caller broadcasts the TLB flush. We return the first failure
+     * encountered (if any); the hide pass is best-effort and does not
+     * abort on a single-range failure. */
+    return first_err;
+#else
+    UNREFERENCED_PARAMETER(hv_dll_base);
+    UNREFERENCED_PARAMETER(hv_size_of_image);
+    /* Flag off: no-op. Return success so DriverEntry doesn't fail. */
+    return STATUS_SUCCESS;
+#endif
+}
+
 /* ------------------------------------------------------------------ */
 /* Phase 1.6: handle_npf fault-recovery path.                         */
 /*                                                                    */

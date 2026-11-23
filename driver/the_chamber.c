@@ -11,11 +11,37 @@
  *
  * SVM/NPT/VMEXIT cluster implementations live in separate .c files and are
  * called via the externs declared in the_chamber.h.
- */
+ *
+ * --- \Driver directory discoverability note ----------------------------
+ *
+ * The \Driver\<name> object-directory entry that IoCreateDeviceSecure
+ * registers is still reachable to anything walking \Driver with
+ * ObjectDirectoryInformation. The master plan's "no \Driver entry at all"
+ * alternative (VMMCALL-only interface) is not fully applicable here
+ * because KICK / SHUTDOWN / STATUS must be reachable from user mode via
+ * IOCTL, which requires a DEVICE_OBJECT.
+ *
+ * Instead:
+ *   - DEVICE_TYPE is FILE_DEVICE_UNKNOWN (no device-type fingerprint).
+ *   - No additional \GLOBAL?? symlinks are created at runtime beyond the
+ *     one already produced from g_chamber_cfg.symlink_path. That single
+ *     symlink's name is patched per install by the launcher to a random
+ *     string, written to last_install.txt; nothing in the driver's
+ *     release binary reveals it.
+ *   - The device path itself (g_chamber_cfg.device_path) is likewise
+ *     launcher-randomized.
+ *
+ * Discovery therefore requires enumerating \Driver (not grepping strings)
+ * AND knowing which launcher-random \GLOBAL?? symlink maps to it. An
+ * adversary with ring-0 code and a willingness to walk the object
+ * namespace finds us; a surface scanner relying on brand strings or
+ * known-device-names does not. */
 
 #include "the_chamber.h"
 #include "stealth.h"
 #include "timing.h"
+#include "npt.h"
+#include "integrity.h"
 #include <wdmsec.h>   /* IoCreateDeviceSecure + SDDL_DEVOBJ_SYS_ALL_ADM_ALL */
 
 CHAMBER_GLOBALS g_chamber;
@@ -149,7 +175,58 @@ static NTSTATUS crash_marker_clear(void)
     return STATUS_SUCCESS;
 }
 
-/* --- Watchdog --- */
+/* --- Watchdog ---
+ *
+ * Phase 7.3 extends the watchdog with:
+ *   - Consecutive-miss counter. A miss is one DPC fire that sees
+ *     elapsed time since last_kick > WATCHDOG_TIMEOUT_MS; a KICK
+ *     IOCTL resets the counter to 0.
+ *   - Auto-unload path. After WATCHDOG_MAX_MISSES misses the DPC
+ *     queues a PASSIVE_LEVEL work item that calls svm_shutdown_all_cpus.
+ *     The work item is required because svm_shutdown_all_cpus uses
+ *     affinity-switch logic that cannot run at DISPATCH_LEVEL (where
+ *     the DPC fires).
+ *
+ * The AMD-SVM unload sequence is EFER.SVME-clear per CPU (see
+ * svm_bringup.c svm_offline_cpu). There is no VMXOFF on AMD -- that's
+ * Intel VT-x terminology.
+ */
+
+/* PASSIVE_LEVEL work-item callback. Called once when the watchdog
+ * determines the operator agent is gone. Does the full SVM teardown
+ * (EFER.SVME clear per CPU, free VMCB / MSRPM / IOPM / NPT / host-save).
+ * Running IoAllocateWorkItem's callback at PASSIVE_LEVEL is documented;
+ * the DPC that queued it has already returned. */
+static IO_WORKITEM_ROUTINE watchdog_unload_worker;
+static void watchdog_unload_worker(PDEVICE_OBJECT DevObj, PVOID Ctx)
+{
+    UNREFERENCED_PARAMETER(DevObj);
+    UNREFERENCED_PARAMETER(Ctx);
+
+    CHAMBER_LOG_WARN("watchdog auto-unload: clearing EFER.SVME on all CPUs\n");
+
+    /* Full SVM teardown. svm_shutdown_all_cpus sets per-CPU
+     * shutdown_requested, broadcasts the offline IPI (which clears
+     * EFER.SVME), frees per-CPU structures, and nulls g_cpu_ctx. */
+    if (g_chamber.svm_initialized) {
+        (void)svm_shutdown_all_cpus();
+        g_chamber.svm_initialized = FALSE;
+    }
+    if (g_chamber.npt_initialized) {
+        npt_free_tables();
+        g_chamber.npt_initialized = FALSE;
+    }
+
+    /* Free the work item itself. We stashed its pointer in globals so
+     * the DPC could queue it exactly once; zero the pointer AFTER free
+     * so a late second queue attempt sees NULL. */
+    if (g_chamber.shutdown_work_item) {
+        PIO_WORKITEM wi = g_chamber.shutdown_work_item;
+        g_chamber.shutdown_work_item = NULL;
+        IoFreeWorkItem(wi);
+    }
+}
+
 static void watchdog_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2)
 {
     UNREFERENCED_PARAMETER(Dpc);
@@ -169,15 +246,54 @@ static void watchdog_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2)
     ULONGLONG delta_ms = delta_100ns / 10000ULL;
 
     if (delta_ms > WATCHDOG_TIMEOUT_MS) {
-        CHAMBER_LOG_WARN("watchdog timeout (%llu ms) -- requesting unload\n",
-                         delta_ms);
-        InterlockedExchange(&g_chamber.unload_requested, 1);
-        /* Signal any per-CPU shutdown flags so VMRUN loops exit */
-        if (g_cpu_ctx) {
-            for (ULONG i = 0; i < g_cpu_count; i++) {
-                InterlockedExchange(&g_cpu_ctx[i].shutdown_requested, 1);
+        ULONG miss;
+        KeAcquireSpinLock(&g_chamber.state_lock, &irql);
+        miss = ++g_chamber.miss_count;
+        KeReleaseSpinLock(&g_chamber.state_lock, irql);
+
+        CHAMBER_LOG_WARN("watchdog miss %u/%u (delta=%llu ms)\n",
+                         miss, WATCHDOG_MAX_MISSES, delta_ms);
+
+        if (miss >= WATCHDOG_MAX_MISSES) {
+            /* Signal per-CPU shutdown flags so VMRUN loops exit at
+             * their next VMEXIT. The work item below then does the
+             * actual EFER.SVME-clear sequence at PASSIVE_LEVEL. */
+            InterlockedExchange(&g_chamber.unload_requested, 1);
+            if (g_cpu_ctx) {
+                for (ULONG i = 0; i < g_cpu_count; i++) {
+                    InterlockedExchange(
+                        &g_cpu_ctx[i].shutdown_requested, 1);
+                }
+            }
+
+            /* Queue the PASSIVE-level unload path exactly once. The
+             * work item was allocated in DriverEntry. Null the pointer
+             * under the lock to make this one-shot even if the DPC
+             * refires. */
+            PIO_WORKITEM wi = NULL;
+            KeAcquireSpinLock(&g_chamber.state_lock, &irql);
+            if (g_chamber.shutdown_work_item &&
+                g_chamber.unload_requested) {
+                wi = g_chamber.shutdown_work_item;
+                /* Don't null here -- the worker frees it and nulls
+                 * on completion. We mark the DPC's intent via a
+                 * sentinel: raise miss_count beyond threshold so the
+                 * check above stays true but we only queue once. */
+                g_chamber.miss_count = WATCHDOG_MAX_MISSES + 1;
+            }
+            KeReleaseSpinLock(&g_chamber.state_lock, irql);
+
+            if (wi && miss == WATCHDOG_MAX_MISSES) {
+                IoQueueWorkItem(wi, watchdog_unload_worker,
+                                DelayedWorkQueue, NULL);
             }
         }
+    } else {
+        /* Successful kick observed since the last DPC. Reset the
+         * miss counter so a transient hiccup doesn't accumulate. */
+        KeAcquireSpinLock(&g_chamber.state_lock, &irql);
+        g_chamber.miss_count = 0;
+        KeReleaseSpinLock(&g_chamber.state_lock, irql);
     }
 }
 
@@ -185,6 +301,14 @@ static void start_watchdog(void)
 {
     KeInitializeTimer(&g_chamber.watchdog_timer);
     KeInitializeDpc(&g_chamber.watchdog_dpc, watchdog_dpc_routine, NULL);
+
+    /* Phase 7.3: pre-allocate the work item at PASSIVE_LEVEL so the
+     * DPC can queue it without allocating. g_chamber.device_object is
+     * required; it was created in DriverEntry before start_watchdog. */
+    if (g_chamber.device_object) {
+        g_chamber.shutdown_work_item =
+            IoAllocateWorkItem(g_chamber.device_object);
+    }
 
     LARGE_INTEGER due;
     due.QuadPart = -(LONGLONG)(5000 * 10000);  /* first fire in 5 s */
@@ -195,6 +319,13 @@ static void stop_watchdog(void)
 {
     KeCancelTimer(&g_chamber.watchdog_timer);
     KeRemoveQueueDpc(&g_chamber.watchdog_dpc);
+    /* If the auto-unload path never fired, free the work item here.
+     * If it did fire, the worker already freed it and nulled the
+     * pointer -- null-check before free. */
+    if (g_chamber.shutdown_work_item) {
+        IoFreeWorkItem(g_chamber.shutdown_work_item);
+        g_chamber.shutdown_work_item = NULL;
+    }
 }
 
 static void reset_watchdog(void)
@@ -205,6 +336,10 @@ static void reset_watchdog(void)
     KIRQL irql;
     KeAcquireSpinLock(&g_chamber.state_lock, &irql);
     g_chamber.last_kick_time = now;
+    /* Phase 7.3: a successful kick zeros the miss counter so a
+     * transient agent stall does not accumulate toward the auto-
+     * unload threshold. */
+    g_chamber.miss_count = 0;
     KeReleaseSpinLock(&g_chamber.state_lock, irql);
     InterlockedIncrement(&g_chamber.kick_counter);
 }
@@ -338,6 +473,11 @@ VOID UnloadRoutine(PDRIVER_OBJECT Driver)
 {
     CHAMBER_LOG("unload begin (vmexits=%llu, kicks=%ld)\n",
                 g_vmexit_count, g_chamber.kick_counter);
+
+    /* Phase 7.2: stop the integrity DPC first; it reads HV code via
+     * either direct call or VMMCALL, both of which are unsafe after
+     * we start tearing down. */
+    integrity_shutdown();
 
     /* Restore ourselves to PsLoadedModuleList + DriverObject BEFORE any
      * of the IO-manager cleanup paths run. */
@@ -497,6 +637,22 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
         CHAMBER_LOG_ERR("svm_launch_all_cpus failed 0x%08x\n", st);
         goto fail;
     }
+
+    /* Phase 7.1: NPT-hide the HV's own image so guest reads of our
+     * code / data return #PF (when CHAMBER_HV_INTROSPECTION_RESIST is
+     * compiled in; no-op otherwise). Capture DllBase/SizeOfImage from
+     * the live DRIVER_OBJECT BEFORE stealth_apply scrambles section
+     * headers and zeros the PE prefix; DriverStart/DriverSize survive
+     * stealth_apply, but doing this first keeps the hide pass agnostic
+     * to stealth internals. */
+    (void)npt_hide_hv_image(Driver->DriverStart, Driver->DriverSize);
+
+    /* Phase 7.2: arm the integrity self-check DPC. Non-fatal on
+     * failure -- operator can disable integrity by removing this call
+     * without breaking the rest of the HV. Must come AFTER
+     * npt_hide_hv_image so that, when §7.1 is enabled, the DPC's
+     * compile-time branch sees the correct state. */
+    (void)integrity_init(Driver);
 
     /* Self-hide: rename our KLDR entry + null driver name.  Keep the
      * crash marker set across stealth_apply so a bugcheck from the
