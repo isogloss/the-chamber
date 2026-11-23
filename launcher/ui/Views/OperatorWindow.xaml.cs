@@ -24,6 +24,7 @@ public partial class OperatorWindow : Window
     private SafeFileHandle? _device;
     private readonly DispatcherTimer _statusTimer;
     private readonly System.Timers.Timer _kickTimer;
+    private readonly DumpService _dumpService;
     private DateTime _lastOkUtc;
     private ulong _lastVmexits;
 
@@ -31,6 +32,7 @@ public partial class OperatorWindow : Window
     {
         _loader = loader;
         _device = device;
+        _dumpService = new DumpService(loader);
         InitializeComponent();
 
         _statusTimer = new DispatcherTimer(DispatcherPriority.Normal)
@@ -53,6 +55,11 @@ public partial class OperatorWindow : Window
             PollStatus();
             _statusTimer.Start();
             _kickTimer.Start();
+
+            // Hand the Dump tab a live service once the driver is up.
+            // DumpTab opens its own control-device handles per IOCTL
+            // through DumpService, so no handle is shared across tabs.
+            DumpTabContent.AttachService(_dumpService);
         };
 
         Closed += async (_, _) => await OnClosedAsync().ConfigureAwait(false);

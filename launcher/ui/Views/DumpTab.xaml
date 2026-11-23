@@ -1,0 +1,297 @@
+<UserControl x:Class="TheChamber.Views.DumpTab"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="{StaticResource ChamberBg}"
+             FontFamily="{StaticResource ChamberMono}"
+             Foreground="{StaticResource ChamberFg}">
+
+    <Grid Margin="0,16,0,0">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="auto" />
+            <RowDefinition Height="auto" />
+            <RowDefinition Height="auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- ROW 0 — Target process selector -->
+        <StackPanel Grid.Row="0">
+            <TextBlock Text="TARGET PROCESS"
+                       Style="{StaticResource ChamberLabel}"
+                       LetterSpacing="4" Margin="0,0,0,6" />
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="auto" />
+                </Grid.ColumnDefinitions>
+                <ComboBox Grid.Column="0"
+                          x:Name="ProcessCombo"
+                          IsEditable="False"
+                          MinHeight="28"
+                          DisplayMemberPath="Display" />
+                <Button Grid.Column="1"
+                        Content="refresh"
+                        Click="OnRefreshProcesses"
+                        Margin="8,0,0,0" />
+            </Grid>
+            <TextBlock x:Name="ProcessHint"
+                       Style="{StaticResource ChamberLabel}"
+                       Text="live refresh every 2 s"
+                       Margin="0,4,0,0" />
+        </StackPanel>
+
+        <Border Grid.Row="0" VerticalAlignment="Bottom"
+                Style="{StaticResource ChamberRule}" Margin="0,16,0,0" />
+
+        <!-- ROW 1 — Output directory picker -->
+        <StackPanel Grid.Row="1" Margin="0,16,0,0">
+            <TextBlock Text="OUTPUT DIRECTORY"
+                       Style="{StaticResource ChamberLabel}"
+                       LetterSpacing="4" Margin="0,0,0,6" />
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="auto" />
+                </Grid.ColumnDefinitions>
+                <TextBox Grid.Column="0"
+                         x:Name="OutputDirBox"
+                         Background="{StaticResource ChamberBgAlt}"
+                         Foreground="{StaticResource ChamberFg}"
+                         BorderBrush="{StaticResource ChamberLine}"
+                         CaretBrush="{StaticResource ChamberFg}"
+                         FontFamily="{StaticResource ChamberMono}"
+                         FontSize="{StaticResource ChamberFontSize}"
+                         Padding="6,4"
+                         MinHeight="28" />
+                <Button Grid.Column="1"
+                        Content="browse..."
+                        Click="OnBrowseOutputDir"
+                        Margin="8,0,0,0" />
+            </Grid>
+        </StackPanel>
+
+        <Border Grid.Row="1" VerticalAlignment="Bottom"
+                Style="{StaticResource ChamberRule}" Margin="0,16,0,0" />
+
+        <!-- ROW 2 — Trigger selection -->
+        <StackPanel Grid.Row="2" Margin="0,16,0,0">
+            <TextBlock Text="TRIGGER"
+                       Style="{StaticResource ChamberLabel}"
+                       LetterSpacing="4" Margin="0,0,0,6" />
+            <StackPanel>
+                <!-- Manual -->
+                <Grid Margin="0,2">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="220" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="auto" />
+                    </Grid.ColumnDefinitions>
+                    <RadioButton Grid.Column="0"
+                                 x:Name="TrigManual"
+                                 GroupName="TriggerGroup"
+                                 Content="manual"
+                                 Foreground="{StaticResource ChamberFg}"
+                                 FontFamily="{StaticResource ChamberMono}"
+                                 FontSize="{StaticResource ChamberFontSize}"
+                                 IsChecked="True"
+                                 Checked="OnTriggerChecked" />
+                    <TextBlock Grid.Column="1"
+                               Style="{StaticResource ChamberLabel}"
+                               Text="operator presses dump now" />
+                    <Button Grid.Column="2"
+                            x:Name="BtnDumpNow"
+                            Content="dump now"
+                            Click="OnDumpNow" />
+                </Grid>
+
+                <!-- Write-to-execute -->
+                <Grid Margin="0,2">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="220" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="auto" />
+                    </Grid.ColumnDefinitions>
+                    <RadioButton Grid.Column="0"
+                                 x:Name="TrigWx"
+                                 GroupName="TriggerGroup"
+                                 Content="on write-to-execute"
+                                 Foreground="{StaticResource ChamberFg}"
+                                 FontFamily="{StaticResource ChamberMono}"
+                                 FontSize="{StaticResource ChamberFontSize}"
+                                 Checked="OnTriggerChecked" />
+                    <TextBlock Grid.Column="1"
+                               Style="{StaticResource ChamberLabel}"
+                               Text="driver covers all user pages of target CR3" />
+                    <Button Grid.Column="2"
+                            x:Name="BtnArmWx"
+                            Content="arm"
+                            Click="OnArmWx"
+                            IsEnabled="False" />
+                </Grid>
+
+                <!-- OEP -->
+                <Grid Margin="0,2">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="220" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="auto" />
+                    </Grid.ColumnDefinitions>
+                    <RadioButton Grid.Column="0"
+                                 x:Name="TrigOep"
+                                 GroupName="TriggerGroup"
+                                 Content="on oep execute"
+                                 Foreground="{StaticResource ChamberFg}"
+                                 FontFamily="{StaticResource ChamberMono}"
+                                 FontSize="{StaticResource ChamberFontSize}"
+                                 Checked="OnTriggerChecked" />
+                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                        <TextBlock Style="{StaticResource ChamberLabel}"
+                                   Text="suspected oep (hex): "
+                                   VerticalAlignment="Center" />
+                        <TextBox x:Name="OepBox"
+                                 Width="180"
+                                 Background="{StaticResource ChamberBgAlt}"
+                                 Foreground="{StaticResource ChamberFg}"
+                                 BorderBrush="{StaticResource ChamberLine}"
+                                 CaretBrush="{StaticResource ChamberFg}"
+                                 FontFamily="{StaticResource ChamberMono}"
+                                 FontSize="{StaticResource ChamberFontSize}"
+                                 Padding="6,2"
+                                 IsEnabled="False" />
+                    </StackPanel>
+                    <Button Grid.Column="2"
+                            x:Name="BtnArmOep"
+                            Content="arm"
+                            Click="OnArmOep"
+                            IsEnabled="False" />
+                </Grid>
+
+                <!-- Write threshold -->
+                <Grid Margin="0,2">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="220" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="auto" />
+                    </Grid.ColumnDefinitions>
+                    <RadioButton Grid.Column="0"
+                                 x:Name="TrigThreshold"
+                                 GroupName="TriggerGroup"
+                                 Content="on write-threshold"
+                                 Foreground="{StaticResource ChamberFg}"
+                                 FontFamily="{StaticResource ChamberMono}"
+                                 FontSize="{StaticResource ChamberFontSize}"
+                                 Checked="OnTriggerChecked" />
+                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                        <TextBlock Style="{StaticResource ChamberLabel}"
+                                   Text="threshold bytes: "
+                                   VerticalAlignment="Center" />
+                        <TextBox x:Name="ThresholdBox"
+                                 Width="140"
+                                 Text="65536"
+                                 Background="{StaticResource ChamberBgAlt}"
+                                 Foreground="{StaticResource ChamberFg}"
+                                 BorderBrush="{StaticResource ChamberLine}"
+                                 CaretBrush="{StaticResource ChamberFg}"
+                                 FontFamily="{StaticResource ChamberMono}"
+                                 FontSize="{StaticResource ChamberFontSize}"
+                                 Padding="6,2"
+                                 IsEnabled="False"
+                                 PreviewTextInput="OnThresholdPreviewText" />
+                    </StackPanel>
+                    <Button Grid.Column="2"
+                            x:Name="BtnArmThreshold"
+                            Content="arm"
+                            Click="OnArmThreshold"
+                            IsEnabled="False" />
+                </Grid>
+
+                <!-- Payload -->
+                <Grid Margin="0,2">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="220" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="auto" />
+                    </Grid.ColumnDefinitions>
+                    <RadioButton Grid.Column="0"
+                                 x:Name="TrigPayload"
+                                 GroupName="TriggerGroup"
+                                 Content="on payload received"
+                                 Foreground="{StaticResource ChamberFg}"
+                                 FontFamily="{StaticResource ChamberMono}"
+                                 FontSize="{StaticResource ChamberFontSize}"
+                                 Checked="OnTriggerChecked" />
+                    <TextBlock Grid.Column="1"
+                               Style="{StaticResource ChamberLabel}"
+                               Text="stub until wfp shim ships" />
+                    <Button Grid.Column="2"
+                            x:Name="BtnArmPayload"
+                            Content="arm"
+                            Click="OnArmPayload"
+                            IsEnabled="False" />
+                </Grid>
+            </StackPanel>
+
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+                <Button Content="disarm all" Click="OnDisarmAll" />
+            </StackPanel>
+        </StackPanel>
+
+        <Border Grid.Row="2" VerticalAlignment="Bottom"
+                Style="{StaticResource ChamberRule}" Margin="0,16,0,0" />
+
+        <!-- ROW 3 — Dump history -->
+        <Grid Grid.Row="3" Margin="0,16,0,0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0"
+                           Text="HISTORY"
+                           Style="{StaticResource ChamberLabel}"
+                           LetterSpacing="4"
+                           VerticalAlignment="Center" />
+                <Button Grid.Column="1"
+                        Content="refresh history"
+                        Click="OnRefreshHistory" />
+            </Grid>
+
+            <ListView Grid.Row="1"
+                      x:Name="HistoryList"
+                      Margin="0,8,0,0"
+                      Background="{StaticResource ChamberBgAlt}"
+                      BorderBrush="{StaticResource ChamberLine}"
+                      BorderThickness="1"
+                      Foreground="{StaticResource ChamberFg}"
+                      FontFamily="{StaticResource ChamberMono}"
+                      FontSize="{StaticResource ChamberFontSize}">
+                <ListView.View>
+                    <GridView>
+                        <GridViewColumn Header="timestamp" Width="160"
+                                        DisplayMemberBinding="{Binding TimestampText}" />
+                        <GridViewColumn Header="target" Width="220"
+                                        DisplayMemberBinding="{Binding Target}" />
+                        <GridViewColumn Header="trigger" Width="100"
+                                        DisplayMemberBinding="{Binding Trigger}" />
+                        <GridViewColumn Header="bytes" Width="100"
+                                        DisplayMemberBinding="{Binding BytesText}" />
+                        <GridViewColumn Header="open" Width="80">
+                            <GridViewColumn.CellTemplate>
+                                <DataTemplate>
+                                    <Button Content="open"
+                                            Click="OnOpenHistoryItem"
+                                            Tag="{Binding Path}"
+                                            Padding="8,2" />
+                                </DataTemplate>
+                            </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                    </GridView>
+                </ListView.View>
+            </ListView>
+        </Grid>
+    </Grid>
+</UserControl>
