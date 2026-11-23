@@ -11,16 +11,29 @@ namespace TheChamber.Services;
 /// <summary>
 /// Locates the 632-byte CHAMBER_CFG_V2 blob inside a driver image by
 /// scanning for its magic-version-length triple, overwrites it with the
-/// derived identity, recomputes the PE checksum, and writes the result to
-/// a seed-named file under %ProgramFiles%\The Chamber\.
+/// derived identity, recomputes the PE checksum, writes the result to
+/// a seed-named file under %ProgramFiles%\The Chamber\, and re-signs
+/// the result with the launcher's cached self-signed cert (Subject
+/// "The Chamber"; see <see cref="AuthenticodeSigner"/>).
 ///
 /// The image bytes come in as a parameter so this layer doesn't care
 /// whether the driver was resource-embedded or copied in from somewhere
-/// else. Re-signing is a separate step; the packaging wave wires it in
-/// after Agent B freezes the driver build output.
+/// else. Re-signing is invoked by the launcher separately after the
+/// patch completes.
 /// </summary>
 public sealed class CfgPatcher
 {
+    private readonly AuthenticodeSigner _signer = new();
+
+    /// <summary>
+    /// Re-sign a patched driver (or the shim DLL) in place with the
+    /// launcher's cached code-signing cert. Must be called after the
+    /// CFG patch and PE-checksum rewrite, otherwise <c>NtLoadDriver</c>
+    /// rejects the file for an invalid Authenticode signature while
+    /// test-signing is on.
+    /// </summary>
+    public Task ResignAsync(string filePath) => _signer.SignAsync(filePath);
+
     // Must match driver/the_chamber.h and design Section 3.
     public const uint CfgMagicV2 = 0x32474643; // 'CFG2'
     public const uint CfgVersion = 2;
@@ -72,12 +85,23 @@ public sealed class CfgPatcher
     }
 
     /// <summary>
+    /// Result of a successful <see cref="PatchAndWriteAsync"/>: the on-disk
+    /// path of the patched driver, plus a stand-alone copy of the 632-byte
+    /// CHAMBER_CFG_V2 blob exactly as it was written into the driver's
+    /// <c>.cfg</c> section. The second field is what
+    /// <see cref="DriverLoader.InstallAndLoadFingerprintAsync"/> writes
+    /// under <c>Services\&lt;fp_svc&gt;\Parameters\CfgBlob</c> so the
+    /// fingerprint driver sees byte-identical identity bytes.
+    /// </summary>
+    public readonly record struct PatchResult(string Path, byte[] CfgBlob);
+
+    /// <summary>
     /// Patches the CHAMBER_CFG_V2 blob inside <paramref name="driverImage"/>
     /// (in place in a working copy) with values from <paramref name="id"/>,
     /// recomputes the PE checksum, writes the result to <paramref name="target"/>,
-    /// and returns the path written.
+    /// and returns the path written together with the final CFG blob bytes.
     /// </summary>
-    public async Task<string> PatchAndWriteAsync(byte[] driverImage, DerivedIdentity id, string target)
+    public async Task<PatchResult> PatchAndWriteAsync(byte[] driverImage, DerivedIdentity id, string target)
     {
         var work = (byte[])driverImage.Clone();
 
@@ -85,9 +109,16 @@ public sealed class CfgPatcher
         {
             // Build-time stub: no driver embedded yet. Write a tiny marker
             // file so the rest of the pipeline can tell the patch stage
-            // ran but had nothing to work against.
+            // ran but had nothing to work against. The returned CFG blob
+            // is still byte-exact so the second driver's registry CFG
+            // path is still populated — useful for launcher-only dry runs.
+            var stub = new byte[CfgTotalLength];
+            BinaryPrimitives.WriteUInt32LittleEndian(stub.AsSpan(OffMagic), CfgMagicV2);
+            BinaryPrimitives.WriteUInt32LittleEndian(stub.AsSpan(OffVersion), CfgVersion);
+            BinaryPrimitives.WriteUInt32LittleEndian(stub.AsSpan(OffTotalLength), (uint)CfgTotalLength);
+            WriteFields(stub.AsSpan(0, CfgTotalLength), id);
             await WriteStubAsync(target, id).ConfigureAwait(false);
-            return target;
+            return new PatchResult(target, stub);
         }
 
         var offset = FindCfgOffset(work);
@@ -101,13 +132,19 @@ public sealed class CfgPatcher
         var span = work.AsSpan(offset, CfgTotalLength);
         WriteFields(span, id);
 
+        // Snapshot the final blob BEFORE we re-checksum the whole image —
+        // the checksum lives in the PE header, not in the CFG blob, so
+        // this copy is byte-identical to what the fingerprint driver
+        // consumes.
+        var cfgCopy = span.ToArray();
+
         RecomputePeChecksum(work);
 
         Directory.CreateDirectory(Path.GetDirectoryName(target)!);
         var tmp = target + ".tmp";
         await File.WriteAllBytesAsync(tmp, work).ConfigureAwait(false);
         File.Move(tmp, target, overwrite: true);
-        return target;
+        return new PatchResult(target, cfgCopy);
     }
 
     public int FindCfgOffset(ReadOnlySpan<byte> image)

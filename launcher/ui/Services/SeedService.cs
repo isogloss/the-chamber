@@ -246,6 +246,30 @@ public sealed class SeedService
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Independent service name for the second (fingerprint) driver.
+    /// Derived from the same master seed under a distinct field so the two
+    /// services never collide, and so a seed re-roll changes both names
+    /// together. The alphabet matches <see cref="DeriveServiceName"/>.
+    /// Exposed because <c>App.xaml.cs</c> hands it directly to
+    /// <see cref="DriverLoader.InstallAndLoadFingerprintAsync"/>; nothing
+    /// else should need it.
+    /// </summary>
+    public string DeriveFingerprintServiceName()
+    {
+        Span<byte> raw = stackalloc byte[16];
+        DeriveGroup("hv", _hvSalt, "fp_service_name", raw);
+        var cs = "abcdefghijklmnopqrstuvwxyz";
+        var cs2 = "abcdefghijklmnopqrstuvwxyz0123456789";
+        var sb = new StringBuilder(12);
+        sb.Append(cs[raw[0] % cs.Length]);
+        for (int i = 1; i < 8; i++)
+        {
+            sb.Append(cs2[raw[i] % cs2.Length]);
+        }
+        return sb.ToString();
+    }
+
     private string DeriveDeviceSuffix()
     {
         Span<byte> raw = stackalloc byte[16];

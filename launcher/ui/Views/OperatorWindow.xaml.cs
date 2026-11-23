@@ -45,9 +45,11 @@ public partial class OperatorWindow : Window
         Loaded += (_, _) =>
         {
             FooterText.Text = $"service {_loader.LoadedServiceName}   device {_loader.LoadedDevicePath}";
-            RenderRow("service name", _loader.LoadedServiceName ?? "?");
+            RenderRow("hv service", _loader.LoadedServiceName ?? "?");
             RenderRow("device path", _loader.LoadedDevicePath ?? "?");
-            RenderRow("image path", _loader.LoadedImagePath ?? "?");
+            RenderRow("hv image", _loader.LoadedImagePath ?? "?");
+            RenderRow("fp service", _loader.LoadedFingerprintServiceName ?? "(not loaded)");
+            RenderRow("fp image", _loader.LoadedFingerprintImagePath ?? "(not loaded)");
             PollStatus();
             _statusTimer.Start();
             _kickTimer.Start();
@@ -75,9 +77,11 @@ public partial class OperatorWindow : Window
             _lastVmexits = s.VmexitCount;
 
             StatusPanel.Children.Clear();
-            RenderRow("service name", _loader.LoadedServiceName ?? "?");
+            RenderRow("hv service", _loader.LoadedServiceName ?? "?");
             RenderRow("device path", _loader.LoadedDevicePath ?? "?");
-            RenderRow("image path", _loader.LoadedImagePath ?? "?");
+            RenderRow("hv image", _loader.LoadedImagePath ?? "?");
+            RenderRow("fp service", _loader.LoadedFingerprintServiceName ?? "(not loaded)");
+            RenderRow("fp image", _loader.LoadedFingerprintImagePath ?? "(not loaded)");
             RenderRow("version", $"0x{s.Version:X8}");
             RenderRow("cpu count", s.CpuCount.ToString());
             RenderRow("active cpus", $"{s.ActiveCpus} / {s.CpuCount}");

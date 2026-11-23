@@ -91,3 +91,86 @@ The compiled `.sys` carries no brand strings in `.rdata`. Pool tag is `'FsFl'` (
 - **Resumable analysis across reboots.** No capture state persists. Operator re-arms the dump after each boot.
 - **Deployment outside the analysis rig.** HVCI on a target machine rejects the driver. Attestation signing (Microsoft Partner Center) is the production route; test-signing is local-dev only.
 - **Protection against ring-0 adversaries.** Guest ring-0 can `INVD` or write random bytes to physical RAM including the HV's code. Phase 10 scoping stands.
+
+## Wave 4 + 5 complete
+
+Wave 4 delivered the persistent-seed identity system and the per-process
+query interceptor; Wave 5 packages both into a signed single-file
+release the end user can download from GitHub and double-click.
+
+### Wave 4 — fingerprint coverage (merged commits `09f4035`, `486c6c6`, `e0ef44e`)
+
+- **Launcher UI** (`launcher/ui/`): WPF .NET 8, single-file self-
+  contained target. Splash → BCD check → seed modal (Randomize + Proceed)
+  → Operator panel with 1 Hz status poll and 20 s watchdog kick.
+- **Seed service** (`launcher/ui/Services/SeedService.cs`): 32-byte
+  master seed, DPAPI-wrapped on disk under `%AppData%\TheChamber\`.
+  Mirrors `driver/crypt.c` SHA-256 derive byte-for-byte so the C side
+  and the C# side agree on every expanded field. Seed only re-rolls on
+  explicit *Randomize seed* click.
+- **HV identity coverage** (`driver/svm_vmcb.c`, `driver/vmexit.c`):
+  CFG v2 blob drives CPUID brand string / topology / feature leaves,
+  MSR rewrite table (`0x8B`, `0x17`, `0xC0000103`, `0xC0010015`), guest
+  ASID, VMMCALL magic, driver-image nonce, pool tags, etc.
+- **Fingerprint driver** (`driver/fingerprint/`): second kernel driver,
+  separate service. Reads the same 632-byte CFG v2 blob out of
+  `Services\<fp_svc>\Parameters\CfgBlob`. Registers
+  `CmRegisterCallbackEx` (registry surfaces),
+  `FltRegisterFilter` (NDIS IOCTLs on `\Device\Ndis`),
+  `PsSetCreateProcessNotifyRoutineEx` (per-PID arm/disarm), and installs
+  `ProcessInstrumentationCallback` on each spoofed PID. All intercepts
+  are documented Windows APIs — no SSDT / IDT / GDT patches, no inline
+  hooks.
+
+### Wave 5 — packaging + release
+
+- **Second-driver load** (`launcher/ui/Services/DriverLoader.cs`):
+  adds `InstallAndLoadFingerprintAsync`. Mints the fingerprint service
+  name from the same master seed under a distinct derivation field,
+  writes the byte-exact CFG blob into `Parameters\CfgBlob` (REG_BINARY),
+  calls `NtLoadDriver`. `UnloadAsync` tears both down in reverse.
+- **CfgPatcher re-sign** (`launcher/ui/Services/CfgPatcher.cs` +
+  `AuthenticodeSigner.cs`): after patching the CFG blob and the PE
+  checksum, the launcher invokes `mssign32!SignerSignEx2` with a cached
+  self-signed cert (Subject **The Chamber**) at
+  `%ProgramData%\TheChamber\cert\the_chamber.pfx`. The cert is minted on
+  first run via `CertificateRequest.CreateSelfSigned` (the managed
+  wrapper around `CertCreateSelfSignCertificate`) and reused thereafter.
+- **User-mode shim** (`launcher/shim/`): new C++ DLL
+  `chamber_shim.dll`. Trampoline mirrors
+  `driver/fingerprint/ic_trampoline.asm` (`rcx = ret`, `r10 = user RIP`,
+  syscall number in `gs:[0x1480]`). Dispatches
+  `NtQuerySystemInformation` classes 103 / 144 / 176, `NtQueryValueKey`,
+  `NtDeviceIoControlFile` through a single AMD-SVM `vmmcall`
+  (`CHAMBER_HCALL_REWRITE_RESULT`, shared-secret magic in `rbx`) and
+  passes everything else through with a straight `jmp r10`. `#UD` on a
+  non-HV host is caught by `__try` / `__except`.
+- **Build glue** (`driver/build.ps1`, `driver/fingerprint/build.ps1`,
+  `launcher/shim/build.ps1`): one call to `driver/build.ps1` produces
+  all three signed artifacts (HV `.sys`, fingerprint `.sys`, shim
+  `.dll`) with the same shared self-signed cert at
+  `recovery/the_chamber_sign.pfx`. Paths are resolved relative to the
+  script so a CI checkout at an arbitrary workspace path works unchanged.
+- **GitHub Actions release** (`.github/workflows/release.yml`): on
+  every `v*` tag push, a `windows-latest` runner installs the WDK via
+  Chocolatey (with a VS-Installer fallback for the SDK), runs
+  `driver/build.ps1`, then `dotnet publish launcher/ui /p:PublishSingleFile=true /p:SelfContained=true`
+  produces `thechamber.exe` with the fresh driver blobs picked up via
+  `<EmbeddedResource>` `Condition="Exists(...)"`. The exe is signed with
+  the same cert and uploaded by `softprops/action-gh-release@v2`.
+- **End-user docs** (`RELEASES.md`): download, prerequisites (HVCI off,
+  test-signing on — one reboot the first time), seed modal, Operator
+  panel, uninstall.
+
+### Signing-chain summary
+
+| Artifact | How it is signed |
+|---|---|
+| `thechamber.exe` | Pipeline — `signtool sign /f recovery\the_chamber_sign.pfx` after publish. |
+| `the_chamber.sys` (build time) | Pipeline — same shared cert. |
+| `the_chamber.sys` (run time, after CFG patch) | Launcher — `SignerSignEx2` with the cached PFX at `%ProgramData%\TheChamber\cert\`. |
+| `chamber_fingerprint.sys` | Same as the HV driver: pipeline at build, launcher after CFG patch. |
+| `chamber_shim.dll` | Pipeline signs at build; not patched at install time, so the pipeline signature is final. |
+
+All certs share a single Subject: `CN=The Chamber`. No real vendor name
+appears anywhere in the chain or in driver metadata.

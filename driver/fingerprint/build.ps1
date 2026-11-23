@@ -2,18 +2,28 @@
 # Mirrors driver/build.ps1 with the fingerprint source set and the
 # minifilter library additions.
 #
-# Produces: driver/fingerprint/build_output.sys (placeholder filename;
-# launcher renames and re-signs after CFG patch).
+# Produces: driver/fingerprint/build/chamber_fingerprint.sys
+# (stable release path, consumed by launcher/ui/TheChamber.csproj's
+# <EmbeddedResource>).
+#
+# Can be called directly or via driver/build.ps1 (which runs the HV
+# driver, the fingerprint driver, and the user-mode shim in one pass).
 
 #Requires -RunAsAdministrator
 
 $ErrorActionPreference = 'Stop'
-$root    = 'C:\THE_CHAMBER'
-$driver  = Join-Path $root 'driver\fingerprint'
+# Resolve repo layout from this script's location rather than a hardcoded
+# C:\THE_CHAMBER so the release workflow (which checks the repo out into
+# a runner-specific path) finds the sources.
+$here    = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root    = Split-Path -Parent (Split-Path -Parent $here)
+$driver  = $here
 $objDir  = Join-Path $root 'build\obj_fp'
-$pfx     = Join-Path $root 'recovery\the_chamber_test.pfx'
-$cer     = Join-Path $root 'recovery\the_chamber_test.cer'
+$outDir  = Join-Path $here 'build'
+$pfx     = Join-Path $root 'recovery\the_chamber_sign.pfx'
+$cer     = Join-Path $root 'recovery\the_chamber_sign.cer'
 New-Item -ItemType Directory -Path $objDir -Force | Out-Null
+New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
 Write-Host "=== chamber_fingerprint build ===" -ForegroundColor Cyan
 
@@ -110,10 +120,10 @@ if (Test-Path $asm) {
 }
 
 # --- Link ---
-# Placeholder output name; launcher renames per install after CFG patch
-# and before signing, like the_chamber.sys does.
-$sys = Join-Path $driver 'build_output.sys'
-$linkFlags = "/NOLOGO /SUBSYSTEM:NATIVE,10.0 /DRIVER /ENTRY:DriverEntry /MACHINE:X64 /INCREMENTAL:NO /NODEFAULTLIB /OPT:REF /OPT:ICF /RELEASE /PDBALTPATH:build_output.pdb /DEBUG:NONE"
+# Stable output path. The launcher rewrites the CFG blob + PE checksum
+# and re-signs per install; this name is what the .csproj embeds.
+$sys = Join-Path $outDir 'chamber_fingerprint.sys'
+$linkFlags = "/NOLOGO /SUBSYSTEM:NATIVE,10.0 /DRIVER /ENTRY:DriverEntry /MACHINE:X64 /INCREMENTAL:NO /NODEFAULTLIB /OPT:REF /OPT:ICF /RELEASE /PDBALTPATH:chamber_fingerprint.pdb /DEBUG:NONE"
 
 # Minifilter adds fltmgr.lib. Fltmgr is the one extra kernel library
 # beyond the HV driver's set.
@@ -136,9 +146,10 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  Built: $sys ($([int]((Get-Item $sys).Length / 1024)) KiB)"
 
-# --- Test cert (shared with the_chamber.sys) ---
+# --- Shared cert (minted by driver/build.ps1 on first run) ---
 if (-not (Test-Path $pfx)) {
-    Write-Host "  No test cert; driver/build.ps1 creates one. Run that first."
+    Write-Host '  No shared cert at recovery/the_chamber_sign.pfx.'
+    Write-Host '  Run driver/build.ps1 first -- it mints the cert and signs both drivers.'
     exit 1
 }
 
@@ -147,17 +158,17 @@ $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse 
     Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
     Sort-Object FullName -Descending |
     Select-Object -First 1
-if (-not $signtool) { throw "signtool.exe not found" }
-Write-Host ""
-Write-Host "=== Sign ==="
-& $signtool.FullName sign /f $pfx /p 'THE_CHAMBER' /fd SHA256 /t http://timestamp.digicert.com $sys
+if (-not $signtool) { throw 'signtool.exe not found' }
+Write-Host ''
+Write-Host '=== Sign ==='
+& $signtool.FullName sign /f $pfx /p 'the-chamber' /fd SHA256 /t http://timestamp.digicert.com $sys
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "  Timestamp failed, retrying without timestamp..." -ForegroundColor Yellow
-    & $signtool.FullName sign /f $pfx /p 'THE_CHAMBER' /fd SHA256 $sys
-    if ($LASTEXITCODE -ne 0) { throw "signtool sign failed" }
+    Write-Host '  Timestamp failed, retrying without timestamp...' -ForegroundColor Yellow
+    & $signtool.FullName sign /f $pfx /p 'the-chamber' /fd SHA256 $sys
+    if ($LASTEXITCODE -ne 0) { throw 'signtool sign failed' }
 }
 & $signtool.FullName verify /pa /v $sys
 
-Write-Host ""
-Write-Host "=== Done ===" -ForegroundColor Green
+Write-Host ''
+Write-Host '=== Done ===' -ForegroundColor Green
 Write-Host "  $sys"

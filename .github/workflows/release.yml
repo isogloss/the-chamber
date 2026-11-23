@@ -1,0 +1,172 @@
+# Release workflow -- builds thechamber.exe (single-file, self-contained,
+# with both drivers + shim embedded) on a Windows runner whenever a v*
+# tag is pushed, and uploads the result to the GitHub Release.
+#
+# No cloud signing cert / no EV key. The build mints a self-signed cert
+# (Subject "The Chamber") locally in the runner, uses it to sign both
+# .sys files and the shim .dll, and the launcher reuses the same chain
+# at run time. End users must enable test-signing on their own machine
+# before loading the driver -- documented in RELEASES.md.
+#
+# WDK install strategy: Microsoft does not publish a first-party GitHub
+# Action for the WDK. We use Chocolatey, which has a well-maintained
+# windowsdriverkit10 package that pulls the EWDK layout the WDK ships
+# with. `windows-latest` already carries MSVC 2022 Build Tools and
+# .NET 8 SDK via the runner image, so only the WDK bootstrap is
+# workflow work. If that package is unavailable we fall back to the
+# Visual Studio Installer's `--add Microsoft.VisualStudio.Component.Windows11SDK.22621`
+# invocation which pulls a WDK-equivalent SDK layout for the toolchain.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'tag or branch to build (manual dispatch only)'
+        required: true
+        default: 'main'
+
+permissions:
+  contents: write  # softprops/action-gh-release uploads the artifact
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install WDK (via chocolatey)
+        shell: pwsh
+        run: |
+          # The `windowsdriverkit10` Chocolatey package layers the WDK
+          # include / lib tree under C:\Program Files (x86)\Windows Kits\10
+          # which is what driver/build.ps1 looks for. If Chocolatey itself
+          # is somehow missing we fall back to the VS Installer with the
+          # Windows SDK + SDK kernel-tools component which gives the
+          # same headers the kernel-mode compile needs.
+          $ErrorActionPreference = 'Stop'
+          if (Get-Command choco -EA SilentlyContinue) {
+            choco install -y windowsdriverkit10 --no-progress || `
+              Write-Host '  windowsdriverkit10 install declined; trying fallback'
+          }
+
+          # Verify ntddk.h is on disk; if not, pull the SDK via VS
+          # installer as the documented second-source.
+          $incRoot = 'C:\Program Files (x86)\Windows Kits\10\Include'
+          $have = Test-Path $incRoot
+          if ($have) {
+            $ntddk = Get-ChildItem $incRoot -Recurse -Filter 'ntddk.h' -EA SilentlyContinue |
+              Select-Object -First 1
+            if (-not $ntddk) { $have = $false }
+          }
+          if (-not $have) {
+            Write-Host 'Falling back to VS Installer for the WDK SDK layout.'
+            $vsPath = & 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe' `
+              -latest -property installationPath
+            if (-not $vsPath) { throw 'No Visual Studio install found on runner.' }
+            $installer = Join-Path $vsPath '..\..\Installer\vs_installer.exe'
+            if (-not (Test-Path $installer)) {
+              $installer = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vs_installer.exe'
+            }
+            Start-Process $installer -Wait -ArgumentList @(
+              'modify',
+              '--installPath', $vsPath,
+              '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621',
+              '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+              '--quiet', '--norestart'
+            )
+          }
+
+      - name: Build drivers + shim
+        shell: pwsh
+        run: |
+          # driver/build.ps1 chains the fingerprint driver + the shim
+          # DLL and signs all three with the shared self-signed cert.
+          # This produces:
+          #   driver/build/the_chamber.sys
+          #   driver/fingerprint/build/chamber_fingerprint.sys
+          #   launcher/shim/build/chamber_shim.dll
+          # which TheChamber.csproj picks up via <EmbeddedResource>
+          # Condition="Exists(...)".
+          powershell -ExecutionPolicy Bypass -File driver\build.ps1
+
+      - name: Publish launcher (single-file, self-contained)
+        shell: pwsh
+        run: |
+          # /p:PublishSingleFile=true /p:SelfContained=true gives the
+          # end user a one-file thechamber.exe that bootstraps its own
+          # .NET runtime, extracts the embedded driver blobs on first
+          # run, and patches / re-signs them in place with the same
+          # cert the pipeline just used.
+          dotnet publish launcher/ui/TheChamber.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            /p:PublishSingleFile=true `
+            /p:IncludeNativeLibrariesForSelfExtract=true `
+            /p:EnableCompressionInSingleFile=true `
+            -o publish
+
+      - name: Sign thechamber.exe with the shared cert
+        shell: pwsh
+        run: |
+          $pfx = 'recovery\the_chamber_sign.pfx'
+          if (-not (Test-Path $pfx)) {
+            throw 'Shared cert missing -- driver/build.ps1 should have minted it.'
+          }
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe -EA SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found on runner' }
+          & $signtool.FullName sign /f $pfx /p 'the-chamber' /fd SHA256 /t http://timestamp.digicert.com publish\thechamber.exe
+          if ($LASTEXITCODE -ne 0) {
+            # Timestamp servers flap in CI; retry without timestamp.
+            & $signtool.FullName sign /f $pfx /p 'the-chamber' /fd SHA256 publish\thechamber.exe
+            if ($LASTEXITCODE -ne 0) { throw 'signtool sign failed' }
+          }
+          & $signtool.FullName verify /pa /v publish\thechamber.exe
+
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Copy-Item publish\thechamber.exe release\thechamber.exe
+          Copy-Item recovery\the_chamber_sign.cer release\the_chamber_sign.cer -EA SilentlyContinue
+          # Compute SHA-256 for the release notes.
+          $hash = (Get-FileHash release\thechamber.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content release\thechamber.exe.sha256 "$hash *thechamber.exe"
+          Write-Host "  SHA-256: $hash"
+
+      - name: Upload artifact (for workflow_dispatch runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: thechamber-${{ github.event.inputs.ref }}
+          path: release\*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/thechamber.exe
+            release/thechamber.exe.sha256
+            release/the_chamber_sign.cer
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
