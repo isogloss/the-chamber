@@ -213,7 +213,7 @@ public sealed class SeedService
         d.InstallDateFiletime = DeriveInstallDateFiletime();
         d.ProductId = DeriveProductId();
         d.DigitalProductId = DeriveDigitalProductId();
-        d.CpuBrandString = DeriveCpuBrand(d);
+        d.CpuBrandString = DeriveCpuBrand();
         d.SmbiosSystemUuid = DeriveGuidV4("identity", _identitySalt, "smbios_uuid");
         d.BaseboardSerial = DeriveSerial("baseboard_serial");
         d.ChassisSerial = DeriveSerial("chassis_serial");
@@ -342,7 +342,7 @@ public sealed class SeedService
         return buf;
     }
 
-    private string DeriveCpuBrand(DerivedIdentity ctx)
+    private string DeriveCpuBrand()
     {
         Span<byte> raw = stackalloc byte[4];
         DeriveGroup("identity", _identitySalt, "cpu_brand", raw);
@@ -377,13 +377,16 @@ public sealed class SeedService
 
     private MacAddress[] DeriveMacs()
     {
+        // One derive() per MAC with field "mac_addr_<i>", matching the
+        // FID_MAC_ADDR_BASE enum comment in identity.h so Agent C's
+        // interceptor arrives at the exact same bytes from the seed.
         var macs = new MacAddress[6];
-        Span<byte> raw = stackalloc byte[48];
-        DeriveGroup("identity", _identitySalt, "mac_addr_block", raw);
         for (int i = 0; i < 6; i++)
         {
-            var o = OuiPool[raw[i * 8] % OuiPool.Length];
-            var nic = new byte[3] { raw[i * 8 + 1], raw[i * 8 + 2], raw[i * 8 + 3] };
+            Span<byte> raw = stackalloc byte[4];
+            DeriveGroup("identity", _identitySalt, $"mac_addr_{i}", raw);
+            var o = OuiPool[raw[0] % OuiPool.Length];
+            var nic = new byte[3] { raw[1], raw[2], raw[3] };
             macs[i] = new MacAddress(o, nic);
         }
         return macs;
