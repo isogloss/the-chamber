@@ -142,6 +142,56 @@ NTSTATUS svm_init_all_cpus(void) {
     return STATUS_SUCCESS;
 }
 
+/* ---- Guest entry ---------------------------------------------------- */
+
+/* Pin the current thread to each active CPU and issue VMRUN there. The
+ * affinity-switched PASSIVE_LEVEL path is required: svm_launch issues CLGI
+ * + VMLOAD + VMRUN, which must run at PASSIVE_LEVEL, not the IPI_LEVEL that
+ * KeIpiGenericCall would impose. KeSetSystemAffinityThreadEx accepts a
+ * KAFFINITY mask within the current thread's processor group; the 7700X
+ * fits in a single group so one-bit-set is sufficient.
+ *
+ * After svm_launch() returns via guest_entry_point's ret, that physical
+ * CPU is live in guest mode. The loop continues to pin and launch the
+ * next CPU. Re-entry into a ctx already in guest mode is refused via the
+ * guest_entered latch. */
+NTSTATUS svm_launch_all_cpus(void) {
+    PROCESSOR_NUMBER proc_num;
+    KAFFINITY        prev_aff;
+    NTSTATUS         st;
+    ULONG            i;
+
+    if (!g_cpu_ctx || g_cpu_count == 0) return STATUS_UNSUCCESSFUL;
+
+    for (i = 0; i < g_cpu_count; i++) {
+        PER_CPU_CTX *ctx = &g_cpu_ctx[i];
+
+        if (!ctx->active)       continue;
+        if (ctx->guest_entered) continue;
+
+        st = KeGetProcessorNumberFromIndex(i, &proc_num);
+        if (!NT_SUCCESS(st)) {
+            CHAMBER_LOG_ERR("KeGetProcessorNumberFromIndex(%u) failed 0x%08x\n",
+                            i, st);
+            return st;
+        }
+
+        prev_aff = KeSetSystemAffinityThreadEx(
+            (KAFFINITY)1 << proc_num.Number);
+
+        /* Latch BEFORE svm_launch so a concurrent/duplicate caller that
+         * reads guest_entered observes the in-progress state. */
+        ctx->guest_entered = TRUE;
+
+        svm_launch(ctx);
+
+        KeRevertToUserAffinityThreadEx(prev_aff);
+    }
+
+    CHAMBER_LOG("guest live on %u CPUs\n", g_cpu_count);
+    return STATUS_SUCCESS;
+}
+
 /* ---- Teardown ------------------------------------------------------- */
 
 static VOID svm_offline_cpu(PER_CPU_CTX *ctx) {

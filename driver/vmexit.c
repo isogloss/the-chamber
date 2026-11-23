@@ -7,6 +7,19 @@
  * GPR save index map (see the_chamber.h):
  *   0=rax 1=rbx 2=rcx 3=rdx 4=rsi 5=rdi 6=rbp 7=rsp 8..15=r8..r15
  * rax lives authoritatively in vmcb->save.rax (loaded/stored by VMRUN).
+ *
+ * No-migration rule (RDTSCP consistency): the handler runs on the physical
+ * CPU that trapped. Nothing here issues an IPI, queues a DPC that migrates
+ * work to another CPU, or otherwise causes the guest to resume on a
+ * different CPU than the one that VMEXITed. Guest RDTSCP therefore
+ * reads back a stable TSC_AUX across intercepts, as it would on bare
+ * metal with a pinned thread.
+ *
+ * No-inline-patch rule: this file never patches guest instructions. All
+ * hooks (when Phase 6 adds them) go through NPT split-view -- the HV
+ * swaps the physical page under the guest's read instead of modifying
+ * its text. Keeps the guest-visible code bytes stable, which matters for
+ * PatchGuard's tracked-module hashes and for integrity-check probes.
  */
 
 #include <ntddk.h>
@@ -21,8 +34,41 @@ volatile ULONGLONG g_vmexit_count = 0;
 
 static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb);
 static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb);
+static void handle_rdpmc(PER_CPU_CTX *ctx, VMCB *vmcb);
 static void handle_vmmcall(PER_CPU_CTX *ctx, VMCB *vmcb);
 static void handle_npf(PER_CPU_CTX *ctx, VMCB *vmcb);
+
+/* Zen 4 extended Core PMC: PerfCtrCoreI lives at the odd MSR
+ * 0xC0010201 + 2*i. Six counters total on family 19h. */
+#define PMC_CTR_MSR(i)   (0xC0010201ULL + 2ULL * (ULONGLONG)(i))
+
+/* Snapshot every armed counter at VMEXIT entry so values accrued by the
+ * handler do not leak into subsequent guest RDPMC/__readmsr. */
+static void pmu_snapshot_in(PER_CPU_CTX *ctx)
+{
+    ULONG i;
+    for (i = 0; i < 6; i++) {
+        if (ctx->guest_pmc_armed[i]) {
+            __try {
+                ctx->guest_pmc_snapshot[i] = __readmsr(PMC_CTR_MSR(i));
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        }
+    }
+}
+
+/* Restore the snapshot before VMRUN so the guest resumes with the same
+ * counter value it had at VMEXIT. Handler-side increments are discarded. */
+static void pmu_snapshot_out(PER_CPU_CTX *ctx)
+{
+    ULONG i;
+    for (i = 0; i < 6; i++) {
+        if (ctx->guest_pmc_armed[i]) {
+            __try {
+                __writemsr(PMC_CTR_MSR(i), ctx->guest_pmc_snapshot[i]);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        }
+    }
+}
 
 /* AMD Table 15-5 event_inject layout:
  *   bits 0-7   : vector (6 = #UD)
@@ -52,6 +98,11 @@ void vmexit_handler(PER_CPU_CTX *ctx)
     vmcb = (VMCB *)ctx->vmcb_va;
     exit_code = vmcb->ctl.exit_code;
 
+    /* Freeze every armed guest counter at its current value before any
+     * handler-side RDMSR/WRMSR touches the PMU hardware. Paired with
+     * pmu_snapshot_out at function exit. */
+    pmu_snapshot_in(ctx);
+
     switch (exit_code) {
     case VMEXIT_CPUID:
         handle_cpuid(ctx, vmcb);
@@ -59,6 +110,10 @@ void vmexit_handler(PER_CPU_CTX *ctx)
 
     case VMEXIT_MSR:
         handle_msr(ctx, vmcb);
+        break;
+
+    case VMEXIT_RDPMC:
+        handle_rdpmc(ctx, vmcb);
         break;
 
     case VMEXIT_VMMCALL:
@@ -83,6 +138,11 @@ void vmexit_handler(PER_CPU_CTX *ctx)
         vmexit_inject_ud(vmcb);
         break;
     }
+
+    /* Restore the guest PMC values before VMRUN so counts the handler
+     * ran up are invisible on the next guest-side RDMSR/RDPMC. Paired
+     * with pmu_snapshot_in at function entry. */
+    pmu_snapshot_out(ctx);
 
     /* Phase 1.2: no more per-handler timing hooks here. vmrun.asm captures
      * the host-interval START right after `vmrun rax` returns (before
@@ -143,6 +203,31 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
 }
 
 /* ------------------------------------------------------------------ */
+/* RDPMC interception (AMD 15.9, IVEC3 bit 15).                       */
+/* ------------------------------------------------------------------ */
+
+/* Return the shadowed counter value stashed by pmu_snapshot_in so the
+ * guest never observes host-side counts accrued during VMEXIT handling.
+ * Minimum-viable handler: emit the snapshot directly. A future pass may
+ * fold in a cycle-delta approximation to estimate counts that would have
+ * accrued natively during the host window. */
+static void handle_rdpmc(PER_CPU_CTX *ctx, VMCB *vmcb)
+{
+    ULONG     idx = (ULONG)ctx->gpr_save[2] & 0x7U;   /* rcx low bits */
+    ULONGLONG val = 0;
+
+    if (idx < 6) {
+        val = ctx->guest_pmc_snapshot[idx];
+    }
+
+    vmcb->save.rax   = (ULONGLONG)(ULONG)val;
+    ctx->gpr_save[3] = (ULONGLONG)(ULONG)(val >> 32);
+
+    /* RDPMC is one of the decoded intercepts with next_rip populated. */
+    vmcb->save.rip = vmcb->ctl.next_rip;
+}
+
+/* ------------------------------------------------------------------ */
 /* MSR interception (AMD 15.11).                                      */
 /* ------------------------------------------------------------------ */
 
@@ -154,6 +239,10 @@ static BOOLEAN handle_msr_allowlist_pass(ULONG msr)
     switch (msr) {
     case 0x00000010UL:   /* IA32_TIME_STAMP_COUNTER      */
     case 0x0000001BUL:   /* IA32_APIC_BASE               */
+    case 0x00000048UL:   /* SPEC_CTRL                    */
+    case 0x00000049UL:   /* PRED_CMD                     */
+    case 0x000000E7UL:   /* MPERF                        */
+    case 0x000000E8UL:   /* APERF                        */
     case 0x000000FEUL:   /* IA32_MTRRCAP                 */
     case 0x00000277UL:   /* IA32_PAT                     */
     case 0x000002FFUL:   /* IA32_MTRR_DEF_TYPE           */
@@ -165,6 +254,8 @@ static BOOLEAN handle_msr_allowlist_pass(ULONG msr)
     case 0xC0000100UL:   /* FS_BASE                      */
     case 0xC0000101UL:   /* GS_BASE                      */
     case 0xC0000102UL:   /* KERNEL_GS_BASE               */
+    case 0xC0000103UL:   /* TSC_AUX (RDTSCP tag)         */
+    case 0xC0010015UL:   /* HWCR (no SVM-state bits)     */
         return TRUE;
     default:
         return FALSE;
@@ -206,6 +297,31 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
         return;
     }
 
+    /* Zen 4 extended Core PMC event-selects. Observe arming on WRMSR and
+     * pass the value through so the guest's counter actually counts. EN
+     * is bit 22; any non-zero write with EN set marks the counter armed
+     * for save/restore and handle_rdpmc. Reads pass through too. */
+    if (msr >= 0xC0010200UL && msr <= 0xC001020AUL && (msr & 1U) == 0U) {
+        ULONG idx = (msr - 0xC0010200UL) >> 1;
+        if (is_write) {
+            value = (ULONGLONG)(ULONG)vmcb->save.rax |
+                    ((ULONGLONG)(ULONG)ctx->gpr_save[3] << 32);
+            ctx->guest_pmc_armed[idx] =
+                (value != 0 && (value & (1ULL << 22)) != 0) ? TRUE : FALSE;
+            __try {
+                __writemsr(msr, value);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        } else {
+            __try {
+                value = __readmsr(msr);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { value = 0; }
+            vmcb->save.rax   = (ULONGLONG)(ULONG)value;
+            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
+        }
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+
     if (msr == (ULONG)SVM_MSR_EFER) {
         if (is_write) {
             /* Update VMCB.save.efer only; do NOT mutate the host's
@@ -232,6 +348,31 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
         if (!is_write) {
             vmcb->save.rax   = 0;
             ctx->gpr_save[3] = 0;
+        }
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+
+    /* SMM_ADDR (0xC0010112), SMM_MASK (0xC0010113): hide SMM configuration;
+     * guest reads the bare-metal default of 0 and writes are absorbed. */
+    if (msr == 0xC0010112UL || msr == 0xC0010113UL) {
+        if (!is_write) {
+            vmcb->save.rax   = 0;
+            ctx->gpr_save[3] = 0;
+        }
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+
+    /* TSC_RATIO (0xC0000104): 8.32 fixed-point identity 1.0.  Integer
+     * part 1 goes in bits [39:32]; fraction + reserved are zero.  This
+     * is what stock Linux and Windows read back from an unprogrammed
+     * part; returning 0 would itself be an anomaly. */
+    if (msr == 0xC0000104UL) {
+        if (!is_write) {
+            ULONGLONG v = 0x0000000100000000ULL;
+            vmcb->save.rax   = (ULONGLONG)(ULONG)v;
+            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(v >> 32);
         }
         vmcb->save.rip = vmcb->ctl.next_rip;
         return;
