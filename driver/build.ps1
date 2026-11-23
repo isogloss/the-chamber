@@ -63,7 +63,9 @@ $sources = @(
     'stealth.c',
     'timing.c',
     'dump.c',
-    'integrity.c'
+    'integrity.c',
+    'crypt.c',
+    'identity.c'
 ) | ForEach-Object { Join-Path $driver $_ } | Where-Object { Test-Path $_ }
 
 if ($sources.Count -eq 0) { throw "No .c sources found under $driver." }
