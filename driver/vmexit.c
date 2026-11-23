@@ -29,6 +29,7 @@
 #include "svm.h"
 #include "timing.h"
 #include "npt.h"
+#include "dump.h"
 
 volatile ULONGLONG g_vmexit_count = 0;
 
@@ -424,6 +425,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
 #define THE_CHAMBER_HYPERCALL_MAGIC   0x5452484D4648434AULL  /* "JCHFMHRT" */
 #define THE_CHAMBER_HCALL_VERSION     1
 #define THE_CHAMBER_HCALL_SHUTDOWN    2
+/* CHAMBER_HCALL_DUMP_CR3 (3) is defined in dump.h and dispatched below. */
 
 static void inject_ud(VMCB *vmcb) {
     /* AMD Table 15-5: event_inject layout:
@@ -457,6 +459,34 @@ static void handle_vmmcall(PER_CPU_CTX *ctx, VMCB *vmcb)
     case THE_CHAMBER_HCALL_SHUTDOWN:
         InterlockedExchange(&ctx->shutdown_requested, 1);
         break;
+    case CHAMBER_HCALL_DUMP_CR3: {
+        /* Phase 6.2 pause-the-world capture. Operator calling convention
+         * (also documented in dump.h):
+         *
+         *   rax = CHAMBER_HCALL_DUMP_CR3
+         *   rbx = THE_CHAMBER_HYPERCALL_MAGIC (checked above)
+         *   rcx = target PID
+         *   rdx = output buffer VA (operator AS)
+         *   rsi = output buffer size (bytes)
+         *
+         * Return value in rax: bytes written, or 0 on error.
+         *
+         * IRQL: the VMMCALL handler runs at the IRQL the guest VMMCALL'd
+         * at. For a user-mode operator thread that is PASSIVE_LEVEL,
+         * which is what dump_snapshot_pause_target requires (it uses
+         * KeStackAttachProcess and ZwQueryVirtualMemory). An operator
+         * that issues VMMCALL from a DISPATCH-level DPC gets 0 back and
+         * is expected to retry from PASSIVE context -- we do NOT queue
+         * a passive work item internally because userland sees the
+         * VMMCALL as synchronous and expects the result in rax on the
+         * instruction's return. */
+        CHAMBER_DUMP_REQ req;
+        req.target_pid         = ctx->gpr_save[2];  /* rcx */
+        req.output_buffer_va   = ctx->gpr_save[3];  /* rdx */
+        req.output_buffer_size = ctx->gpr_save[4];  /* rsi */
+        vmcb->save.rax = dump_snapshot_pause_target(&req);
+        break;
+    }
     default:
         inject_ud(vmcb);
         return;
