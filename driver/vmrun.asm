@@ -126,11 +126,10 @@ host_vmexit_loop:
     mov rax, [rsp + 8]                  ; rax = guest R15 (from scratch)
     mov [r15 + GPR_SAVE_OFFSET + 120], rax
 
-    ; FXSAVE64 to the 16-byte-aligned per-CPU scratch area.  MSVC emits
-    ; XMM / YMM against the kernel stack through memcpy, DbgPrintEx
-    ; varargs classification, and inline float lowering; without this
-    ; save / restore the handler leaks guest x87/SSE state to the host
-    ; and corrupts the guest's vector state across the exit.
+    ; FXSAVE64 to the 16-byte-aligned per-CPU scratch area.  Sufficient
+    ; for the integer-only vmexit_handler path.  If a future handler
+    ; emits YMM via SIMD intrinsics, upgrade to xsave64 against XCR0
+    ; and resize the save area per CPUID 0xD.0.
     lea rax, [r15 + FXSAVE_AREA]
     fxsave64 [rax]
 
@@ -140,12 +139,21 @@ host_vmexit_loop:
     add rsp, 40
 
     mov r15, [rsp]                      ; reload ctx
-    lea rax, [r15 + FXSAVE_AREA]
-    fxrstor64 [rax]
 
     mov eax, dword ptr [r15 + SHUTDOWN_REQ_OFFSET]
     test eax, eax
     jnz host_done
+
+    ; Capture END BEFORE timing_update so END and START are matched from
+    ; the same iteration (if END followed timing_update, END would pair
+    ; with the NEXT iteration's START and timing.c's END<START guard
+    ; would fire every call).  timing_update's own cycles plus the GPR
+    ; reload sled are charged to g_timing_tail_cycles in timing.c.
+    lfence
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    mov [r15 + TIMING_HOST_INTERVAL_END], rax
 
     mov rcx, r15                        ; first arg = ctx
     sub rsp, 40                         ; shadow + 8 pad for 16-byte align
@@ -153,14 +161,8 @@ host_vmexit_loop:
     add rsp, 40
     mov r15, [rsp]                      ; reload ctx after call
 
-    ; Host-interval END captured AFTER timing_update so its own cycles
-    ; (locked add, VMCB tsc_offset write, clean-bit clear) are included
-    ; in the delta the NEXT iteration adds to g_total_accumulated_cycles.
-    lfence
-    rdtsc
-    shl rdx, 32
-    or rax, rdx
-    mov [r15 + TIMING_HOST_INTERVAL_END], rax
+    lea rax, [r15 + FXSAVE_AREA]
+    fxrstor64 [rax]
 
     ; Reload guest GPRs for the next VMRUN.  R15 last so ctx access ends.
     mov rbx, [r15 + GPR_SAVE_OFFSET +   8]
