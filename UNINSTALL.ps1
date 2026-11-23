@@ -176,43 +176,42 @@ $marker = "$root\last_session.marker"
 if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force }
 
 # --- 5. BCD restore from snapshot (never blanket off) ---
+# JSON-driven per-flag revert is the primary restore path. The .bcd hive
+# file is a safety backup only -- bcdedit /import replaces the whole BCD
+# store and /clean additionally wipes EFI firmware boot entries, so any
+# unrelated BCD edits between INSTALL and UNINSTALL would be lost. We
+# never auto-import the hive; the operator may do so manually from WinRE
+# if the per-flag path proves insufficient.
 if (-not $KeepTestSigning) {
     $snapJson = Join-Path $logs 'bcd_pre_install.json'
     $snapHive = Join-Path $logs 'bcd_pre_install.bcd'
-    $restoredFromHive = $false
-    if (Test-Path -LiteralPath $snapHive) {
+    if (Test-Path -LiteralPath $snapJson) {
         try {
-            bcdedit /import $snapHive /clean | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "BCD restored from snapshot: $snapHive" -ForegroundColor Green
-                $restoredFromHive = $true
+            $snap = Get-Content -LiteralPath $snapJson -Raw | ConvertFrom-Json
+            if ($snap.installer_touched_testsigning) {
+                Write-Host "Reverting testsigning (INSTALL enabled it)..." -ForegroundColor White
+                bcdedit /set testsigning off | Out-Null
+            } else {
+                Write-Host "testsigning was not changed by INSTALL; leaving as-is." -ForegroundColor DarkGray
             }
-        } catch {}
-    }
-    if (-not $restoredFromHive) {
-        if (Test-Path -LiteralPath $snapJson) {
-            try {
-                $snap = Get-Content -LiteralPath $snapJson -Raw | ConvertFrom-Json
-                if ($snap.installer_touched_testsigning) {
-                    Write-Host "Reverting testsigning (INSTALL enabled it)..." -ForegroundColor White
-                    bcdedit /set testsigning off | Out-Null
-                } else {
-                    Write-Host "testsigning was not changed by INSTALL; leaving as-is." -ForegroundColor DarkGray
-                }
-                if ($snap.installer_touched_nointegritychecks) {
-                    Write-Host "Reverting nointegritychecks (INSTALL enabled it)..." -ForegroundColor White
-                    bcdedit /set nointegritychecks off | Out-Null
-                }
-            } catch {
-                Write-Host ("Could not parse $snapJson; leaving BCD flags untouched. " + $_.Exception.Message) -ForegroundColor Yellow
+            if ($snap.installer_touched_nointegritychecks) {
+                Write-Host "Reverting nointegritychecks (INSTALL enabled it)..." -ForegroundColor White
+                bcdedit /set nointegritychecks off | Out-Null
+            } else {
+                Write-Host "nointegritychecks was not changed by INSTALL; leaving as-is." -ForegroundColor DarkGray
             }
-        } else {
-            Write-Host "No BCD snapshot found; leaving bcdedit flags untouched (INSTALL may have been skipped)." -ForegroundColor Yellow
+        } catch {
+            Write-Host ("Could not parse $snapJson; leaving BCD flags untouched. " + $_.Exception.Message) -ForegroundColor Yellow
         }
+    } else {
+        Write-Host "No BCD snapshot found; leaving bcdedit flags untouched (INSTALL may have been skipped)." -ForegroundColor Yellow
     }
-    # Remove snapshot files so a later INSTALL takes a fresh baseline.
+    if (Test-Path -LiteralPath $snapHive) {
+        Write-Host "Safety backup $snapHive left in place (not auto-imported)." -ForegroundColor DarkGray
+    }
+    # Remove snapshot JSON so a later INSTALL takes a fresh baseline; keep
+    # the .bcd hive as an operator-visible safety copy.
     Remove-Item -LiteralPath $snapJson -Force -EA SilentlyContinue
-    Remove-Item -LiteralPath $snapHive -Force -EA SilentlyContinue
 } else {
     Write-Host "-KeepTestSigning set; leaving BCD flags as-is." -ForegroundColor Yellow
 }
