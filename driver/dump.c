@@ -94,6 +94,15 @@ static ULONGLONG g_pause_target_cr3 = 0;
  * for. */
 static volatile LONG g_pause_matched = 0;
 
+/* Completion counter: every DPC increments this exactly once, whether
+ * it matched or not. The originator waits for completion == cpu_count
+ * (or timeout) before reading g_pause_matched and starting the walk.
+ * Non-match DPCs increment on return; match DPCs increment after they
+ * have set their parked flag but before they enter the spin, so the
+ * originator can distinguish "DPC queue still draining" from "match
+ * DPCs are in the spin with parked flagged". */
+static volatile LONG g_pause_completion = 0;
+
 /* Pause-window ceiling. 2 seconds in 100-ns units; KeQueryInterruptTime
  * ticks at the system clock interval so this is a real wall-clock
  * bound, not a spin-count. */
@@ -185,13 +194,16 @@ static VOID pause_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2)
      * refreshes at the next VMEXIT. __readcr3 is the correct source. */
     current_cr3 = __readcr3() & ~0xFFFULL;
     if (current_cr3 != g_pause_target_cr3) {
+        InterlockedIncrement(&g_pause_completion);
         return;
     }
 
-    /* Match. Announce ourselves, flip our per-CPU parked flag, and
-     * spin on g_pause_active with a bounded wait. */
+    /* Match. Announce ourselves, flip our per-CPU parked flag, record
+     * completion so the originator knows this DPC has actually run,
+     * and spin on g_pause_active with a bounded wait. */
     InterlockedIncrement(&g_pause_matched);
     InterlockedExchange(&slot->parked, 1);
+    InterlockedIncrement(&g_pause_completion);
 
     t0.QuadPart = (ULONGLONG)KeQueryInterruptTime();
 
@@ -440,8 +452,9 @@ static ULONG pause_broadcast_and_wait(void)
         InterlockedExchange(&g_pause_per_cpu[i].parked,    0);
         InterlockedExchange(&g_pause_per_cpu[i].timed_out, 0);
     }
-    InterlockedExchange(&g_pause_matched, 0);
-    InterlockedExchange(&g_pause_active,  1);
+    InterlockedExchange(&g_pause_matched,    0);
+    InterlockedExchange(&g_pause_completion, 0);
+    InterlockedExchange(&g_pause_active,     1);
 
     /* Queue each DPC on its pinned CPU. KeInsertQueueDpc returns FALSE
      * if the DPC was already queued -- benign when a prior fire did
@@ -450,45 +463,36 @@ static ULONG pause_broadcast_and_wait(void)
         KeInsertQueueDpc(&g_pause_per_cpu[i].dpc, NULL, NULL);
     }
 
-    /* Wait for the match counter to stabilize. Each matching CPU has
-     * to run its DPC and reach the InterlockedIncrement before the
-     * walk is safe. Non-matching CPUs may still be running the DPC's
-     * CR3 compare. Bound the wait by the same 2 s ceiling the DPC
-     * uses so a CPU that is deep in an SMI (unreachable DPC) does
-     * not wedge the originator. */
+    /* Wait for every DPC to have reached its post-CR3-check point:
+     * non-matches have returned, matches have flagged parked and
+     * entered their spin. Bound by the same 2 s ceiling so a CPU
+     * stuck in an SMI (unreachable DPC) does not wedge the
+     * originator. */
     t0.QuadPart = (ULONGLONG)KeQueryInterruptTime();
     for (;;) {
-        ULONG parked_now = 0;
-        ULONG seen       = 0;
-        for (i = 0; i < g_pause_cpu_count; i++) {
-            if (InterlockedCompareExchange(&g_pause_per_cpu[i].parked, 0, 0)) {
-                parked_now++;
-            }
-        }
-        matched = (ULONG)InterlockedCompareExchange(
-            (volatile LONG *)&g_pause_matched, 0, 0);
-        seen = parked_now;
-
-        if (matched > 0 && seen >= matched) break;
-        /* No match at all after one pass means no matching CPU was
-         * running the target. Still safe to proceed; the walk is on
-         * the originator CPU which is itself a matching CPU in the
-         * common case (operator thread calls VMMCALL or IOCTL from
-         * inside its own address space). */
-        if (matched == 0) {
-            /* Give every CPU a chance to be scheduled at least once. */
-            LARGE_INTEGER delay;
-            delay.QuadPart = -10000LL; /* 1 ms */
-            KeDelayExecutionThread(KernelMode, FALSE, &delay);
-        }
+        LONG completion = InterlockedCompareExchange(
+            (volatile LONG *)&g_pause_completion, 0, 0);
+        if ((ULONG)completion >= g_pause_cpu_count) break;
 
         t.QuadPart = (ULONGLONG)KeQueryInterruptTime();
         if (t.QuadPart - t0.QuadPart >= PAUSE_WINDOW_100NS) {
-            CHAMBER_LOG_WARN("pause window elapsed; releasing\n");
+            CHAMBER_LOG_WARN("pause broadcast window elapsed, "
+                             "completion=%u/%u\n",
+                             (ULONG)completion, g_pause_cpu_count);
             break;
+        }
+
+        /* Yield briefly so queued DPCs on this CPU get a chance to
+         * fire. KeDelayExecutionThread at PASSIVE_LEVEL is safe here. */
+        {
+            LARGE_INTEGER delay;
+            delay.QuadPart = -5000LL; /* 0.5 ms */
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
         }
     }
 
+    matched = (ULONG)InterlockedCompareExchange(
+        (volatile LONG *)&g_pause_matched, 0, 0);
     return matched;
 }
 
