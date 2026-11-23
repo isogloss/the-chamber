@@ -50,14 +50,16 @@ public sealed class AuthenticodeSigner
     public string PfxPath => Path.Combine(CertDirectory, "the_chamber.pfx");
 
     /// <summary>
-    /// Load the cached cert, or generate and cache one if the file is
-    /// absent. Also recovers if the PFX is present but corrupted by
-    /// regenerating. Returns the live cert.
+    /// Load the cached cert, or materialize one from a build-time
+    /// embedded resource, or generate a fresh one, in that order. Also
+    /// recovers if a cached PFX is present but corrupted by falling
+    /// through. Returns the live cert.
     /// </summary>
     public X509Certificate2 LoadOrCreateCert()
     {
         Directory.CreateDirectory(CertDirectory);
 
+        // 1. Cached cert from an earlier run on this box.
         if (File.Exists(PfxPath))
         {
             try
@@ -75,13 +77,48 @@ public sealed class AuthenticodeSigner
             }
             catch (CryptographicException)
             {
-                // Fall through to regenerate.
+                // Fall through to resource / regenerate.
             }
         }
 
-        // Fresh self-signed cert. 2048-bit RSA / SHA-256 / 5-year validity.
-        // CertificateRequest ultimately calls the same Crypto Next Gen API
-        // that CertCreateSelfSignCertificate sits on top of.
+        // 2. Embedded PFX resource: the release pipeline signs the
+        //    embedded .sys / .dll blobs with recovery\the_chamber_sign.pfx
+        //    and embeds the matching cer public portion in the launcher
+        //    so a run-time re-sign uses the same chain. If the private
+        //    PFX itself was ever embedded (the project currently embeds
+        //    only the .cer), it lives at logical name
+        //    TheChamber.Certs.the_chamber.pfx -- cache it and return.
+        var asm = Assembly.GetExecutingAssembly();
+        using (var s = asm.GetManifestResourceStream("TheChamber.Certs.the_chamber.pfx"))
+        {
+            if (s is not null)
+            {
+                using var ms = new MemoryStream();
+                s.CopyTo(ms);
+                var pfxBytes = ms.ToArray();
+                try
+                {
+                    var cert = new X509Certificate2(
+                        pfxBytes,
+                        PfxPassword,
+                        X509KeyStorageFlags.MachineKeySet |
+                        X509KeyStorageFlags.PersistKeySet |
+                        X509KeyStorageFlags.Exportable);
+                    // Cache so later runs skip the resource path.
+                    File.WriteAllBytes(PfxPath, pfxBytes);
+                    return cert;
+                }
+                catch (CryptographicException)
+                {
+                    // Embedded resource malformed; fall through.
+                }
+            }
+        }
+
+        // 3. Fresh self-signed cert. 2048-bit RSA / SHA-256 / 5-year
+        //    validity. CertificateRequest ultimately calls the same
+        //    Crypto Next Gen API that CertCreateSelfSignCertificate
+        //    sits on top of.
         using var rsa = RSA.Create(2048);
         var req = new CertificateRequest(
             $"CN={CertSubjectCommonName}",
