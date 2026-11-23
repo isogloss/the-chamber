@@ -53,8 +53,14 @@ void     npt_free_tables(void);
  * 2 MB PDE granularity: the input range is rounded outward. The side
  * table has capacity for 256 live 2 MB regions (512 MB total). After
  * the PDE writes the caller must broadcast a TLB flush across every
- * CPU's VMCB (conceptually by OR-ing (1u << 31) into
- * vmcb->ctl.guest_asid_tlb on each per-CPU VMCB). */
+ * CPU's VMCB via npt_tlb_flush(vmcb), which writes
+ * TLB_CONTROL_FLUSH_GUEST to the dedicated tlb_control byte at VMCB
+ * offset 0x05C and clears the matching clean-bit group. The prior
+ * guidance to OR (1u << 31) into a combined guest_asid_tlb field was
+ * wrong (it would silently raise the ASID itself to 0x80000001 on
+ * Zen 4 and trigger zero flushes); that field no longer exists -- the
+ * VMCB struct now exposes guest_asid at 0x058 and tlb_control at
+ * 0x05C as separate fields. */
 NTSTATUS npt_hide_range(ULONGLONG start_pa, SIZE_T size);
 NTSTATUS npt_unhide_range(ULONGLONG start_pa, SIZE_T size);
 
