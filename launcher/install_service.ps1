@@ -179,10 +179,15 @@ $signSucceeded = $true
     # If we leave the copy+patch+sign sequence without signSucceeded=true,
     # the dropped .sys is an unsigned (or signature-stripped) kernel driver
     # sitting in System32\drivers; remove it so repeated failed installs
-    # don't accumulate.
+    # don't accumulate. A locked file (another handle still open) is a
+    # loud failure, not a silent one -- the operator needs to clean it up.
     if (-not $signSucceeded -and (Test-Path -LiteralPath $dstSys)) {
-        Remove-Item -LiteralPath $dstSys -Force -ErrorAction SilentlyContinue
-        Write-Host "Removed un-signed intermediate driver: $dstSys" -ForegroundColor DarkYellow
+        try {
+            Remove-Item -LiteralPath $dstSys -Force -ErrorAction Stop
+            Write-Host "Removed un-signed intermediate driver: $dstSys" -ForegroundColor DarkYellow
+        } catch {
+            Write-Warning ("Could not remove intermediate driver {0}: {1}. Manual cleanup required." -f $dstSys, $_.Exception.Message)
+        }
     }
 }
 
@@ -241,9 +246,34 @@ if ($adjust -ne 0 -and $adjust -ne 0x40000016) {   # STATUS_PRIVILEGE_NOT_HELD i
     Write-Host ("RtlAdjustPrivilege returned 0x{0:X8}" -f $adjust) -ForegroundColor Yellow
 }
 
-$nt = [Nt]::Load("\Registry\Machine\SYSTEM\CurrentControlSet\Services\$randName")
-if ($nt -ne 0) {
-    Write-Host ("NtLoadDriver failed 0x{0:X8}" -f $nt) -ForegroundColor Red
+$loadSucceeded = $false
+try {
+    $nt = [Nt]::Load("\Registry\Machine\SYSTEM\CurrentControlSet\Services\$randName")
+    if ($nt -ne 0) {
+        Write-Host ("NtLoadDriver failed 0x{0:X8}" -f $nt) -ForegroundColor Red
+    } else {
+        $loadSucceeded = $true
+    }
+} catch {
+    Write-Host ("NtLoadDriver threw: " + $_.Exception.Message) -ForegroundColor Red
+    $nt = -1
+}
+if (-not $loadSucceeded) {
+    # Roll back the on-disk + registry footprint we just created so a
+    # failed load doesn't leave an orphan .sys + HKLM\...\Services\<name>
+    # pair for the next install / UNINSTALL to trip over.
+    if (Test-Path -LiteralPath $dstSys) {
+        try {
+            Remove-Item -LiteralPath $dstSys -Force -ErrorAction Stop
+        } catch {
+            Write-Warning ("NtLoadDriver rollback: could not remove {0}: {1}" -f $dstSys, $_.Exception.Message)
+        }
+    }
+    try {
+        Remove-Item -Path $svcKey -Recurse -Force -ErrorAction Stop
+    } catch {
+        Write-Warning ("NtLoadDriver rollback: could not remove {0}: {1}" -f $svcKey, $_.Exception.Message)
+    }
     exit $nt
 }
 
