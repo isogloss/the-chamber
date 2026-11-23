@@ -176,9 +176,12 @@ static void scramble_section_names(PVOID image_base) {
     n = nt->FileHeader.NumberOfSections;
     sec = IMAGE_FIRST_SECTION(nt);
     for (i = 0; i < n; i++) {
-        RtlZeroMemory(sec[i].Name, IMAGE_SIZEOF_SHORT_NAME);
         for (j = 0; j < IMAGE_SIZEOF_SHORT_NAME; j++) {
-            sec[i].Name[j] = (UCHAR)('A' + (RtlRandomEx(&seed) % 26));
+            /* 52 values per byte (A-Z + a-z); keyspace 52^8 ~= 5.3e13 per name,
+             * better than 26^8 ~= 2.1e11. The prior RtlZeroMemory was dead:
+             * this loop overwrites every byte unconditionally. */
+            ULONG v = RtlRandomEx(&seed) % 52U;
+            sec[i].Name[j] = (UCHAR)((v < 26U) ? ('A' + v) : ('a' + (v - 26U)));
         }
     }
 }

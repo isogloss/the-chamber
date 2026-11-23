@@ -192,12 +192,49 @@ NTSTATUS integrity_init(PDRIVER_OBJECT drv)
 
     if (!drv) return STATUS_INVALID_PARAMETER;
 
-    /* Capture HV image range. We hash only the first half (approximation
-     * of .text + .rdata) to avoid spurious mismatches from mutable
-     * .data / .bss. See file-top comment. */
-    g_hv_image_start = (PUCHAR)drv->DriverStart;
-    g_hv_image_size  = drv->DriverSize / 2;
-    if (g_hv_image_size == 0) return STATUS_INVALID_PARAMETER;
+    /* Capture the .text bounds from the live PE section headers. §5.2
+     * scrambles section NAMES post-init but leaves their positions /
+     * sizes intact, and integrity_init runs BEFORE stealth_apply so
+     * even the names are still intact here. Hashing exactly .text
+     * avoids the spurious mismatches that a positional heuristic
+     * (first-half-of-image) would produce once a mutable .data global
+     * crosses the midpoint on a given build. */
+    {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)drv->DriverStart;
+        PIMAGE_NT_HEADERS nt;
+        PIMAGE_SECTION_HEADER sec;
+        USHORT i;
+
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        nt = (PIMAGE_NT_HEADERS)((PUCHAR)drv->DriverStart + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        sec = IMAGE_FIRST_SECTION(nt);
+        g_hv_image_start = NULL;
+        g_hv_image_size = 0;
+        for (i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+            /* IMAGE_SCN_CNT_CODE (0x00000020) | MEM_EXECUTE (0x20000000):
+             * the executable code sections. On a typical MSVC WDK build
+             * this is just .text, but some builds split into .text+INIT. */
+            if ((sec[i].Characteristics &
+                 (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE))
+                == (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE))
+            {
+                PUCHAR s = (PUCHAR)drv->DriverStart + sec[i].VirtualAddress;
+                SIZE_T sz = sec[i].Misc.VirtualSize;
+                if (!g_hv_image_start || s < g_hv_image_start) {
+                    g_hv_image_start = s;
+                }
+                if ((SIZE_T)(s + sz - g_hv_image_start) > g_hv_image_size) {
+                    g_hv_image_size = (SIZE_T)(s + sz - g_hv_image_start);
+                }
+            }
+        }
+        if (g_hv_image_size == 0) return STATUS_INVALID_IMAGE_FORMAT;
+    }
 
     /* Allocate the shared status page from nonpaged pool. It will be
      * reachable from guest context via its kernel VA (same mapping;

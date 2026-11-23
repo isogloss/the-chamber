@@ -565,14 +565,22 @@ static void handle_npf(PER_CPU_CTX *ctx, VMCB *vmcb)
     if (npt_is_hidden(fault_page)) {
         /* AMD Table 15-5: event_inject, vector 14 (#PF), type 3
          * (exception), ec-valid bit 11 set, valid bit 31 set. The
-         * error code (bits 32-63) matches an ordinary user-write PF
-         * (P=0, W/R per fault_info, U/S=1, RSVD=0). CR2 would normally
-         * hold the faulting GVA; we can't synthesize a GVA here (the
-         * VMEXIT reports a GPA) so leave CR2 alone -- some probers
-         * inspect it and see stale data, which is fine for passive
-         * defense. */
-        vmcb->ctl.event_inject = (1ULL << 31) | (1ULL << 11) |
-                                 (3ULL << 8) | 14ULL;
+         * NPF exit_info_1 carries the fault attributes in bits:
+         *   bit 0  P    (1 if present, 0 if not; hidden => 0)
+         *   bit 1  W/R  (1 on write, 0 on read)
+         *   bit 2  U/S  (1 on user, 0 on supervisor)
+         * Forward those into the injected #PF error code (bits [32:35])
+         * so an introspector that inspects the EC sees a fault
+         * consistent with its probing access rather than a fixed
+         * pattern. P stays 0 by construction (page is not present).
+         * CR2 is left stale -- the VMEXIT reports GPA, not GVA. */
+        {
+            ULONGLONG ec = ((fault_info >> 1) & 1ULL) << 1 |   /* W/R */
+                           ((fault_info >> 2) & 1ULL) << 2;    /* U/S */
+            vmcb->ctl.event_inject = (ec << 32) |
+                                     (1ULL << 31) | (1ULL << 11) |
+                                     (3ULL << 8) | 14ULL;
+        }
         return;
     }
 

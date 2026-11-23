@@ -205,6 +205,13 @@ static void watchdog_unload_worker(PDEVICE_OBJECT DevObj, PVOID Ctx)
 
     CHAMBER_LOG_WARN("watchdog auto-unload: clearing EFER.SVME on all CPUs\n");
 
+    /* Stop the integrity DPC BEFORE clearing EFER.SVME. Otherwise the
+     * next 5-second fire of integrity_dpc_routine would issue a VMMCALL
+     * on a CPU with SVME=0, raising #UD inside the DPC (IRQL at
+     * DISPATCH_LEVEL) which is a terminal bugcheck. Mirror the
+     * UnloadRoutine ordering (integrity first, then SVM). */
+    integrity_shutdown();
+
     /* Full SVM teardown. svm_shutdown_all_cpus sets per-CPU
      * shutdown_requested, broadcasts the offline IPI (which clears
      * EFER.SVME), frees per-CPU structures, and nulls g_cpu_ctx. */
@@ -646,6 +653,21 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
      * stealth_apply, but doing this first keeps the hide pass agnostic
      * to stealth internals. */
     (void)npt_hide_hv_image(Driver->DriverStart, Driver->DriverSize);
+
+    /* Phase 7.1 TLB flush: broadcast the ASID-flush request to every
+     * per-CPU VMCB so stale (GVA, HPA) translations from before the
+     * hide do not keep serving HV bytes to the guest. Each CPU picks
+     * it up on its next VMRUN. This write races a running guest but
+     * the mutated field is a one-byte control (TLB_CONTROL at 0x05C),
+     * single-byte writes are atomic on x86_64, and worst case a CPU
+     * flushes twice across adjacent VMEXITs. */
+    {
+        ULONG i;
+        for (i = 0; i < g_cpu_count; i++) {
+            VMCB *v = (VMCB *)g_cpu_ctx[i].vmcb_va;
+            if (v) npt_tlb_flush(v);
+        }
+    }
 
     /* Phase 7.2: arm the integrity self-check DPC. Non-fatal on
      * failure -- operator can disable integrity by removing this call
