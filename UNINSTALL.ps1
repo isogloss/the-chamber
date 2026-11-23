@@ -135,8 +135,12 @@ function Test-ChamberFingerprint {
 
 try {
     $svcRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+    # -match is case-insensitive by default, so mixed-case 10-letter names
+    # like DcomLaunch would pass the first filter. Force case-sensitive
+    # matching so only the lowercase-alnum random names we actually mint
+    # survive the enumeration.
     $candidates = Get-ChildItem -Path $svcRoot -ErrorAction SilentlyContinue |
-        Where-Object { $_.PSChildName -match '^[a-z][a-z0-9]{9}$' }
+        Where-Object { $_.PSChildName -cmatch '^[a-z][a-z0-9]{9}$' }
     foreach ($svc in $candidates) {
         $name = $svc.PSChildName
         if ($seen.ContainsKey($name)) { continue }
