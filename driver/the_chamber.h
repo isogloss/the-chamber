@@ -104,4 +104,13 @@ void     vmexit_cleanup(void);
 /* Global driver state */
 extern CHAMBER_GLOBALS g_chamber;
 
+/* Phase 1.5: single, process-lifetime spin lock guarding every
+ * PsLoadedModuleList edit made by stealth.c. Initialized ONCE in
+ * DriverEntry before stealth_apply() is called; stealth.c acquires and
+ * releases without re-init. The old in-function
+ * `static KSPIN_LOCK dummy; KeInitializeSpinLock(&dummy)` pattern reset the
+ * lock on every entry, so a concurrent walker could observe the
+ * mid-operation state. */
+extern KSPIN_LOCK g_stealth_lock;
+
 #endif /* THE_CHAMBER_H */

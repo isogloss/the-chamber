@@ -18,6 +18,10 @@
 
 CHAMBER_GLOBALS g_chamber;
 
+/* Phase 1.5: process-lifetime spin lock for PsLoadedModuleList edits.
+ * Initialized once in DriverEntry; declared extern in the_chamber.h. */
+KSPIN_LOCK g_stealth_lock;
+
 /* --- Forward decls --- */
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD     UnloadRoutine;
@@ -303,6 +307,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
     RtlZeroMemory(&g_chamber, sizeof(g_chamber));
     g_chamber.driver_object = Driver;
     KeInitializeSpinLock(&g_chamber.state_lock);
+    /* Phase 1.5: initialize the stealth lock ONCE here. stealth.c now
+     * acquires it without reinitializing. */
+    KeInitializeSpinLock(&g_stealth_lock);
     KeQuerySystemTimePrecise(&g_chamber.last_kick_time);
 
     /* Crash-marker safety: refuse to load if the previous session left one */
