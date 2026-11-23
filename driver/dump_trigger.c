@@ -62,6 +62,7 @@ typedef struct _TRIGGER_STATE {
     ULONGLONG     target_pid;
     ULONGLONG     target_cr3;       /* captured at arm time */
     PEPROCESS     target_eprocess;  /* referenced; released on disarm */
+    PEPROCESS     operator_eprocess;/* who owns output_va; referenced */
 
     /* Operator output sink. The kernel keeps the VA and probes it
      * only inside the dump path. */
@@ -208,7 +209,7 @@ static TRIGGER_STATE *trigger_alloc_slot_locked(void)
     return NULL;
 }
 
-/* Restore every GPA this trigger hid and release its EPROCESS ref. */
+/* Restore every GPA this trigger hid and release its EPROCESS refs. */
 static void trigger_reset_slot_locked(TRIGGER_STATE *t)
 {
     ULONG i;
@@ -225,6 +226,10 @@ static void trigger_reset_slot_locked(TRIGGER_STATE *t)
     if (t->target_eprocess) {
         ObDereferenceObject(t->target_eprocess);
         t->target_eprocess = NULL;
+    }
+    if (t->operator_eprocess) {
+        ObDereferenceObject(t->operator_eprocess);
+        t->operator_eprocess = NULL;
     }
 
     RtlZeroMemory(t, sizeof(*t));
@@ -373,6 +378,7 @@ static NTSTATUS trigger_arm_common(ULONG kind,
                                     BOOLEAN   rearm)
 {
     PEPROCESS target = NULL;
+    PEPROCESS oper = NULL;
     NTSTATUS  st;
     TRIGGER_STATE *t;
     KIRQL irql;
@@ -388,6 +394,14 @@ static NTSTATUS trigger_arm_common(ULONG kind,
     st = PsLookupProcessByProcessId(
         (HANDLE)(ULONG_PTR)target_pid, &target);
     if (!NT_SUCCESS(st) || !target) return STATUS_INVALID_CID;
+
+    /* Capture the operator process. Arm IOCTLs always come in through
+     * the IRP dispatcher at IRP_MJ_DEVICE_CONTROL which runs in the
+     * calling thread's context, so PsGetCurrentProcess is the
+     * operator. A reference holds the EPROCESS alive until disarm so
+     * a delayed trigger fire can still attach for the write. */
+    oper = PsGetCurrentProcess();
+    if (oper) ObReferenceObject(oper);
 
     KeStackAttachProcess(target, &apc);
     target_cr3 = __readcr3() & ~0xFFFULL;
@@ -405,19 +419,21 @@ static NTSTATUS trigger_arm_common(ULONG kind,
 
     if (!t) {
         ObDereferenceObject(target);
+        if (oper) ObDereferenceObject(oper);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    t->kind            = kind;
-    t->target_pid      = target_pid;
-    t->target_cr3      = target_cr3;
-    t->target_eprocess = target;    /* ownership transferred */
-    t->output_va       = (ULONGLONG)(ULONG_PTR)out_va;
-    t->output_size     = out_size;
-    t->oep_gva         = oep_gva;
-    t->threshold_bytes = threshold;
-    t->write_counter   = 0;
-    t->rearm           = rearm;
+    t->kind              = kind;
+    t->target_pid        = target_pid;
+    t->target_cr3        = target_cr3;
+    t->target_eprocess   = target;  /* ownership transferred */
+    t->operator_eprocess = oper;    /* ownership transferred */
+    t->output_va         = (ULONGLONG)(ULONG_PTR)out_va;
+    t->output_size       = out_size;
+    t->oep_gva           = oep_gva;
+    t->threshold_bytes   = threshold;
+    t->write_counter     = 0;
+    t->rearm             = rearm;
 
     st = trigger_collect_gpas(t, target, writable_only, only_gva);
     if (!NT_SUCCESS(st)) {
@@ -578,16 +594,25 @@ static VOID trigger_fire_worker(PVOID Context)
                         &t->fire_disarm_after, 0, 0);
     rearm_after  = (BOOLEAN)InterlockedCompareExchange(
                         &t->fire_rearm_after, 0, 0);
-    KeReleaseSpinLock(&g_trigger_lock, irql);
 
-    bytes = dump_run_targeted(target_pid,
-                               (PVOID)(ULONG_PTR)output_va,
-                               output_size,
-                               kind_at_fire,
-                               fault_gpa,
-                               &cr3,
-                               &parked);
-    (void)bytes;
+    /* Operator EPROCESS is held referenced across the slot's lifetime;
+     * the worker reads it under the lock so a concurrent disarm
+     * cannot dereference it mid-write. */
+    {
+        PEPROCESS oper = t->operator_eprocess;
+        KeReleaseSpinLock(&g_trigger_lock, irql);
+
+        bytes = dump_run_targeted_ex(target_pid,
+                                      oper,
+                                      (PVOID)(ULONG_PTR)output_va,
+                                      output_size,
+                                      kind_at_fire,
+                                      fault_gpa,
+                                      TRUE,     /* output_is_user */
+                                      &cr3,
+                                      &parked);
+        (void)bytes;
+    }
 
     /* Post-fire bookkeeping. */
     KeAcquireSpinLock(&g_trigger_lock, &irql);

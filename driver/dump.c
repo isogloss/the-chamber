@@ -291,7 +291,34 @@ void dump_pause_shutdown(void)
 
 /* --- VAD walk + copy ---------------------------------------------- */
 
+/* Operator-side write helper. If operator_proc is non-NULL the call
+ * site attaches to it before writing, so a dump fired from a system
+ * worker thread (trigger path) still lands in the operator's user
+ * VA. operator_proc == NULL means "we are already in the operator's
+ * AS" (the VMMCALL and MANUAL / PAYLOAD IOCTL paths). The __try
+ * wrapper catches user-VA faults in either case.
+ */
+static BOOLEAN dump_write_bytes(PEPROCESS operator_proc,
+                                 PUCHAR    out_buf,
+                                 ULONGLONG write_off,
+                                 PVOID     src,
+                                 SIZE_T    bytes)
+{
+    KAPC_STATE apc;
+    BOOLEAN    ok = TRUE;
+
+    if (operator_proc) KeStackAttachProcess(operator_proc, &apc);
+    __try {
+        RtlCopyMemory(out_buf + write_off, src, bytes);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = FALSE;
+    }
+    if (operator_proc) KeUnstackDetachProcess(&apc);
+    return ok;
+}
+
 static ULONGLONG dump_one_region(PEPROCESS target_proc,
+                                 PEPROCESS operator_proc,
                                  ULONGLONG region_base,
                                  ULONGLONG region_size,
                                  ULONG     region_prot,
@@ -311,17 +338,18 @@ static ULONGLONG dump_one_region(PEPROCESS target_proc,
     }
 
     write_off = out_cursor;
-    __try {
-        *(ULONGLONG *)(out_buf + write_off) = region_base;
-        write_off += sizeof(ULONGLONG);
-        *(ULONGLONG *)(out_buf + write_off) = region_size;
-        write_off += sizeof(ULONGLONG);
-        *(ULONG *)(out_buf + write_off) = region_prot;
-        write_off += sizeof(ULONG);
-        *(ULONG *)(out_buf + write_off) = 0;
-        write_off += sizeof(ULONG);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return 0;
+    {
+        UCHAR hdr[sizeof(ULONGLONG) * 2 + sizeof(ULONG) * 2];
+        ULONG off = 0;
+        *(ULONGLONG *)&hdr[off] = region_base;  off += sizeof(ULONGLONG);
+        *(ULONGLONG *)&hdr[off] = region_size;  off += sizeof(ULONGLONG);
+        *(ULONG     *)&hdr[off] = region_prot;  off += sizeof(ULONG);
+        *(ULONG     *)&hdr[off] = 0;            off += sizeof(ULONG);
+        if (!dump_write_bytes(operator_proc, out_buf, write_off,
+                              hdr, sizeof(hdr))) {
+            return 0;
+        }
+        write_off += sizeof(hdr);
     }
 
     {
@@ -349,9 +377,8 @@ static ULONGLONG dump_one_region(PEPROCESS target_proc,
             }
             KeUnstackDetachProcess(&apc);
 
-            __try {
-                RtlCopyMemory(out_buf + write_off, scratch, (SIZE_T)chunk);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (!dump_write_bytes(operator_proc, out_buf, write_off,
+                                  scratch, (SIZE_T)chunk)) {
                 ExFreePoolWithTag(scratch, POOLTAG("dump_scratch"));
                 return 0;
             }
@@ -367,6 +394,7 @@ static ULONGLONG dump_one_region(PEPROCESS target_proc,
 }
 
 static ULONGLONG dump_walk_target(PEPROCESS target_proc,
+                                  PEPROCESS operator_proc,
                                   PUCHAR    out_buf,
                                   ULONGLONG out_capacity)
 {
@@ -404,6 +432,7 @@ static ULONGLONG dump_walk_target(PEPROCESS target_proc,
 
         if (mbi.State == 0x1000 /* MEM_COMMIT */) {
             ULONGLONG wrote = dump_one_region(target_proc,
+                                              operator_proc,
                                               (ULONGLONG)(ULONG_PTR)mbi.BaseAddress,
                                               (ULONGLONG)mbi.RegionSize,
                                               mbi.Protect,
@@ -499,11 +528,21 @@ static ULONG pause_broadcast_and_wait(void)
 /* Common harness used by both the VMMCALL and the IOCTL entry points.
  * The caller supplies an EPROCESS pointer and the operator-VA output
  * buffer; we handle the probe, pause, walk, release, and history
- * record. ObReference/Dereference is the caller's responsibility
+ * record.
+ *
+ * operator_proc is the process that owns out_buf's address space.
+ * NULL means "current AS is already the operator's" -- the VMMCALL
+ * path and the direct-IOCTL manual/payload paths (where out_buf is
+ * a kernel-side METHOD_BUFFERED copy). Non-NULL means attach to it
+ * before every write -- the trigger-fire path, which runs in a
+ * system worker thread.
+ *
+ * ObReference/Dereference on target is the caller's responsibility
  * because the lookup path differs between VMMCALL (operator PID in
  * GPR) and IOCTL (operator PID in buffered input). */
 static ULONGLONG snapshot_locked(PEPROCESS target,
                                   ULONGLONG target_pid,
+                                  PEPROCESS operator_proc,
                                   PUCHAR    out_buf,
                                   ULONGLONG out_cap,
                                   ULONG     trigger_kind,
@@ -533,14 +572,32 @@ static ULONGLONG snapshot_locked(PEPROCESS target,
 
     matched = pause_broadcast_and_wait();
 
-    __try {
-        if (probe_user_buf) {
+    if (probe_user_buf) {
+        /* Run the probe in operator AS. The attach/detach stays
+         * paired across an exception thanks to an inner __try. */
+        KAPC_STATE apc;
+        BOOLEAN    probed_ok = TRUE;
+        if (operator_proc) KeStackAttachProcess(operator_proc, &apc);
+        __try {
             ProbeForWrite(out_buf, (SIZE_T)out_cap, sizeof(UCHAR));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            probed_ok = FALSE;
         }
-        bytes = dump_walk_target(target, out_buf, out_cap);
+        if (operator_proc) KeUnstackDetachProcess(&apc);
+        if (!probed_ok) {
+            /* Fall through to history record via bytes = 0. The
+             * pause window is still open; the shared release below
+             * clears it. */
+            goto record_history;
+        }
+    }
+    __try {
+        bytes = dump_walk_target(target, operator_proc, out_buf, out_cap);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         bytes = 0;
     }
+
+record_history:
 
     InterlockedExchange(&g_pause_active, 0);
 
@@ -578,8 +635,11 @@ ULONGLONG dump_snapshot_pause_target(PCHAMBER_DUMP_REQ req)
         (HANDLE)(ULONG_PTR)req->target_pid, &target);
     if (!NT_SUCCESS(st) || !target) return 0;
 
+    /* VMMCALL path: handler runs on the operator thread's host
+     * context, so current AS is the operator's. operator_proc=NULL. */
     bytes = snapshot_locked(target,
                              req->target_pid,
+                             NULL,
                              (PUCHAR)(ULONG_PTR)req->output_buffer_va,
                              req->output_buffer_size,
                              CHAMBER_TRIGGER_MANUAL,
@@ -600,6 +660,32 @@ ULONGLONG dump_run_targeted(ULONGLONG target_pid,
                              ULONGLONG *target_cr3_out,
                              ULONG     *parked_cpus_out)
 {
+    return dump_run_targeted_ex(target_pid,
+                                 NULL,
+                                 output_buffer,
+                                 output_capacity,
+                                 trigger_kind,
+                                 trigger_gpa,
+                                 FALSE,
+                                 target_cr3_out,
+                                 parked_cpus_out);
+}
+
+/* Trigger-fire variant: the caller supplies the operator EPROCESS
+ * because the worker thread is in a different AS than the operator's.
+ * The common case (direct IOCTL manual/payload) passes
+ * operator_proc=NULL and output_is_user=FALSE, which lets the write
+ * path treat out_buf as a METHOD_BUFFERED kernel copy. */
+ULONGLONG dump_run_targeted_ex(ULONGLONG target_pid,
+                                PEPROCESS operator_proc,
+                                PVOID     output_buffer,
+                                ULONGLONG output_capacity,
+                                ULONG     trigger_kind,
+                                ULONGLONG trigger_gpa,
+                                BOOLEAN   output_is_user,
+                                ULONGLONG *target_cr3_out,
+                                ULONG     *parked_cpus_out)
+{
     PEPROCESS target = NULL;
     NTSTATUS  st;
     ULONGLONG bytes;
@@ -612,16 +698,14 @@ ULONGLONG dump_run_targeted(ULONGLONG target_pid,
         (HANDLE)(ULONG_PTR)target_pid, &target);
     if (!NT_SUCCESS(st) || !target) return 0;
 
-    /* IOCTL path: SystemBuffer is a kernel copy for METHOD_BUFFERED, so
-     * ProbeForWrite is not required. Callers that reach here from a
-     * user-VA path set the probe themselves before marshalling. */
     bytes = snapshot_locked(target,
                              target_pid,
+                             operator_proc,
                              (PUCHAR)output_buffer,
                              output_capacity,
                              trigger_kind,
                              trigger_gpa,
-                             FALSE,
+                             output_is_user,
                              target_cr3_out,
                              parked_cpus_out);
 

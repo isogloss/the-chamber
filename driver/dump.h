@@ -92,12 +92,10 @@ typedef struct _CHAMBER_DUMP_REQ {
  * (0 on error). Host context, PASSIVE_LEVEL caller. */
 ULONGLONG dump_snapshot_pause_target(PCHAMBER_DUMP_REQ req);
 
-/* IOCTL entry point. Called from IrpDeviceControl on the operator's
- * thread. target_cr3_out (optional) receives the resolved CR3 so the
- * dump history record can carry it. trigger_kind is forwarded to the
- * history ring. trigger_gpa is the GPA that caused the trigger (0 for
- * manual / payload). parked_cpus_out receives the count of CPUs that
- * observed a CR3 match and parked. */
+/* IOCTL entry point for a direct dump. The output buffer is a kernel
+ * copy (METHOD_BUFFERED) so no probe is performed and the current AS
+ * is irrelevant to the write path. trigger_kind is forwarded to the
+ * history ring. target_cr3_out and parked_cpus_out are optional. */
 ULONGLONG dump_run_targeted(ULONGLONG target_pid,
                              PVOID     output_buffer,
                              ULONGLONG output_capacity,
@@ -105,6 +103,22 @@ ULONGLONG dump_run_targeted(ULONGLONG target_pid,
                              ULONGLONG trigger_gpa,
                              ULONGLONG *target_cr3_out,
                              ULONG     *parked_cpus_out);
+
+/* Trigger-fire variant. operator_proc is the process that owns
+ * output_buffer's VA. If output_is_user is TRUE, output_buffer is a
+ * user VA in operator_proc's AS and every write attaches briefly to
+ * operator_proc. If FALSE, output_buffer is a kernel VA valid from
+ * any AS and operator_proc is ignored.
+ */
+ULONGLONG dump_run_targeted_ex(ULONGLONG target_pid,
+                                PEPROCESS operator_proc,
+                                PVOID     output_buffer,
+                                ULONGLONG output_capacity,
+                                ULONG     trigger_kind,
+                                ULONGLONG trigger_gpa,
+                                BOOLEAN   output_is_user,
+                                ULONGLONG *target_cr3_out,
+                                ULONG     *parked_cpus_out);
 
 /* Pause primitive lifecycle. dump_pause_init allocates the per-CPU
  * DPC array; dump_pause_shutdown releases it. Called from DriverEntry
