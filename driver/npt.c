@@ -22,10 +22,14 @@ ULONGLONG g_npt_cr3_pa = 0;
 /*                                                                    */
 /* Every contiguous page we allocate (PML4, PDPTs, PDs) is recorded   */
 /* in g_npt_pages so npt_free_tables() can hand each one back to      */
-/* MmFreeContiguousMemory().                                          */
+/* MmFreeContiguousMemory().  Architectural ceiling for 32 PDPT slots */
+/* is 1 + 32 + 32*512 = 16417 pages; round up to 16448 so sustained   */
+/* sparse NPFs cannot push an allocation past the tracker.            */
 /* ------------------------------------------------------------------ */
 
-static PVOID  g_npt_pages[8192];
+#define NPT_MAX_TRACKED_PAGES 16448
+
+static PVOID  g_npt_pages[NPT_MAX_TRACKED_PAGES];
 static ULONG  g_npt_page_count = 0;
 
 static PVOID  g_npt_pml4_va = NULL;
@@ -55,6 +59,13 @@ static PVOID npt_alloc_page(void)
     PHYSICAL_ADDRESS boundary;
     PVOID va;
 
+    /* Refuse the allocation if the tracker is full.  Previously we
+     * returned a usable VA the caller held without recording it, so
+     * teardown leaked it. */
+    if (g_npt_page_count >= RTL_NUMBER_OF(g_npt_pages)) {
+        return NULL;
+    }
+
     lowest.QuadPart = 0;
     highest.QuadPart = (LONGLONG)0xFFFFFFFFFFFFFFFFULL;
     boundary.QuadPart = 0;
@@ -70,10 +81,7 @@ static PVOID npt_alloc_page(void)
 
     RtlZeroMemory(va, PAGE_SIZE);
 
-    if (g_npt_page_count < RTL_NUMBER_OF(g_npt_pages)) {
-        g_npt_pages[g_npt_page_count++] = va;
-    }
-
+    g_npt_pages[g_npt_page_count++] = va;
     return va;
 }
 
@@ -149,6 +157,39 @@ static ULONGLONG *npt_ensure_pd(NPT_PDPT_SLOT *slot, ULONG pdpt_index)
 /* Public API.                                                        */
 /* ------------------------------------------------------------------ */
 
+/* NPT_UC: uncached leaf attribute.  Bit 4 = PCD on a 2 MB PDE. */
+#define NPT_UC_PCD      (1ULL << 4)
+
+/* Pre-allocate every PDPT and PD that covers [0, NPT_MAX_PHYS_GB) so a
+ * later Nested Page Fault at DISPATCH_LEVEL does NOT need to call
+ * MmAllocateContiguousMemorySpecifyCache (which requires PASSIVE_LEVEL).
+ * The handler can then just write the leaf PDE under g_npt_hide_lock.
+ *
+ * 128 GB coverage = 128 PDPT entries = 1 PDPT slot (512 PDs under one
+ * PDPT = 512 GB), but we're mapping identity so PML4[0]'s PDPT covers
+ * 0..512 GB; pre-allocate 128 PDs under it. */
+static NTSTATUS npt_preallocate_tables(void)
+{
+    NPT_PDPT_SLOT *slot;
+    ULONGLONG       cap_bytes;
+    ULONG           pdpt_i;
+    ULONG           pdpt_count;
+
+    cap_bytes = (ULONGLONG)NPT_MAX_PHYS_GB * 1024ULL * 1024ULL * 1024ULL;
+    pdpt_count = (ULONG)((cap_bytes + (1ULL << 30) - 1) >> 30);
+    if (pdpt_count > 512) pdpt_count = 512;
+
+    slot = npt_ensure_pdpt(0);
+    if (slot == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+
+    for (pdpt_i = 0; pdpt_i < pdpt_count; pdpt_i++) {
+        if (npt_ensure_pd(slot, pdpt_i) == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS npt_init(void)
 {
     PPHYSICAL_MEMORY_RANGE ranges;
@@ -156,6 +197,7 @@ NTSTATUS npt_init(void)
     PHYSICAL_ADDRESS pml4_pa;
     ULONGLONG total_mapped = 0;
     ULONGLONG cap_bytes;
+    NTSTATUS  st;
     ULONG i;
 
     g_npt_page_count = 0;
@@ -171,6 +213,14 @@ NTSTATUS npt_init(void)
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     g_npt_pml4_va = pml4;
+
+    /* Pre-allocate every PDPT and PD at PASSIVE_LEVEL.  Later NPFs can
+     * only write PDE leaves while holding the spin lock. */
+    st = npt_preallocate_tables();
+    if (!NT_SUCCESS(st)) {
+        npt_free_tables();
+        return st;
+    }
 
     ranges = MmGetPhysicalMemoryRanges();
     if (ranges == NULL) {
@@ -192,6 +242,17 @@ NTSTATUS npt_init(void)
         /* Round the range outward to 2 MB boundaries. */
         start &= ~(NPT_PAGE_SIZE_2MB - 1);
         end = (end + (NPT_PAGE_SIZE_2MB - 1)) & ~(NPT_PAGE_SIZE_2MB - 1);
+
+        /* M-15: round-down previously pulled low RAM down to 0, which
+         * identity-mapped VGA 0xA0000-0xBFFFF and ROM shadow
+         * 0xC0000-0xFFFFF as cached-writable-user-exec.  Bump the floor
+         * to 0x100000 so the first MB (with its legacy MMIO holes) is
+         * not covered by the WB-cached leaf; we install explicit UC
+         * leaves for VGA and the ROM shadow below. */
+        if (start < 0x100000ULL) start = 0x100000ULL;
+        if (end <= start)       continue;
+        /* Realign up after bumping start. */
+        start &= ~(NPT_PAGE_SIZE_2MB - 1);
 
         for (f = start; f < end; f += NPT_PAGE_SIZE_2MB) {
             ULONG pml4_i = (ULONG)((f >> 39) & 0x1FF);
@@ -222,6 +283,27 @@ NTSTATUS npt_init(void)
             pd[pd_i] = (f & ~0x1FFFFFULL) | 0x87ULL;
 
             total_mapped += NPT_PAGE_SIZE_2MB;
+        }
+    }
+
+    /* Legacy MMIO holes in the first 2 MB: install a dedicated 2 MB UC
+     * leaf at frame 0 so VGA (0xA0000-0xBFFFF) and the ROM shadow
+     * (0xC0000-0xFFFFF) are reachable with the correct cache attribute
+     * instead of either being unmapped or covered by a WB leaf.
+     *
+     * Master plan 2.6 ideally splits VGA (UC+Writable) from ROM shadow
+     * (UC+ReadOnly). A 2 MB large page cannot represent that split, so
+     * this leaf maps both regions UC+Writable as a passive-dump
+     * compromise. Splitting into 4 KB leaves to differentiate attributes
+     * is a future enhancement, not a Phase 1 requirement. */
+    {
+        NPT_PDPT_SLOT *slot = npt_ensure_pdpt(0);
+        if (slot != NULL) {
+            ULONGLONG *pd = npt_ensure_pd(slot, 0);
+            if (pd != NULL) {
+                /* Frame 0 identity-mapped, PRESENT|WRITABLE|USER|PCD|PS. */
+                pd[0] = 0ULL | 0x87ULL | NPT_UC_PCD;
+            }
         }
     }
 
@@ -262,10 +344,20 @@ void npt_free_tables(void)
 /* unheld state, which is valid for KSPIN_LOCK on x64 Windows.        */
 /*                                                                    */
 /* The caller is responsible for TLB invalidation across every CPU's  */
-/* VMCB after the PDE edits (conceptually by OR-ing (1u << 31) into   */
-/* vmcb->ctl.guest_asid_tlb on each per-CPU VMCB) because that        */
-/* broadcast lives outside this translation unit.                     */
+/* VMCB after the PDE edits: write TLB_CONTROL_FLUSH_GUEST (0x03) to  */
+/* vmcb->ctl.tlb_control on each per-CPU VMCB (see npt_tlb_flush).    */
+/* The guest_asid_tlb field is the 32-bit ASID; ORing bit 31 into it  */
+/* silently raises the ASID instead of flushing.                       */
 /* ------------------------------------------------------------------ */
+
+/* Write TLB_CONTROL_FLUSH_GUEST into the low byte of tlb_control so
+ * hardware flushes the guest's TLB entries on the next VMRUN.  Caller
+ * must invoke this on every per-CPU VMCB after a PDE edit. */
+void npt_tlb_flush(VMCB *vmcb)
+{
+    if (!vmcb) return;
+    vmcb->ctl.tlb_control = TLB_CONTROL_FLUSH_GUEST;
+}
 
 typedef struct _NPT_HIDE_ENTRY {
     ULONGLONG pa;
@@ -365,10 +457,192 @@ NTSTATUS npt_hide_range(ULONGLONG start_pa, SIZE_T size)
 
     KeReleaseSpinLock(&g_npt_hide_lock, old_irql);
 
-    /* Caller must broadcast a TLB flush across every CPU's VMCB
-     * (conceptually: vmcb->ctl.guest_asid_tlb |= (1u << 31)) because
-     * that per-CPU broadcast lives outside this translation unit. */
+    /* Caller must broadcast a TLB flush across every CPU's VMCB via
+     * npt_tlb_flush(vmcb) because that per-CPU broadcast lives outside
+     * this translation unit. */
     return status;
+}
+
+/* Advisory predicate: is the 2 MB PA covering `pa_byte` currently
+ * marked hidden? Returned under no lock (see npt.h). */
+BOOLEAN npt_is_hidden(ULONGLONG pa_byte)
+{
+    ULONGLONG pa_2mb = pa_byte & ~(NPT_PAGE_SIZE_2MB - 1);
+    ULONG i;
+
+    for (i = 0; i < g_npt_hide_count; i++) {
+        if (g_npt_hide_table[i].pa == pa_2mb) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 7.1: HV-image NPT hide.                                      */
+/*                                                                    */
+/* Walk every 4 KiB page covering the driver's loaded image, resolve  */
+/* each page's host physical address via MmGetPhysicalAddress, and    */
+/* feed the 2 MB-aligned PAs through npt_hide_range so the covering   */
+/* NPT PDE loses P/W/U. Guest reads of those GPAs then take an NPF;   */
+/* with the compile-time flag CHAMBER_HV_INTROSPECTION_RESIST set,    */
+/* handle_npf refuses to remap the range (returns without advancing   */
+/* RIP and with the PDE still cleared), so the guest sees zeros or    */
+/* faults at those GPAs. Operator opts in -- flag is OFF by default.  */
+/*                                                                    */
+/* The driver image is in nonpaged pool but its VA range is           */
+/* contiguous; the PA range is discontiguous because non-paged pool   */
+/* comes from the OS's own allocator. We therefore have to query      */
+/* each page's PA individually rather than assume contiguity.         */
+/* ------------------------------------------------------------------ */
+
+NTSTATUS npt_hide_hv_image(PVOID hv_dll_base, ULONG hv_size_of_image)
+{
+#ifdef CHAMBER_HV_INTROSPECTION_RESIST
+    PUCHAR  va;
+    PUCHAR  end;
+    ULONGLONG last_2mb_pa = ~0ULL;
+    NTSTATUS st;
+    NTSTATUS first_err = STATUS_SUCCESS;
+
+    if (!hv_dll_base || hv_size_of_image == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (g_npt_pml4_va == NULL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    va  = (PUCHAR)hv_dll_base;
+    end = va + hv_size_of_image;
+
+    /* Walk one 4 KiB page at a time; dedupe hides at 2 MB granularity
+     * because the NPT leaf is 2 MB. The idempotence check inside
+     * npt_hide_range also catches repeats but the local dedupe spares
+     * the spinlock acquire/release per page. */
+    for (; va < end; va += PAGE_SIZE) {
+        PHYSICAL_ADDRESS pa = MmGetPhysicalAddress(va);
+        ULONGLONG this_2mb;
+
+        if (pa.QuadPart == 0) {
+            /* Page not currently backed. Skip; it is not in the NPT
+             * identity map either. If the OS later pages it in to
+             * another host PA, that PA won't be hidden -- limitation
+             * of static hiding. HV code is in non-paged pool so this
+             * is not a concern for our image. */
+            continue;
+        }
+
+        this_2mb = (ULONGLONG)pa.QuadPart & ~(NPT_PAGE_SIZE_2MB - 1);
+        if (this_2mb == last_2mb_pa) {
+            continue;
+        }
+        last_2mb_pa = this_2mb;
+
+        st = npt_hide_range(this_2mb, NPT_PAGE_SIZE_2MB);
+        if (!NT_SUCCESS(st) && NT_SUCCESS(first_err)) {
+            first_err = st;
+        }
+    }
+
+    /* Caller broadcasts the TLB flush. We return the first failure
+     * encountered (if any); the hide pass is best-effort and does not
+     * abort on a single-range failure. */
+    return first_err;
+#else
+    UNREFERENCED_PARAMETER(hv_dll_base);
+    UNREFERENCED_PARAMETER(hv_size_of_image);
+    /* Flag off: no-op. Return success so DriverEntry doesn't fail. */
+    return STATUS_SUCCESS;
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 1.6: handle_npf fault-recovery path.                         */
+/*                                                                    */
+/* npt_init() identity-maps every range MmGetPhysicalMemoryRanges()   */
+/* reports. A guest access to RAM outside that reported set (e.g.     */
+/* firmware-reserved region revealed by a later ACPI walk) takes a    */
+/* Nested Page Fault. handle_npf() calls npt_map_page() here to       */
+/* grow the NPT on demand at the 2 MB PDE granularity and retries the */
+/* faulting instruction by NOT advancing RIP.                         */
+/* ------------------------------------------------------------------ */
+
+NTSTATUS npt_map_page(ULONGLONG gpa, ULONGLONG hpa, ULONGLONG flags)
+{
+    ULONGLONG gpa_2mb;
+    ULONGLONG hpa_2mb;
+    ULONG     pml4_i;
+    ULONG     pdpt_i;
+    ULONG     pd_i;
+    NPT_PDPT_SLOT *slot;
+    ULONGLONG *pd;
+    KIRQL     old_irql;
+
+    if (g_npt_pml4_va == NULL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    gpa_2mb = gpa & ~(NPT_PAGE_SIZE_2MB - 1);
+    hpa_2mb = hpa & ~(NPT_PAGE_SIZE_2MB - 1);
+    pml4_i  = (ULONG)((gpa_2mb >> 39) & 0x1FF);
+    pdpt_i  = (ULONG)((gpa_2mb >> 30) & 0x1FF);
+    pd_i    = (ULONG)((gpa_2mb >> 21) & 0x1FF);
+
+    /* npt_init preallocates every PDPT and PD under PML4[0] (the first
+     * NPT_MAX_PHYS_GB of address space).  Addresses in any other PML4
+     * slot (>= 512 GB) would require an allocation at DISPATCH_LEVEL
+     * under the hide-lock, which the WDK forbids.  Passive-dump guests
+     * never see >512 GB of address space -- reject the fault instead. */
+    if (pml4_i != 0) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    /* The side table is guarded by g_npt_hide_lock to keep the PDPT /
+     * PD allocation and the final PDE write atomic against a concurrent
+     * npt_hide_range() / npt_unhide_range() on the same PDE. */
+    KeAcquireSpinLock(&g_npt_hide_lock, &old_irql);
+
+    slot = npt_ensure_pdpt(pml4_i);
+    if (slot == NULL) {
+        KeReleaseSpinLock(&g_npt_hide_lock, old_irql);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    pd = npt_ensure_pd(slot, pdpt_i);
+    if (pd == NULL) {
+        KeReleaseSpinLock(&g_npt_hide_lock, old_irql);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    /* 2 MB leaf PDE: frame | PS | caller-supplied perms. Drop any bits
+     * of `flags` above the low 12 that would collide with the PFN. */
+    pd[pd_i] = (hpa_2mb & ~0x1FFFFFULL) | NPT_LARGE_PS | (flags & 0xFFF);
+
+    KeReleaseSpinLock(&g_npt_hide_lock, old_irql);
+    return STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 1.6 NPT monitor stubs. Phase 6 replaces these with the real  */
+/* per-page execute-only / read-only / write-trap bookkeeping used    */
+/* for tracing specific guest-physical regions. For Phase 1 they      */
+/* always report "not monitored" so handle_npf() falls through to     */
+/* npt_map_page().                                                    */
+/* ------------------------------------------------------------------ */
+
+NPT_MONITOR *npt_monitor_find(ULONGLONG gpa_page)
+{
+    UNREFERENCED_PARAMETER(gpa_page);
+    return NULL;
+}
+
+void npt_monitor_handle_fault(NPT_MONITOR *mon,
+                              VMCB       *vmcb,
+                              ULONGLONG   fault_info)
+{
+    UNREFERENCED_PARAMETER(mon);
+    UNREFERENCED_PARAMETER(vmcb);
+    UNREFERENCED_PARAMETER(fault_info);
 }
 
 NTSTATUS npt_unhide_range(ULONGLONG start_pa, SIZE_T size)
@@ -425,8 +699,8 @@ NTSTATUS npt_unhide_range(ULONGLONG start_pa, SIZE_T size)
 
     KeReleaseSpinLock(&g_npt_hide_lock, old_irql);
 
-    /* Caller must broadcast a TLB flush across every CPU's VMCB
-     * (conceptually: vmcb->ctl.guest_asid_tlb |= (1u << 31)) because
-     * that per-CPU broadcast lives outside this translation unit. */
+    /* Caller must broadcast a TLB flush across every CPU's VMCB via
+     * npt_tlb_flush(vmcb) because that per-CPU broadcast lives outside
+     * this translation unit. */
     return status;
 }

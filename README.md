@@ -4,11 +4,11 @@ A Windows-native thin hypervisor that demotes the running OS to an AMD-V (SVM) g
 
 ## Architecture
 
-- **Kernel driver** (`driver/the_chamber.sys`) loads via SCM as `DEMAND_START`.
+- **Kernel driver** (built as `build_output.sys`, installed under a per-install random name) loads via `NtLoadDriver` with a random service key written directly to the registry (no `sc.exe create`, no SCM 7045 event).
 - On start it builds a per-CPU VMCB with Nested Page Table identity map, enables SVM in EFER, and issues VMRUN. Current Windows continues as guest.
-- A short VMEXIT handler services CPUID (leaf 1 ECX[31] cleared, leaves 0x40000000..0x40000010 zeroed), MSR reads (EFER.SVME cleared in the guest view, Hyper-V enlightenment range returns 0), VMMCALL (private hypercall for unload), and NPF (nested page faults logged).
-- A TSC-offset accumulator (`timing.c`) subtracts cumulative host handler time from the VMCB's TSC offset so a guest RDTSC-around-CPUID probe reads bare-metal-looking deltas.
-- A self-hide module (`stealth.c`) unlinks the driver image from `PsLoadedModuleList` and clears `DriverName`/`DriverSection` so SystemModuleInformation enumerators do not see us.
+- A short VMEXIT handler services CPUID (leaf 1 ECX[31] cleared, leaves 0x40000000..0x4FFFFFFF zeroed), MSR reads (EFER.SVME cleared in the guest view, Hyper-V / KVM / VMware / Xen enlightenment ranges return 0), VMMCALL (private hypercall for unload), and NPF (nested page faults retried without advancing RIP; growable NPT behind a monitor table).
+- A TSC-offset accumulator (`timing.c`) brackets host handler cycles between VMEXIT return and the next VMRUN (round-3 bracket) and subtracts them from a shared global so a guest RDTSC-around-CPUID probe reads bare-metal-looking deltas.
+- A self-hide module (`stealth.c`) renames the driver's `KLDR_DATA_TABLE_ENTRY->BaseDllName` in place against a donor module (`pci.sys`, falling back to `acpi.sys` / `msrpc.sys`) rather than unlinking from `PsLoadedModuleList`, and nulls `DriverName` / `DriverSection`, so SystemModuleInformation enumerators do not see us.
 
 ## First-time setup
 
@@ -22,7 +22,7 @@ INSTALL.ps1 compiles the driver with your installed WDK, signs it with the self-
 
 - **Activate**: double-click the `THE_CHAMBER` desktop shortcut. A launcher window appears. The driver loads, a watchdog starts kicking every 20 s.
 - **Deactivate**: close the launcher window or run `launcher\stop.ps1`.
-- **Status**: `sc query the_chamber` or send `IOCTL_THE_CHAMBER_STATUS` (0x8008210C) to `\\.\THE_CHAMBER`.
+- **Status**: read the per-install random device-object name from `C:\THE_CHAMBER\logs\last_install.txt` and open `\\.\<random>` (the fixed `\\.\THE_CHAMBER` path was removed in Phase 1). The driver exposes three IOCTLs: `KICK` (`0x80002004`), `STATUS` (`0x80002008`), `SHUTDOWN` (`0x8000200C`); send them with `DeviceIoControl`. `sc query` does not work: `install_service.ps1` writes the service registry key directly via `NtLoadDriver` and never goes through the SCM.
 
 ## Pen-test
 
@@ -43,7 +43,7 @@ A BCD backup was taken by the pre-install prep script and lives at `recovery\bcd
 
 ## Known limits
 
-- **Kernel Patch Protection (Patch Guard)** scans `PsLoadedModuleList` structural invariants on some newer Windows builds. Our unlink creates a mismatch PG may eventually detect; worst case this triggers a BugCheck with KeBugCheck code 0x109. Running at ring -1 reduces but does not eliminate the exposure.
+- **Kernel Patch Protection (Patch Guard)** scans `PsLoadedModuleList` structural invariants on some newer Windows builds. Phase 1 replaced the earlier unlink with an in-place `UNICODE_STRING` rename against a donor (`pci.sys`), which avoids the structural 0x109 BugCheck that the unlink pattern used to trip. Residual risk: the donor module unloading at the wrong moment, or a concurrent reader seeing a half-written `BaseDllName` (Buffer / Length / MaximumLength are swapped under `g_stealth_lock`, but KD-attached kernels and some PG sweeps scan without taking that lock). Running at ring -1 reduces but does not eliminate exposure.
 - **Secure Boot must stay off** for the self-signed driver to load.
 - **Test Mode watermark** appears on the desktop while test-signing is enabled.
 - **TSC offset** accumulator hides handler time from guest RDTSC but a sufficiently sophisticated probe (e.g. cross-core shared counter instead of RDTSC) can still measure VMEXIT latency. Mitigation: minimize the set of intercepted instructions; keep the handler short.

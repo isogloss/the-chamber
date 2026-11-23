@@ -20,6 +20,7 @@
 #define CPUID_HYPERV_VENDOR_LEAF 0x40000000U
 
 /* VMEXIT codes (AMD 15.7) */
+#define VMEXIT_RDPMC            0x52ULL
 #define VMEXIT_CPUID            0x72ULL
 #define VMEXIT_MSR              0x7CULL
 #define VMEXIT_VMMCALL          0x81ULL
@@ -80,6 +81,11 @@
 /* NP_ENABLE register bits (VMCB offset 0x090, AMD 15.19) */
 #define NP_ENABLE               (1ULL << 0)
 
+/* TLB_CONTROL codes (VMCB byte at 0x05C, AMD 15.16.1). 0x03 flushes the
+ * guest's TLB entries only (preserves global entries); written to the low
+ * byte of the ULONG field `tlb_control`. */
+#define TLB_CONTROL_FLUSH_GUEST 0x03u
+
 #pragma pack(push, 1)
 
 /* Segment selector attribute entry for state-save area (AMD Table 15-3). */
@@ -90,23 +96,24 @@ typedef struct _VMCB_SEG {
     ULONGLONG   base;
 } VMCB_SEG;
 
-/* Control area -- 1024 bytes. AMD Table 15-1. */
+/* Control area -- 1024 bytes. AMD Table B-1.
+ * CR reads(lo16)+writes(hi16) pack into one ULONG at 0x00; DR reads+writes
+ * at 0x04; exceptions at 0x08; intercept_vec3 (misc1: CPUID/MSR/IRET/...)
+ * at 0x0C; intercept_vec4 (misc2: VMRUN/VMMCALL/...) at 0x10. */
 typedef struct _VMCB_CONTROL_AREA {
-    /* 0x000 */ ULONG       intercept_cr_read;
-    /* 0x004 */ ULONG       intercept_cr_write;
-    /* 0x008 */ ULONG       intercept_dr_read;
-    /* 0x00C */ ULONG       intercept_dr_write;
-    /* 0x010 */ ULONG       intercept_exceptions;
-    /* 0x014 */ ULONG       intercept_vec3;
-    /* 0x018 */ ULONG       intercept_vec4;
-    /* 0x01C */ ULONG       intercept_vec5;
-    /* 0x020 */ UCHAR       pad_020[0x03C - 0x020];
-    /* 0x03C */ ULONGLONG   iopm_base_pa;
-    /* 0x044 */ ULONG       pad_044;
+    /* 0x000 */ ULONG       intercept_cr;         /* reads lo16 | writes hi16 */
+    /* 0x004 */ ULONG       intercept_dr;         /* reads lo16 | writes hi16 */
+    /* 0x008 */ ULONG       intercept_exceptions;
+    /* 0x00C */ ULONG       intercept_vec3;
+    /* 0x010 */ ULONG       intercept_vec4;
+    /* 0x014 */ ULONG       intercept_vec5;
+    /* 0x018 */ UCHAR       pad_018[0x03C - 0x018];
+    /* 0x03C */ ULONG       pause_filter_thresh;
+    /* 0x040 */ ULONGLONG   iopm_base_pa;
     /* 0x048 */ ULONGLONG   msrpm_base_pa;
     /* 0x050 */ ULONGLONG   tsc_offset;
     /* 0x058 */ ULONG       guest_asid_tlb;
-    /* 0x05C */ ULONG       pad_05c;
+    /* 0x05C */ ULONG       tlb_control;          /* lo byte: tlb_control flush code */
     /* 0x060 */ ULONGLONG   vintr;
     /* 0x068 */ ULONGLONG   interrupt_shadow;
     /* 0x070 */ ULONGLONG   exit_code;
@@ -127,6 +134,24 @@ typedef struct _VMCB_CONTROL_AREA {
 } VMCB_CONTROL_AREA;
 
 C_ASSERT(sizeof(VMCB_CONTROL_AREA) == 0x400);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, intercept_cr)         == 0x000);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, intercept_dr)         == 0x004);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, intercept_exceptions) == 0x008);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, intercept_vec3)       == 0x00C);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, intercept_vec4)       == 0x010);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, intercept_vec5)       == 0x014);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, iopm_base_pa)         == 0x040);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, msrpm_base_pa)        == 0x048);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, tsc_offset)           == 0x050);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, guest_asid_tlb)       == 0x058);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, tlb_control)          == 0x05C);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, vintr)                == 0x060);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, exit_code)            == 0x070);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, np_enable)            == 0x090);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, event_inject)         == 0x0A8);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, n_cr3)                == 0x0B0);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, vmcb_clean_bits)      == 0x0C0);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, next_rip)             == 0x0C8);
 
 /* State save area -- 1024 bytes at VMCB offset 0x400. AMD Table 15-3. */
 typedef struct _VMCB_STATE_SAVE_AREA {
@@ -175,6 +200,14 @@ typedef struct _VMCB_STATE_SAVE_AREA {
 } VMCB_STATE_SAVE_AREA;
 
 C_ASSERT(sizeof(VMCB_STATE_SAVE_AREA) == 0x400);
+/* VMRUN auto-saves CR0/CR2/CR3/CR4 into the state-save area at the
+ * offsets below. CR2 is not grouped with the other three. If any of
+ * these offsets drifts, a guest that observes its own CR state through
+ * these fields sees the wrong value and VMRUN consistency checks fail. */
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, cr4) == 0x148);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, cr3) == 0x150);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, cr0) == 0x158);
+C_ASSERT(FIELD_OFFSET(VMCB_STATE_SAVE_AREA, cr2) == 0x240);
 
 typedef struct _VMCB {
     VMCB_CONTROL_AREA ctl;
@@ -190,4 +223,4 @@ C_ASSERT(sizeof(VMCB) == 0x800);
 
 void     svm_build_vmcb(PER_CPU_CTX *ctx);
 void     vmexit_handler(PER_CPU_CTX *ctx);
-void     svm_launch(PER_CPU_CTX *ctx);  /* defined in vmrun.asm */
+void     svm_launch(PER_CPU_CTX *ctx, PVOID host_stack_top);  /* defined in vmrun.asm */

@@ -6,14 +6,31 @@ param(
 
 # cloak_target.ps1 -- drops the user-mode shim DLLs next to a target .exe so
 # the Windows loader finds them first on LoadLibrary and they hook the APIs
-# the target's detection logic reads from. Companion to winhvmon.sys which
-# handles the CPUID/MSR surface at ring -1; these shims handle TBS, NCrypt,
-# firmware tables, DXGI, GDI, and PE module enumeration at ring 3.
-
-. "C:\Users\lkhnj\Downloads\testbench\gpu_spoof\_safety_gate.ps1"
-Assert-NoAntiCheatRunning
+# the target's detection logic reads from. Companion to the ring-0 driver
+# which handles the CPUID/MSR surface at ring -1; these shims handle TBS,
+# NCrypt, firmware tables, DXGI, GDI, and PE module enumeration at ring 3.
 
 $ErrorActionPreference = 'Stop'
+
+# --- Safety gate ---
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot  = Split-Path -Parent $scriptDir
+$gateCandidates = @(
+    (Join-Path $repoRoot 'pentest\_safety_gate.ps1'),
+    'C:\THE_CHAMBER\pentest\_safety_gate.ps1',
+    'C:\Users\lkhnj\Downloads\testbench\gpu_spoof\_safety_gate.ps1'
+)
+$gate = $gateCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $gate) {
+    Write-Host "Safety gate not found; refusing to run." -ForegroundColor Red
+    exit 1
+}
+. $gate
+if (-not (Get-Command Assert-NoAntiCheatRunning -ErrorAction SilentlyContinue)) {
+    Write-Host "Safety gate loaded but Assert-NoAntiCheatRunning is undefined; refusing to run." -ForegroundColor Red
+    exit 1
+}
+Assert-NoAntiCheatRunning
 
 $testbench = 'C:\Users\lkhnj\Downloads\testbench'
 $buildOut  = 'C:\THE_CHAMBER\tools\shim_bin'

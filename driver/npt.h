@@ -53,9 +53,72 @@ void     npt_free_tables(void);
  * 2 MB PDE granularity: the input range is rounded outward. The side
  * table has capacity for 256 live 2 MB regions (512 MB total). After
  * the PDE writes the caller must broadcast a TLB flush across every
- * CPU's VMCB (conceptually by OR-ing (1u << 31) into
- * vmcb->ctl.guest_asid_tlb on each per-CPU VMCB). */
+ * CPU's VMCB via npt_tlb_flush(vmcb), which writes
+ * TLB_CONTROL_FLUSH_GUEST to the dedicated tlb_control byte at VMCB
+ * offset 0x05C and clears the matching clean-bit group. The prior
+ * guidance to OR (1u << 31) into a combined guest_asid_tlb field was
+ * wrong (it would silently raise the ASID itself to 0x80000001 on
+ * Zen 4 and trigger zero flushes); that field no longer exists -- the
+ * VMCB struct now exposes guest_asid at 0x058 and tlb_control at
+ * 0x05C as separate fields. */
 NTSTATUS npt_hide_range(ULONGLONG start_pa, SIZE_T size);
 NTSTATUS npt_unhide_range(ULONGLONG start_pa, SIZE_T size);
+
+/* Phase 7.1: predicate for handle_npf. Returns TRUE if the 2 MB PA
+ * covering `pa_byte` is currently in the hide table and must not be
+ * remapped on fault. The query is advisory (no lock) because the side
+ * table only grows under the hide lock at init and shrinks under the
+ * same lock at teardown; a transient wrong answer is tolerable. */
+BOOLEAN  npt_is_hidden(ULONGLONG pa_byte);
+
+/* Phase 1.6 fault-recovery mapping. gpa/hpa are rounded down to a 2 MB
+ * boundary and a large PDE is installed (or updated). `flags` is the
+ * low-bits permission mask (NPT_PRESENT | NPT_WRITABLE | NPT_USER).
+ * Called from handle_npf() to grow the NPT on demand when a fault hits
+ * a region MmGetPhysicalMemoryRanges() did not report at init time. */
+NTSTATUS npt_map_page(ULONGLONG gpa, ULONGLONG hpa, ULONGLONG flags);
+
+/* Request a guest-ASID TLB flush on the next VMRUN by writing
+ * TLB_CONTROL_FLUSH_GUEST into vmcb->ctl.tlb_control. */
+void npt_tlb_flush(VMCB *vmcb);
+
+/* Phase 1.6 NPT monitor hooks. Phase 6 will implement the real
+ * execute-only / read-only / write-trap plumbing for tracing specific
+ * pages; the Phase 1 handler must compile against these symbols. The
+ * stubs in npt.c always return NULL / do nothing. */
+typedef struct _NPT_MONITOR NPT_MONITOR;
+NPT_MONITOR *npt_monitor_find(ULONGLONG gpa_page);
+void         npt_monitor_handle_fault(NPT_MONITOR *mon,
+                                      VMCB       *vmcb,
+                                      ULONGLONG   fault_info);
+
+/* Phase 7.1: compile-time-gated HV introspection resistance.
+ *
+ * When CHAMBER_HV_INTROSPECTION_RESIST is defined at build time, a
+ * post-init pass removes present/writable/user bits on every NPT PDE
+ * covering a host-physical page that backs HV code or data. A guest
+ * read of those GPAs then takes a nested page fault and falls into
+ * handle_npf, where we currently re-map it -- so this flag ALSO
+ * changes handle_npf to instead inject #PF back into the guest for
+ * matching ranges (or leave them unmapped; either way guest sees
+ * zeros / fault, not HV code).
+ *
+ * TRADE-OFFS. Removing the NPT entry for pages the OS legitimately
+ * touches breaks on contact. Windows itself does not routinely walk
+ * other drivers' code pages, but PG and crash-dump introspection can.
+ * Leave the flag off for Phase 7 initial landing; operator opts in on
+ * a disposable VM.
+ *
+ * ENTRY POINT. npt_hide_hv_image() is called from DriverEntry after
+ * svm_launch_all_cpus() with the driver's DllBase + SizeOfImage
+ * (captured from the live KLDR entry BEFORE stealth_apply zeros the
+ * PE header). It queries MmGetPhysicalAddress for each page inside
+ * that range and clears present/writable/user on the covering 2 MB
+ * NPT PDE via the existing npt_hide_range (which handles idempotence
+ * and locking).
+ *
+ * TLB. Caller must broadcast npt_tlb_flush(vmcb) on every per-CPU
+ * VMCB after the hide pass to flush stale translations. */
+NTSTATUS npt_hide_hv_image(PVOID hv_dll_base, ULONG hv_size_of_image);
 
 #endif /* THE_CHAMBER_NPT_H */
