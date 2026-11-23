@@ -43,6 +43,8 @@
 #include "npt.h"
 #include "integrity.h"
 #include "identity.h"
+#include "dump.h"
+#include "dump_trigger.h"
 #include <wdmsec.h>   /* IoCreateDeviceSecure + SDDL_DEVOBJ_SYS_ALL_ADM_ALL */
 
 CHAMBER_GLOBALS g_chamber;
@@ -309,6 +311,14 @@ static void watchdog_unload_worker(PDEVICE_OBJECT DevObj, PVOID Ctx)
      * UnloadRoutine ordering (integrity first, then SVM). */
     integrity_shutdown();
 
+    /* Disarm every passive trigger and tear down the pause primitive
+     * before dropping EFER.SVME. The pause DPCs run at DISPATCH_LEVEL
+     * in guest context; letting them persist after SVM shutdown would
+     * read stale CR3 against a stale target. */
+    (void)dump_trigger_disarm(0, CHAMBER_TRIGGER_ANY);
+    dump_trigger_shutdown();
+    dump_pause_shutdown();
+
     /* Full SVM teardown. svm_shutdown_all_cpus sets per-CPU
      * shutdown_requested, broadcasts the offline IPI (which clears
      * EFER.SVME), frees per-CPU structures, and nulls g_cpu_ctx. */
@@ -563,6 +573,141 @@ NTSTATUS IrpDeviceControl(PDEVICE_OBJECT Device, PIRP Irp)
         }
         st = STATUS_SUCCESS;
         break;
+
+    case IOCTL_THE_CHAMBER_DUMP_NOW: {
+        /* Operator issues a bare dump. METHOD_BUFFERED gives us a
+         * kernel copy of the input struct AND the output buffer in
+         * SystemBuffer -- but a dump needs a possibly-large output
+         * region in operator VA space, not a buffered copy. The
+         * dispatcher therefore reads the request struct from the
+         * input portion and routes to dump_run_targeted which
+         * accepts a kernel-side output buffer (we hand it
+         * SystemBuffer + sizeof(request) as the output window). */
+        CHAMBER_DUMP_NOW_REQ *req = (CHAMBER_DUMP_NOW_REQ *)buf;
+        ULONG hdr = sizeof(CHAMBER_DUMP_NOW_REQ);
+        if (in_len < hdr || out_len < hdr) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (req->target_pid == 0 ||
+            req->output_buffer_size == 0 ||
+            req->output_buffer_size > (out_len - hdr)) {
+            st = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        {
+            PUCHAR     output = (PUCHAR)buf + hdr;
+            ULONGLONG  bytes;
+            bytes = dump_trigger_manual(req->target_pid,
+                                        output,
+                                        req->output_buffer_size);
+            info = hdr + bytes;
+            /* Write the actual byte count back into the request
+             * echo at the head of the buffer so the operator knows
+             * the dump size without a second IOCTL. */
+            req->output_buffer_size = bytes;
+            st = (bytes > 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        }
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_DUMP_ON_PAYLOAD: {
+        /* Same shape as DUMP_NOW; distinct kind so the history ring
+         * records the payload cause. */
+        CHAMBER_DUMP_NOW_REQ *req = (CHAMBER_DUMP_NOW_REQ *)buf;
+        ULONG hdr = sizeof(CHAMBER_DUMP_NOW_REQ);
+        if (in_len < hdr || out_len < hdr) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (req->target_pid == 0 ||
+            req->output_buffer_size == 0 ||
+            req->output_buffer_size > (out_len - hdr)) {
+            st = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        {
+            PUCHAR     output = (PUCHAR)buf + hdr;
+            ULONGLONG  bytes;
+            bytes = dump_trigger_payload(req->target_pid,
+                                         output,
+                                         req->output_buffer_size);
+            info = hdr + bytes;
+            req->output_buffer_size = bytes;
+            st = (bytes > 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        }
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_ARM_WX: {
+        CHAMBER_ARM_WX_REQ *req = (CHAMBER_ARM_WX_REQ *)buf;
+        if (in_len < sizeof(*req)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        st = dump_trigger_arm_wx(
+                req->target_pid,
+                (PVOID)(ULONG_PTR)req->output_buffer_va,
+                req->output_buffer_size,
+                req->rearm != 0);
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_ARM_OEP: {
+        CHAMBER_ARM_OEP_REQ *req = (CHAMBER_ARM_OEP_REQ *)buf;
+        if (in_len < sizeof(*req)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        st = dump_trigger_arm_oep(
+                req->target_pid,
+                req->suspected_oep_gva,
+                (PVOID)(ULONG_PTR)req->output_buffer_va,
+                req->output_buffer_size,
+                req->rearm != 0);
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_ARM_WRITE_THRESHOLD: {
+        CHAMBER_ARM_WRITE_THRESHOLD_REQ *req =
+            (CHAMBER_ARM_WRITE_THRESHOLD_REQ *)buf;
+        if (in_len < sizeof(*req)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        st = dump_trigger_arm_write_threshold(
+                req->target_pid,
+                req->threshold_bytes,
+                (PVOID)(ULONG_PTR)req->output_buffer_va,
+                req->output_buffer_size,
+                req->rearm != 0);
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_DISARM_TRIGGERS: {
+        CHAMBER_DISARM_REQ *req = (CHAMBER_DISARM_REQ *)buf;
+        if (in_len < sizeof(*req)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        st = dump_trigger_disarm(req->target_pid, req->trigger_mask);
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_QUERY_DUMP_HISTORY: {
+        if (out_len < sizeof(CHAMBER_DUMP_HISTORY)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        {
+            ULONG wrote = dump_history_copy_out(
+                (PCHAMBER_DUMP_HISTORY)buf, out_len);
+            info = wrote;
+            st = (wrote > 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        }
+        break;
+    }
+
     default:
         break;
     }
@@ -589,6 +734,16 @@ VOID UnloadRoutine(PDRIVER_OBJECT Driver)
     (void)stealth_revert(Driver);
 
     stop_watchdog();
+
+    /* Disarm every passive trigger before tearing down the pause
+     * primitive: trigger_disarm restores NPT PDEs, which keeps the
+     * guest sane once SVM goes away, and releases referenced
+     * EPROCESSes. dump_pause_shutdown then frees the per-CPU DPC
+     * array. */
+    (void)dump_trigger_disarm(0, CHAMBER_TRIGGER_ANY);
+    dump_trigger_shutdown();
+    dump_pause_shutdown();
+
     /* KeRemoveQueueDpc does NOT wait for an in-flight DPC on another
      * CPU; without this flush, a pending watchdog_dpc_routine may race
      * svm_shutdown_all_cpus freeing g_cpu_ctx and write into freed
@@ -761,6 +916,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
     /* Phase 1.2: set the pessimistic default microcode round-trip cost that
      * timing_update() adds to every captured host interval. */
     timing_calibrate();
+
+    /* Pause primitive + trigger registry. Both are PASSIVE_LEVEL init
+     * paths and must run after svm_init_all_cpus populates g_cpu_count
+     * and g_cpu_ctx; failures are non-fatal because the dump path
+     * refuses cleanly when the state is absent. */
+    st = dump_pause_init();
+    if (!NT_SUCCESS(st)) {
+        CHAMBER_LOG_WARN("dump_pause_init failed 0x%08x\n", st);
+    }
+    st = dump_trigger_init();
+    if (!NT_SUCCESS(st)) {
+        CHAMBER_LOG_WARN("dump_trigger_init failed 0x%08x\n", st);
+    }
 
     start_watchdog();
 
