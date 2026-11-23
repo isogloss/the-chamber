@@ -56,6 +56,99 @@ extern USHORT svm_read_gs(void);
 extern USHORT svm_read_ldtr(void);
 extern USHORT svm_read_tr(void);
 
+/* Long-mode FS/GS base MSRs (IA32_FS_BASE / IA32_GS_BASE). */
+#define MSR_IA32_FS_BASE     0xC0000100ULL
+#define MSR_IA32_GS_BASE     0xC0000101ULL
+
+/* Raw 8-byte GDT entry (code/data) and 16-byte TSS/LDT entry layout.
+ * AMD APM Vol 2 §4.8, Intel SDM Vol 3A §3.4.5. */
+#pragma pack(push, 1)
+typedef struct _GDT_ENTRY64 {
+    USHORT limit_low;
+    USHORT base_low;
+    UCHAR  base_mid;
+    UCHAR  access;       /* P|DPL|S|type bits */
+    UCHAR  flags_limit;  /* G|D/B|L|AVL|limit_high */
+    UCHAR  base_high;
+} GDT_ENTRY64;
+#pragma pack(pop)
+
+/* Decode one 8-byte GDT entry into VMCB_SEG (attrib / limit / base).
+ * attrib: AMD APM Vol 2 Table 15-2 packs the 12 descriptor bits:
+ *   bits 0-3  type
+ *   bit  4    S
+ *   bits 5-6  DPL
+ *   bit  7    P
+ *   bit  8    AVL
+ *   bit  9    L
+ *   bit 10    D/B
+ *   bit 11    G
+ * Byte 5 of the GDT holds P|DPL|S|type (bits 7..0 of the first attrib byte).
+ * Byte 6 nibble high holds G|D/B|L|AVL (bits 4..7 of the second attrib byte). */
+static void svm_decode_seg(USHORT selector, PVOID gdt_base, VMCB_SEG *out) {
+    ULONG idx = (ULONG)(selector >> 3) & 0x1FFFU;
+    GDT_ENTRY64 *e;
+    ULONG lim;
+    ULONGLONG base;
+    USHORT attrib;
+
+    out->selector = selector;
+    out->attrib   = 0;
+    out->limit    = 0;
+    out->base     = 0;
+
+    if (selector == 0 || gdt_base == NULL) {
+        return;
+    }
+
+    e = (GDT_ENTRY64 *)((UCHAR *)gdt_base + ((SIZE_T)idx * sizeof(GDT_ENTRY64)));
+    lim  = (ULONG)e->limit_low | (((ULONG)(e->flags_limit & 0x0Fu)) << 16);
+    base = (ULONGLONG)e->base_low
+         | ((ULONGLONG)e->base_mid  << 16)
+         | ((ULONGLONG)e->base_high << 24);
+    attrib = (USHORT)((e->access & 0xFFu) | (((USHORT)(e->flags_limit & 0xF0u)) << 4));
+    if ((e->flags_limit & 0x80u) != 0) {
+        /* G=1 means limit is in 4 KiB units: hardware reports limit_bytes =
+         * (limit * 4096) + 0xFFF, but VMCB wants the raw 20-bit field. The
+         * VMCB_SEG.limit is 32 bits and holds the raw limit value. */
+    }
+    out->limit  = lim;
+    out->base   = base;
+    out->attrib = attrib;
+}
+
+/* Long-mode system descriptor (TR, LDTR) is 16 bytes: the base straddles
+ * the next 8-byte slot. */
+static void svm_decode_sys_seg(USHORT selector, PVOID gdt_base, VMCB_SEG *out) {
+    ULONG idx = (ULONG)(selector >> 3) & 0x1FFFU;
+    GDT_ENTRY64 *lo;
+    ULONG  *hi;
+    ULONG   lim;
+    ULONGLONG base;
+    USHORT  attrib;
+
+    out->selector = selector;
+    out->attrib   = 0;
+    out->limit    = 0;
+    out->base     = 0;
+
+    if (selector == 0 || gdt_base == NULL) {
+        return;
+    }
+
+    lo = (GDT_ENTRY64 *)((UCHAR *)gdt_base + ((SIZE_T)idx * sizeof(GDT_ENTRY64)));
+    hi = (ULONG *)((UCHAR *)gdt_base + ((SIZE_T)idx * sizeof(GDT_ENTRY64)) + 8);
+    lim  = (ULONG)lo->limit_low | (((ULONG)(lo->flags_limit & 0x0Fu)) << 16);
+    base = (ULONGLONG)lo->base_low
+         | ((ULONGLONG)lo->base_mid  << 16)
+         | ((ULONGLONG)lo->base_high << 24)
+         | (((ULONGLONG)hi[0]) << 32);
+    attrib = (USHORT)((lo->access & 0xFFu) | (((USHORT)(lo->flags_limit & 0xF0u)) << 4));
+    out->limit  = lim;
+    out->base   = base;
+    out->attrib = attrib;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Permission bitmaps                                                        */
 /* ------------------------------------------------------------------------- */
@@ -83,8 +176,13 @@ static PVOID svm_alloc_contig_zeroed(SIZE_T size, ULONGLONG *out_pa) {
  * NOTE: MmAllocateContiguousMemorySpecifyCache requires PASSIVE_LEVEL; warm
  * these once at PASSIVE_LEVEL before the bringup broadcast. */
 /* AMD 15.11: MSRPM bit 0 = intercept RDMSR, bit 1 = intercept WRMSR.
- * Zero bitmap means NO MSR intercepts. We must set specific bits for the
- * MSRs we want vmexit_handler to service. */
+ * Zero bitmap means NO MSR intercepts, BUT per APM Vol 2 §15.11 any
+ * MSR access outside the three MSRPM windows is unconditionally
+ * intercepted regardless of bitmap contents.  So the only MSRs the
+ * bitmap can affect are in-window addresses that we want the host to
+ * see.  Out-of-window MSRs (e.g. Hyper-V 0x40000000+) will always exit
+ * and be serviced by handle_msr; calling msrpm_set_intercept on them
+ * is a no-op worth flagging. */
 static void msrpm_set_intercept(PUCHAR bitmap, ULONGLONG msr) {
     ULONG region;
     ULONG offset_msr;
@@ -100,6 +198,9 @@ static void msrpm_set_intercept(PUCHAR bitmap, ULONGLONG msr) {
         region = 2;
         offset_msr = (ULONG)(msr - 0xC0010000ULL);
     } else {
+        /* Out-of-window: the MSR is already auto-intercepted and will
+         * reach handle_msr via IVEC3_MSR.  Flag misuse via NT_ASSERT. */
+        NT_ASSERT(FALSE);
         return;
     }
     bit_pos = offset_msr * 2;
@@ -118,17 +219,15 @@ static void svm_ensure_bitmaps(void) {
                 MmFreeContiguousMemory(p);
             } else {
                 g_msrpm_pa = pa;
-                /* Populate specific MSR intercepts (AMD 15.11). Otherwise a
-                 * zero bitmap = no intercept and handle_msr is dead code. */
+                /* AMD 15.11: bitmap only matters for in-window MSRs.
+                 * Hyper-V (0x40000000..) and KVM (0x4B564D00..) are
+                 * outside all three windows and auto-intercept via
+                 * IVEC3_MSR; handle_msr services them. */
                 {
                     PUCHAR b = (PUCHAR)g_msrpm_va;
-                    ULONGLONG m;
                     msrpm_set_intercept(b, 0xC0000080ULL);  /* EFER */
                     msrpm_set_intercept(b, 0xC0010117ULL);  /* VM_HSAVE_PA */
                     msrpm_set_intercept(b, 0xC0010114ULL);  /* VM_CR */
-                    for (m = 0x40000000ULL; m <= 0x400000FFULL; m++) {
-                        msrpm_set_intercept(b, m);
-                    }
                 }
             }
         }
@@ -186,6 +285,13 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
      * host hypercall path (intercept vector 4). */
     ctl->intercept_vec4 |= IVEC4_VMRUN | IVEC4_VMMCALL;
 
+    /* AMD 15.9 Table 15-2: intercept_dr packs DR reads in bits 0-15 and
+     * DR writes in bits 16-31.  Trap DR0-DR3 (bits 0-3 for read, 16-19
+     * for write) because Phase 6.3 HW-breakpoint capture is out of scope
+     * for passive dump; without an intercept the guest reads host DR0-DR3
+     * and writes them through to the shared host DR state. */
+    ctl->intercept_dr = 0x000F000FU;
+
     /* AMD 15.11 / 15.10.2: install the shared (all-zero) permission bitmaps. */
     svm_ensure_bitmaps();
     ctl->msrpm_base_pa = g_msrpm_pa;   /* AMD 15.11   MSR permission map  */
@@ -200,16 +306,6 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
 
     /* ==================== State-save area (Table 15-3) ================== */
 
-    /* Segment selectors (AMD 15.5.1) via the companion assembly readers. */
-    save->es.selector   = svm_read_es();     /* AMD 15.5.1 ES selector   */
-    save->cs.selector   = svm_read_cs();     /* AMD 15.5.1 CS selector   */
-    save->ss.selector   = svm_read_ss();     /* AMD 15.5.1 SS selector   */
-    save->ds.selector   = svm_read_ds();     /* AMD 15.5.1 DS selector   */
-    save->fs.selector   = svm_read_fs();     /* AMD 15.5.1 FS selector   */
-    save->gs.selector   = svm_read_gs();     /* AMD 15.5.1 GS selector   */
-    save->ldtr.selector = svm_read_ldtr();   /* AMD 15.5.1 LDTR selector */
-    save->tr.selector   = svm_read_tr();     /* AMD 15.5.1 TR selector   */
-
     /* GDTR / IDTR base + limit (AMD 15.5.1) via sgdt / sidt. */
     _sgdt(&gdtr);
     save->gdtr.base  = gdtr.base;            /* AMD 15.5.1 GDTR base  */
@@ -217,6 +313,21 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
     __sidt(&idtr);
     save->idtr.base  = idtr.base;            /* AMD 15.5.1 IDTR base  */
     save->idtr.limit = idtr.limit;           /* AMD 15.5.1 IDTR limit */
+
+    /* Segment selector + attrib/limit/base (AMD 15.5.1). The selector alone
+     * fails VMRUN consistency checks (CS P=0/L=0 rejected) and GS.Base=0
+     * destroys the KPCR. Walk the GDT we just captured to decode each
+     * descriptor; FS/GS base come from the long-mode base MSRs. */
+    svm_decode_seg(svm_read_es(), (PVOID)gdtr.base, &save->es);
+    svm_decode_seg(svm_read_cs(), (PVOID)gdtr.base, &save->cs);
+    svm_decode_seg(svm_read_ss(), (PVOID)gdtr.base, &save->ss);
+    svm_decode_seg(svm_read_ds(), (PVOID)gdtr.base, &save->ds);
+    svm_decode_seg(svm_read_fs(), (PVOID)gdtr.base, &save->fs);
+    svm_decode_seg(svm_read_gs(), (PVOID)gdtr.base, &save->gs);
+    save->fs.base = __readmsr(MSR_IA32_FS_BASE);
+    save->gs.base = __readmsr(MSR_IA32_GS_BASE);
+    svm_decode_sys_seg(svm_read_ldtr(), (PVOID)gdtr.base, &save->ldtr);
+    svm_decode_sys_seg(svm_read_tr(),   (PVOID)gdtr.base, &save->tr);
 
     /* Control registers (AMD 15.5.1). */
     save->cr0 = __readcr0();                 /* AMD 15.5.1 CR0 */
@@ -242,9 +353,18 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
     /* AMD 15.5.1: RIP is patched by vmrun.asm to the guest entry point. */
     save->rip = 0;
 
-    /* AMD 15.5.1: guest RSP = top of this CPU's private host stack. */
-    save->rsp = (ULONGLONG)((ULONG_PTR)ctx->host_stack_va + ctx->host_stack_size);
+    /* vmrun.asm overwrites save->rsp with the caller's live RSP before
+     * every VMRUN, so this initial value is only a placeholder. */
+    save->rsp = 0;
 
-    CHAMBER_LOG("VMCB built CPU %u (msrpm=%llx, iopm=%llx, n_cr3=%llx, rsp=%llx)\n",
-                ctx->cpu_index, g_msrpm_pa, g_iopm_pa, (ULONGLONG)ctl->n_cr3, save->rsp);
+    /* AMD 15.15.1: on a full VMCB write set vmcb_clean_bits = ~0u so
+     * hardware reloads nothing it has cached; update paths then clear
+     * only the groups whose fields changed (see timing.c for an
+     * example of clearing the Intercepts bit after a tsc_offset
+     * write). */
+    ctl->vmcb_clean_bits = ~0u;
+
+    /* CHAMBER_LOG unsafe at IPI_LEVEL -- DbgPrintEx acquires pool locks
+     * and may block.  First-CPU summary logged by svm_init_all_cpus
+     * once the broadcast returns. */
 }

@@ -66,18 +66,12 @@ static NTSTATUS svm_preallocate_cpu(ULONG cpu_index) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    /* host stack: 16 KiB */
-    {
-        ULONGLONG stack_pa;
-        ctx->host_stack_va = alloc_contiguous(16 * 1024, &stack_pa);
-        if (!ctx->host_stack_va) {
-            MmFreeContiguousMemory(ctx->vmcb_va);
-            MmFreeContiguousMemory(ctx->host_save_va);
-            ctx->vmcb_va = NULL; ctx->host_save_va = NULL;
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-    }
-    ctx->host_stack_size = 16 * 1024;
+    /* host_stack_va used to be a 16 KiB-per-CPU allocation that
+     * svm_build_vmcb wrote into VMCB.save.rsp, but vmrun.asm overwrites
+     * save.rsp with the caller's live RSP on every VMRUN so the stack
+     * was never used.  Leave the fields NULL/zero. */
+    ctx->host_stack_va   = NULL;
+    ctx->host_stack_size = 0;
     return STATUS_SUCCESS;
 }
 
@@ -152,8 +146,11 @@ NTSTATUS svm_init_all_cpus(void) {
 
 static VOID svm_offline_cpu(PER_CPU_CTX *ctx) {
     InterlockedExchange(&ctx->shutdown_requested, 1);
-    __writemsr(SVM_MSR_EFER, __readmsr(SVM_MSR_EFER) & ~EFER_SVME);
+    /* AMD APM Appendix B: WRMSR to VM_HSAVE_PA with EFER.SVME=0 raises
+     * #GP(0).  Zero VM_HSAVE_PA FIRST (while SVME is still set), then
+     * clear SVME.  Matches Linux KVM's cpu_svm_disable sequence. */
     __writemsr(SVM_MSR_VM_HSAVE_PA, 0);
+    __writemsr(SVM_MSR_EFER, __readmsr(SVM_MSR_EFER) & ~EFER_SVME);
     ctx->active = FALSE;
 }
 
@@ -173,6 +170,15 @@ static VOID svm_free_cpu(PER_CPU_CTX *ctx) {
 NTSTATUS svm_shutdown_all_cpus(void) {
     ULONG i;
     if (!g_cpu_ctx) return STATUS_SUCCESS;
+
+    /* Cooperative shutdown: GIF=0 on the host side between VMEXIT and
+     * the next VMRUN blocks IPIs.  Setting shutdown_requested on every
+     * CPU FIRST lets each CPU exit its vmrun loop on its own next
+     * VMEXIT and fall out to host_done (which issues STGI), so the
+     * IPI broadcast below is deliverable. */
+    for (i = 0; i < g_cpu_count; i++) {
+        InterlockedExchange(&g_cpu_ctx[i].shutdown_requested, 1);
+    }
 
     KeIpiGenericCall((PKIPI_BROADCAST_WORKER)ipi_offline, 0);
 

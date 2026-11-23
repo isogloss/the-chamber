@@ -24,6 +24,11 @@ extern volatile LONG64 g_total_accumulated_cycles;
  * populated at bringup by timing_calibrate(). */
 extern ULONGLONG       g_fixed_vmexit_cost;
 
+/* Trailing host cycles between TIMING_HOST_INTERVAL_END capture and the
+ * next VMRUN (GPR reload + jmp).  Folded into each delta so the guest
+ * does not see them. */
+extern ULONGLONG       g_timing_tail_cycles;
+
 /* Called from vmrun.asm immediately after the TIMING_HOST_INTERVAL_END
  * capture, before the next `vmrun rax`. */
 void timing_update(PER_CPU_CTX *ctx);
