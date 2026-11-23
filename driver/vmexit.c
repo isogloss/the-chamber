@@ -362,14 +362,21 @@ static void handle_rdpmc(PER_CPU_CTX *ctx, VMCB *vmcb)
 
 /* MSRs we service on behalf of the guest with explicit host-visible side
  * effects.  Every other MSR path returns 0 on RDMSR and absorbs WRMSR
- * so a guest sweep of the MSR space cannot bugcheck the host. */
+ * so a guest sweep of the MSR space cannot bugcheck the host.
+ *
+ * The identity MSRs (0x17, 0x8B, 0xC0000103, 0xC0010015) are listed
+ * here so the SEH-wrapped pass branch stays reachable in case the
+ * dedicated rewrite short-circuits are ever disabled; the normal path
+ * handles them before this allowlist is consulted. */
 static BOOLEAN handle_msr_allowlist_pass(ULONG msr)
 {
     switch (msr) {
     case 0x00000010UL:   /* IA32_TIME_STAMP_COUNTER      */
+    case 0x00000017UL:   /* IA32_PLATFORM_ID             */
     case 0x0000001BUL:   /* IA32_APIC_BASE               */
     case 0x00000048UL:   /* SPEC_CTRL                    */
     case 0x00000049UL:   /* PRED_CMD                     */
+    case 0x0000008BUL:   /* IA32_BIOS_SIGN_ID            */
     case 0x000000E7UL:   /* MPERF                        */
     case 0x000000E8UL:   /* APERF                        */
     case 0x000000FEUL:   /* IA32_MTRRCAP                 */
@@ -386,6 +393,87 @@ static BOOLEAN handle_msr_allowlist_pass(ULONG msr)
     case 0xC0000103UL:   /* TSC_AUX (RDTSCP tag)         */
     case 0xC0010015UL:   /* HWCR (no SVM-state bits)     */
         return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+/* Return TRUE if the MSR is one of the identity-rewrite set. The
+ * per-MSR handler short-circuits before __readmsr / __writemsr is
+ * called, so none of these ever reaches real hardware from the guest
+ * side when the machine-identity spoof toggle is set. */
+static BOOLEAN handle_msr_identity_rewrite(PER_CPU_CTX *ctx, VMCB *vmcb,
+                                           ULONG msr, BOOLEAN is_write)
+{
+    ULONGLONG value = 0;
+    BOOLEAN spoof = g_chamber_cfg_v2_valid && g_identity_valid &&
+                    ((g_chamber_cfg_v2.toggles &
+                      CHAMBER_TOGGLE_MACHINE_IDENTITY_SPOOF) != 0);
+
+    switch (msr) {
+    case 0x0000008BUL: /* IA32_BIOS_SIGN_ID -- microcode patch level */
+        if (is_write) {
+            /* Writes are architecturally used by the OS to poke the
+             * patch-loader; absorb them. */
+        } else {
+            value = spoof ? g_identity_microcode_rev : 0;
+            vmcb->save.rax   = (ULONGLONG)(ULONG)value;
+            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
+        }
+        return TRUE;
+
+    case 0x00000017UL: /* IA32_PLATFORM_ID */
+        if (!is_write) {
+            value = spoof ? g_identity_platform_id : 0;
+            vmcb->save.rax   = (ULONGLONG)(ULONG)value;
+            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
+        }
+        return TRUE;
+
+    case 0xC0000103UL: /* TSC_AUX */
+        if (is_write) {
+            value = (ULONGLONG)(ULONG)vmcb->save.rax |
+                    ((ULONGLONG)(ULONG)ctx->gpr_save[3] << 32);
+            if (spoof) {
+                identity_set_tsc_aux(ctx->cpu_index, value);
+            } else {
+                /* Without the spoof toggle, fall through to host
+                 * passthrough so RDTSCP keeps its usual tag. */
+                __try {
+                    __writemsr(0xC0000103UL, value);
+                } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            }
+        } else {
+            if (spoof) {
+                value = identity_get_tsc_aux(ctx->cpu_index);
+            } else {
+                __try {
+                    value = __readmsr(0xC0000103UL);
+                } __except (EXCEPTION_EXECUTE_HANDLER) { value = 0; }
+            }
+            vmcb->save.rax   = (ULONGLONG)(ULONG)value;
+            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
+        }
+        return TRUE;
+
+    case 0xC0010015UL: /* HWCR */
+        if (is_write) {
+            /* Absorb writes to HWCR; letting the guest flip bits here
+             * (McStatusWrEn, TscFreqSel, TlbCacheDis, SmmLock) would
+             * either fault, compromise host integrity, or betray that
+             * the HV is intercepting SVM state. */
+        } else {
+            /* Report a conservative Zen-default HWCR view. Bit 3
+             * (TlbCacheDis) is architecturally reset-zero; bit 4
+             * (INVD-to-WBINVD) is reset-one on current Zen; the rest
+             * stay zero. Spoof unconditionally — this is HV-safety,
+             * not machine identity. */
+            value = (1ULL << 4);
+            vmcb->save.rax   = (ULONGLONG)(ULONG)value;
+            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
+        }
+        return TRUE;
+
     default:
         return FALSE;
     }
@@ -422,6 +510,15 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
             vmcb->save.rax   = 0;
             ctx->gpr_save[3] = 0;
         }
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+
+    /* Identity rewrite path: TSC_AUX, platform_id, microcode patch
+     * level, HWCR. Each is handled without reaching the host MSR so
+     * reseeds change the guest-visible value and the host state is
+     * not touched. */
+    if (handle_msr_identity_rewrite(ctx, vmcb, msr, is_write)) {
         vmcb->save.rip = vmcb->ctl.next_rip;
         return;
     }
