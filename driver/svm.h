@@ -20,6 +20,7 @@
 #define CPUID_HYPERV_VENDOR_LEAF 0x40000000U
 
 /* VMEXIT codes (AMD 15.7) */
+#define VMEXIT_RDPMC            0x52ULL
 #define VMEXIT_CPUID            0x72ULL
 #define VMEXIT_MSR              0x7CULL
 #define VMEXIT_VMMCALL          0x81ULL
