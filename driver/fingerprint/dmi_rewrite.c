@@ -861,20 +861,28 @@ patch_type17(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end,
         fixed[0x05] = (UCHAR)((info->type16_handle >> 8) & 0xFFu);
     }
 
-    /* Form Factor at 0x0E: stamp DIMM (0x09) unless the firmware
-     * already picked a plausible packaging code (0x09..0x0F covers
-     * DIMM, TSOP, Row of chips, RIMM, SODIMM, SRIMM, FB-DIMM). */
-    {
-        UCHAR ff = fixed[0x0E];
-        if (ff < 0x09u || ff > 0x0Fu) fixed[0x0E] = 0x09u;
-    }
+    /* Fetch the launcher-chosen CPU brand so Form Factor / Memory Type /
+     * Speed stay coherent with the Type 4 socket (AM4 / AM5). Previous
+     * guard-to-preserve pattern let QEMU/Zen-3-era shapes survive next
+     * to a Zen 4 brand — a DDR4 DIMM at 2400 MT/s on an AM5 socket is
+     * itself a tell. Pool decision rule mirrors patch_type4. */
+    UCHAR brand17[48];
+    BOOLEAN have_brand17 = cfp_cfg_get(CFP_FID_CPU_BRAND, brand17, sizeof(brand17));
+    BOOLEAN brand_is_zen3 = have_brand17 &&
+        (dmi_contains_ci(brand17, sizeof(brand17), "5800X", 5) ||
+         dmi_contains_ci(brand17, sizeof(brand17), "5600X", 5));
 
-    /* Memory Type at 0x12: stamp DDR5 (0x22) unless firmware picked a
-     * plausible DDR-family code (0x18..0x22 covers DDR..DDR5). */
-    {
-        UCHAR mt = fixed[0x12];
-        if (mt < 0x18u || mt > 0x22u) fixed[0x12] = 0x22u;
-    }
+    /* Form Factor at 0x0E: DIMM (0x09) is the only desktop form factor
+     * that stays coherent with our Type 16 / Type 7 shape. SODIMM,
+     * FB-DIMM, RIMM etc. would advertise a laptop / server / legacy
+     * packaging next to a desktop socket. Stamp unconditionally. */
+    fixed[0x0E] = 0x09u;
+
+    /* Memory Type at 0x12: DDR5 (0x22) for Zen 4 (AM5), DDR4 (0x1A) for
+     * Zen 3 (AM4). Stamp unconditionally — firmware-reported values
+     * like QEMU's 0x18 (DDR) or a Zen-3 host's 0x1A on a Zen-4 brand
+     * are themselves cross-leaf tells. */
+    fixed[0x12] = brand_is_zen3 ? 0x1Au : 0x22u;
 
     /* Size at 0x0C (2 bytes): 16 GB expressed as 0x4000 MB (bit 15
      * clear => MB units). Only stamp when firmware left it 0 (no
@@ -888,14 +896,14 @@ patch_type17(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end,
         }
     }
 
-    /* Speed at 0x15 (2 bytes, MT/s): 5200 (0x1450) for DDR5-5200.
-     * Only stamp when 0 or 0xFFFF (unknown). */
+    /* Speed at 0x15 (2 bytes, MT/s): 5200 for Zen 4 DDR5, 3200 for Zen 3
+     * DDR4. Stamp unconditionally — QEMU/VM firmware values at
+     * 2133/2400/2666 would survive a preserve-if-plausible guard and
+     * mismatch the DDR5 / DDR4 Memory Type stamped above. */
     if (fixed_len > 0x16) {
-        USHORT sp = (USHORT)fixed[0x15] | ((USHORT)fixed[0x16] << 8);
-        if (sp == 0 || sp == 0xFFFF) {
-            fixed[0x15] = (UCHAR)(0x1450u & 0xFFu);
-            fixed[0x16] = (UCHAR)((0x1450u >> 8) & 0xFFu);
-        }
+        USHORT target_sp = brand_is_zen3 ? 0x0C80u : 0x1450u;
+        fixed[0x15] = (UCHAR)(target_sp & 0xFFu);
+        fixed[0x16] = (UCHAR)((target_sp >> 8) & 0xFFu);
     }
 
     /* Total Width at 0x08 and Data Width at 0x0A (2 bytes each): 64
