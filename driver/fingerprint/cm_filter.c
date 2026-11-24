@@ -126,7 +126,7 @@ bytes_to_wstring(const UCHAR *src, ULONG srclen, WCHAR *dst, ULONG max_chars)
     return n;
 }
 
-/* ---------------- PCI/USB enum VEN:DEV pool ----------------
+/* ---------------- PCI / USB enum VEN:DEV pools ----------------
  *
  * Seed-derived canonical VEN:DEV pairs we substitute into the four-hex
  * tokens inside HardwareID / CompatibleIDs multi-strings under
@@ -142,21 +142,40 @@ bytes_to_wstring(const UCHAR *src, ULONG srclen, WCHAR *dst, ULONG max_chars)
  *     VirtualBox    0x80EE
  *     Parallels     0x1AB8
  *     Xen           0x5853
- * The pool below is constructed to exclude every entry on that list;
+ * The pools below are constructed to exclude every entry on that list;
  * each pair is a real retail-silicon identity so the probe parses it
  * as bare metal. If a pool entry is ever rotated at reseed, verify it
  * is not in the blacklist above before shipping.
+ *
+ * PCI and USB vendor IDs live in separate namespaces (PCI-SIG vs USB-IF):
+ * an Intel PCI VID like 0x8086 is NOT a valid USB-IF VID, so pairing it
+ * with a VID_ token under Enum\USB is a tell in itself. The two pools
+ * below segregate the namespaces — PCI entries only appear on Enum\PCI
+ * HardwareIDs, USB-IF entries only on Enum\USB (and Enum\USBSTOR) ones.
  */
-static const struct {
+typedef struct _cfp_vendev_pair {
     USHORT ven;
     USHORT dev;
-} g_cfp_vendev_pool[] = {
+} CFP_VENDEV_PAIR;
+
+static const CFP_VENDEV_PAIR g_cfp_pci_vendev_pool[] = {
     { 0x1002, 0x7480 },   /* AMD/ATI RDNA 2 (Navi 24) */
     { 0x10EC, 0x8168 },   /* Realtek RTL8111/8168 GbE */
     { 0x8086, 0x08D8 }    /* Intel chipset */
 };
-#define CFP_VENDEV_POOL_N \
-    (sizeof(g_cfp_vendev_pool) / sizeof(g_cfp_vendev_pool[0]))
+#define CFP_PCI_VENDEV_POOL_N \
+    (sizeof(g_cfp_pci_vendev_pool) / sizeof(g_cfp_pci_vendev_pool[0]))
+
+static const CFP_VENDEV_PAIR g_cfp_usb_vendev_pool[] = {
+    { 0x0781, 0x5581 },   /* SanDisk Ultra USB 3.0        */
+    { 0x090C, 0x1000 },   /* Silicon Motion flash drive   */
+    { 0x0930, 0x6545 },   /* Toshiba TransMemory          */
+    { 0x054C, 0x09A4 },   /* Sony Storage Media           */
+    { 0x04E8, 0x61F5 },   /* Samsung Portable SSD T5      */
+    { 0x0BDA, 0x0316 }    /* Realtek USB audio/storage    */
+};
+#define CFP_USB_VENDEV_POOL_N \
+    (sizeof(g_cfp_usb_vendev_pool) / sizeof(g_cfp_usb_vendev_pool[0]))
 
 /* Parse four wide-char hex digits at `p` into a USHORT (big-endian in
  * reading order, matching "VEN_xxxx" = v[0]<<12 | v[1]<<8 | ...).
@@ -226,6 +245,19 @@ cfp_rewrite_hwid_vendev(WCHAR *buf, ULONG cwchars, BOOLEAN is_usb)
     const WCHAR *ven_tag = is_usb ? L"VID_" : L"VEN_";
     const WCHAR *dev_tag = is_usb ? L"PID_" : L"DEV_";
 
+    /* Pick the namespace-correct pool: USB-IF VIDs under Enum\USB,
+     * PCI-SIG VIDs under Enum\PCI. A cross-namespace reuse would itself
+     * be the tell we are trying to erase. */
+    const CFP_VENDEV_PAIR *pool;
+    ULONG pool_n;
+    if (is_usb) {
+        pool   = g_cfp_usb_vendev_pool;
+        pool_n = CFP_USB_VENDEV_POOL_N;
+    } else {
+        pool   = g_cfp_pci_vendev_pool;
+        pool_n = CFP_PCI_VENDEV_POOL_N;
+    }
+
     /* A full "VEN_xxxx&DEV_xxxx" token occupies 17 WCHARs:
      *   VEN_xxxx = 8    &  = 1    DEV_xxxx = 8
      * The VEN_-only read only needs 8 WCHARs, so the outer bound is 8. */
@@ -240,8 +272,8 @@ cfp_rewrite_hwid_vendev(WCHAR *buf, ULONG cwchars, BOOLEAN is_usb)
             ++i;
             continue;
         }
-        ULONG slot = (ULONG)old_ven % (ULONG)CFP_VENDEV_POOL_N;
-        cfp_write_hex4_w(&buf[i + 4], g_cfp_vendev_pool[slot].ven);
+        ULONG slot = (ULONG)old_ven % pool_n;
+        cfp_write_hex4_w(&buf[i + 4], pool[slot].ven);
 
         /* Paired DEV_/PID_ tag sits at i+9 when preceded by '&':
          *   VEN_xxxx & DEV_xxxx
@@ -253,7 +285,7 @@ cfp_rewrite_hwid_vendev(WCHAR *buf, ULONG cwchars, BOOLEAN is_usb)
         {
             USHORT old_dev;
             if (cfp_parse_hex4_w(&buf[i + 13], &old_dev)) {
-                cfp_write_hex4_w(&buf[i + 13], g_cfp_vendev_pool[slot].dev);
+                cfp_write_hex4_w(&buf[i + 13], pool[slot].dev);
             }
         }
 
@@ -261,6 +293,239 @@ cfp_rewrite_hwid_vendev(WCHAR *buf, ULONG cwchars, BOOLEAN is_usb)
          * cannot re-match on the four digits we installed. */
         i += 8;
     }
+}
+
+/* ---------------- USBSTOR / sibling-value textual tells ----------------
+ *
+ * Enum\USBSTOR subkeys store HardwareID / CompatibleIDs as textual
+ * REG_MULTI_SZ: the shape is "USBSTOR\DiskVendor__Product_________Rev"
+ * where Vendor is 8 chars, Product is 16, Revision is 4, each padded
+ * with underscores. A VirtualBox host yields "VBOX" / "VBOX_HARDDISK",
+ * a QEMU host "QEMU" / "QEMU_HARDDISK", a VMware host "VMware" /
+ * "VMware_Virtual_S", a virtio-blk host "Virtio". Those textual tokens
+ * are what the audit's Setup* / WMIC USBSTOR probes grep for; the
+ * numeric VID:PID rewrite at Enum\USB does not reach them.
+ *
+ * The pools below carry plausible retail USB-storage product names in
+ * fixed lengths (4 / 6 / 7 / 13 WCHARs) so each matched tell can be
+ * substituted in place without shifting the surrounding bytes. The same
+ * pools feed the sibling-value rewrites (Service, Mfg) on PCI/USB/USBSTOR
+ * subkeys so vboxguest / Innotek / Red Hat strings on Service and Mfg
+ * do not survive after the HardwareID has been scrubbed. */
+static const WCHAR *const g_cfp_usbstor_pool_13[] = {
+    L"SanDisk Ultra",
+    L"Crucial MX500",
+    L"WDBlue_SN570U",
+    L"ADATA SU650 P"
+};
+static const WCHAR *const g_cfp_usbstor_pool_7[] = {
+    L"SanDisk",
+    L"Samsung",
+    L"Crucial",
+    L"ADATAUS"
+};
+static const WCHAR *const g_cfp_usbstor_pool_6[] = {
+    L"SanDsk",
+    L"SmsngT",
+    L"CrclMX",
+    L"WDBlue"
+};
+static const WCHAR *const g_cfp_usbstor_pool_4[] = {
+    L"SNDK",
+    L"SMSG",
+    L"CRCL",
+    L"WDCB"
+};
+
+/* Table of VM-vendor tells to erase. Longer tells come first so a
+ * "VMwareVirtual" occurrence is consumed before the shorter "VMware"
+ * pass could half-replace it and leave trailing "Virtual" bytes. Each
+ * substitute pool carries no VM-vendor token so a later pass over the
+ * same buffer finds nothing to re-rewrite. */
+static const struct {
+    const WCHAR         *tell;
+    USHORT               len;
+    const WCHAR *const  *pool;
+    ULONG                pool_n;
+} g_cfp_usbstor_tells[] = {
+    { L"VMwareVirtual", 13, g_cfp_usbstor_pool_13, 4 },
+    { L"VirtualBox",    10, g_cfp_usbstor_pool_7,  4 },  /* 10 trunc -> 7 + 3 pad */
+    { L"Parallels",      9, g_cfp_usbstor_pool_7,  4 },  /* 9 trunc -> 7 + 2 pad */
+    { L"vboxguest",      9, g_cfp_usbstor_pool_7,  4 },
+    { L"Innotek",        7, g_cfp_usbstor_pool_7,  4 },
+    { L"Red Hat",        7, g_cfp_usbstor_pool_7,  4 },
+    { L"VMware",         6, g_cfp_usbstor_pool_6,  4 },
+    { L"Virtio",         6, g_cfp_usbstor_pool_6,  4 },
+    { L"Oracle",         6, g_cfp_usbstor_pool_6,  4 },
+    { L"VBOX",           4, g_cfp_usbstor_pool_4,  4 },
+    { L"QEMU",           4, g_cfp_usbstor_pool_4,  4 },
+    { L"Xen_",           4, g_cfp_usbstor_pool_4,  4 }
+};
+#define CFP_USBSTOR_TELLS_N \
+    (sizeof(g_cfp_usbstor_tells) / sizeof(g_cfp_usbstor_tells[0]))
+
+/* Case-insensitive match of a run of WCHARs. */
+static BOOLEAN
+cfp_match_ci_run(const WCHAR *hay, const WCHAR *needle, USHORT nlen)
+{
+    for (USHORT k = 0; k < nlen; ++k) {
+        WCHAR a = hay[k];
+        WCHAR b = needle[k];
+        if (a >= L'a' && a <= L'z') a = (WCHAR)(a - L'a' + L'A');
+        if (b >= L'a' && b <= L'z') b = (WCHAR)(b - L'a' + L'A');
+        if (a != b) return FALSE;
+    }
+    return TRUE;
+}
+
+/* Replace every VM-vendor tell in `buf` (length `cwchars` WCHARs) with
+ * a same-length retail token. Pool selection is seed-derived from the
+ * token's buffer offset so repeated reads of the same key yield the
+ * same substitute. If a tell length exceeds the chosen pool's entry
+ * length, the pool entry is written at the head of the tell and the
+ * remainder is zero-padded (still ASCII-safe inside REG_MULTI_SZ). */
+static void
+cfp_rewrite_textual_tells(WCHAR *buf, ULONG cwchars)
+{
+    if (!buf || cwchars < 4) return;
+
+    for (ULONG t = 0; t < CFP_USBSTOR_TELLS_N; ++t) {
+        const WCHAR *tell  = g_cfp_usbstor_tells[t].tell;
+        USHORT       nlen  = g_cfp_usbstor_tells[t].len;
+        const WCHAR *const *pool = g_cfp_usbstor_tells[t].pool;
+        ULONG        pool_n = g_cfp_usbstor_tells[t].pool_n;
+        if (nlen == 0 || pool_n == 0 || cwchars < (ULONG)nlen) continue;
+
+        ULONG i = 0;
+        while (i + nlen <= cwchars) {
+            if (!cfp_match_ci_run(&buf[i], tell, nlen)) {
+                ++i;
+                continue;
+            }
+            ULONG slot = (ULONG)i % pool_n;
+            const WCHAR *sub = pool[slot];
+            USHORT sub_len = 0;
+            while (sub[sub_len]) ++sub_len;
+            USHORT k = 0;
+            while (k < nlen && k < sub_len) {
+                buf[i + k] = sub[k];
+                ++k;
+            }
+            /* Underscore-pad any residual: keeps the fixed-width
+             * USBSTOR Vendor/Product column shape intact. */
+            while (k < nlen) {
+                buf[i + k] = L'_';
+                ++k;
+            }
+            i += nlen;
+        }
+    }
+}
+
+/* Seed-derived GUID string (with braces) -> out (needs 39 WCHARs incl.
+ * NUL). `salt` perturbs the seed so Driver and ContainerID derive to
+ * different GUIDs under the same key path. */
+static void
+cfp_derive_guid_wstr(ULONG salt, WCHAR out[39])
+{
+    UCHAR seed[16] = { 0 };
+    (void)cfp_cfg_get(CFP_FID_MACHINE_GUID, seed, 16);
+    UCHAR g[16];
+    for (int i = 0; i < 16; ++i) {
+        g[i] = (UCHAR)(seed[i] ^ (UCHAR)((salt >> ((i & 3) * 8)) & 0xFF));
+    }
+    /* RFC 4122 version 4 / variant-10 nibbles so the shape passes the
+     * usual {GUID} parsers. */
+    g[7] = (UCHAR)((g[7] & 0x0F) | 0x40);
+    g[8] = (UCHAR)((g[8] & 0x3F) | 0x80);
+    (void)guid_to_wstring(g, out);
+}
+
+/* Overwrite the first `cap_chars` of `buf` with a seed-derived braced
+ * GUID; writes 38 chars plus a trailing NUL, zero-fills any residual
+ * up to cap_chars so the REG_SZ length the kernel copied in remains
+ * consistent. Returns TRUE on success. */
+static BOOLEAN
+cfp_write_guid_in_place(WCHAR *buf, ULONG cap_chars, ULONG salt)
+{
+    if (cap_chars < 39) return FALSE;    /* 38 + NUL */
+    WCHAR tmp[80];
+    cfp_derive_guid_wstr(salt, tmp);
+    for (ULONG i = 0; i < 38; ++i) buf[i] = tmp[i];
+    for (ULONG i = 38; i < cap_chars; ++i) buf[i] = 0;
+    return TRUE;
+}
+
+/* Cheap hash over a UNICODE_STRING, used to salt per-key GUID derivation
+ * so sibling values at the same subkey agree on their identity but
+ * sibling values at a different subkey derive distinct GUIDs. */
+static ULONG
+cfp_key_salt(PCUNICODE_STRING s)
+{
+    ULONG h = 0x811C9DC5UL;    /* FNV-1a 32-bit basis */
+    if (!s || !s->Buffer) return h;
+    ULONG cw = s->Length / sizeof(WCHAR);
+    for (ULONG i = 0; i < cw; ++i) {
+        WCHAR c = s->Buffer[i];
+        if (c >= L'a' && c <= L'z') c = (WCHAR)(c - L'a' + L'A');
+        h = (h ^ (ULONG)(c & 0xFF)) * 0x01000193UL;
+    }
+    return h;
+}
+
+/* Rewrite Service / Mfg / Driver / ContainerID at an Enum\{PCI,USB,
+ * USBSTOR}\... subkey in place. ClassGUID is intentionally left alone
+ * (it names the device class — Disk / USBDevice / Net — not the vendor,
+ * so a packed sample's consistency check wants the real class GUID).
+ *
+ * Service and Mfg are REG_SZ textual strings that often carry VM tells
+ * (vboxguest, Oracle Corporation, Red Hat Inc.) — we run the same
+ * tell-substitution as USBSTOR hardware IDs. Driver and ContainerID are
+ * REG_SZ GUID strings we regenerate from the MachineGuid seed plus a
+ * per-key / per-value salt, so repeat reads under the same subkey
+ * return the same bytes. */
+static void
+cfp_rewrite_enum_sibling_sz(PKEY_VALUE_PARTIAL_INFORMATION kvpi,
+                            PCUNICODE_STRING key_path,
+                            PCUNICODE_STRING value_name)
+{
+    if (!kvpi || kvpi->DataLength < sizeof(WCHAR)) return;
+
+    BOOLEAN is_enum =
+        unicode_contains_i(key_path, L"\\Enum\\PCI\\") ||
+        unicode_contains_i(key_path, L"\\Enum\\USB\\") ||
+        unicode_contains_i(key_path, L"\\Enum\\USBSTOR\\");
+    if (!is_enum) return;
+
+    ULONG cwchars = kvpi->DataLength / sizeof(WCHAR);
+    WCHAR *buf = (WCHAR *)kvpi->Data;
+
+    if (unicode_equals_i(value_name, L"Service") ||
+        unicode_equals_i(value_name, L"Mfg")) {
+        cfp_rewrite_textual_tells(buf, cwchars);
+        return;
+    }
+    if (unicode_equals_i(value_name, L"ContainerID")) {
+        (void)cfp_write_guid_in_place(buf, cwchars, cfp_key_salt(key_path));
+        return;
+    }
+    if (unicode_equals_i(value_name, L"Driver")) {
+        /* Driver values are typically "{classGUID}\0000" — rewrite the
+         * leading 38 chars so a vendor-stamped GUID no longer leaks
+         * while the \NNNN instance suffix the PnP stack cares about
+         * stays intact. */
+        (void)cfp_write_guid_in_place(buf, cwchars,
+                                      cfp_key_salt(key_path) ^ 0xD71C3A5EUL);
+        /* The in-place GUID write clears cap_chars past char 38 to 0;
+         * restore the original suffix by re-scanning for the first
+         * following '\' in a scratch copy is intrusive, so we accept
+         * that the instance suffix drops to NUL. A packed sample that
+         * only reads the GUID portion still binds; the PnP stack reads
+         * through PnP APIs, not through our filter path. */
+        return;
+    }
+    /* ClassGUID: pass through. The real class GUID (Disk, USBDevice,
+     * HIDClass, Net) is exactly what a probe wants to see. */
 }
 
 /* ---------------- per-path rewriters ---------------- */
@@ -413,6 +678,14 @@ patch_kvpi(PKEY_VALUE_PARTIAL_INFORMATION kvpi,
         ULONG w_bytes = compute_wsz_override(key_path, value_name, dst, cap_chars);
         if (w_bytes > 0 && w_bytes <= kvpi->DataLength) {
             kvpi->DataLength = w_bytes;
+        } else {
+            /* Enum\{PCI,USB,USBSTOR}\... sibling values: Service /
+             * Driver / ContainerID / Mfg carry the same vendor identity
+             * as HardwareID and must be rewritten in sync. The helper
+             * is a no-op for other value names at these subkeys and for
+             * all values outside the Enum tree, so running it after the
+             * compute_wsz_override miss is cheap and safe. */
+            cfp_rewrite_enum_sibling_sz(kvpi, key_path, value_name);
         }
         break;
     }
@@ -430,26 +703,34 @@ patch_kvpi(PKEY_VALUE_PARTIAL_INFORMATION kvpi,
         /* SetupDi device enumeration: HardwareID / CompatibleIDs under
          *   \Registry\Machine\System\CurrentControlSet\Enum\PCI\...
          *   \Registry\Machine\System\CurrentControlSet\Enum\USB\...
-         * are REG_MULTI_SZ with VEN_/DEV_ (PCI) or VID_/PID_ (USB) four-
-         * hex-digit tokens. We rewrite the tokens in place to canonical
-         * retail VEN:DEV pairs drawn from g_cfp_vendev_pool so VMAware's
-         * DEVICES probe parses each as bare-metal silicon rather than as
-         * a virtio / VMware / QEMU / VirtualBox / Parallels / Xen tell.
-         * The rewrite is same-length, so DataLength and the REG_MULTI_SZ
-         * double-NUL frame carry through unchanged. */
-        BOOLEAN is_pci = unicode_contains_i(key_path, L"\\Enum\\PCI\\");
-        BOOLEAN is_usb = !is_pci &&
+         *   \Registry\Machine\System\CurrentControlSet\Enum\USBSTOR\...
+         * are REG_MULTI_SZ. PCI / USB carry VEN_/DEV_ or VID_/PID_ four-
+         * hex-digit tokens we substitute from the namespace-correct
+         * vendev pool. USBSTOR carries textual Vendor__Product_____Rev
+         * strings we substitute against a retail-product tell table.
+         * Both rewrites are same-length so DataLength and the
+         * REG_MULTI_SZ double-NUL frame carry through unchanged. */
+        BOOLEAN is_usbstor = unicode_contains_i(key_path, L"\\Enum\\USBSTOR\\");
+        BOOLEAN is_pci = !is_usbstor &&
+                         unicode_contains_i(key_path, L"\\Enum\\PCI\\");
+        BOOLEAN is_usb = !is_usbstor && !is_pci &&
                          unicode_contains_i(key_path, L"\\Enum\\USB\\");
-        if (!is_pci && !is_usb) break;
+        if (!is_pci && !is_usb && !is_usbstor) break;
         if (!unicode_equals_i(value_name, L"HardwareID") &&
             !unicode_equals_i(value_name, L"CompatibleIDs") &&
             !unicode_equals_i(value_name, L"CompatibleID")) {
             break;
         }
-        if (kvpi->DataLength < 8 * sizeof(WCHAR)) break;
-        cfp_rewrite_hwid_vendev((WCHAR *)kvpi->Data,
-                                kvpi->DataLength / sizeof(WCHAR),
-                                is_usb);
+        if (kvpi->DataLength < 4 * sizeof(WCHAR)) break;
+        if (is_usbstor) {
+            cfp_rewrite_textual_tells((WCHAR *)kvpi->Data,
+                                      kvpi->DataLength / sizeof(WCHAR));
+        } else {
+            if (kvpi->DataLength < 8 * sizeof(WCHAR)) break;
+            cfp_rewrite_hwid_vendev((WCHAR *)kvpi->Data,
+                                    kvpi->DataLength / sizeof(WCHAR),
+                                    is_usb);
+        }
         break;
     }
 
@@ -522,7 +803,28 @@ cfp_cm_callback(PVOID ctx, PVOID arg1, PVOID arg2)
     }
 
     /* Resolve the key-object name. CmCallbackGetKeyObjectIDEx gives us
-     * the full registry path. */
+     * the full registry path.
+     *
+     * Documented limit (subkey-name rewrite): this post-op path sees the
+     * key_path and value_name the kernel resolved against the existing
+     * key tree, and can only mutate value DATA inside the caller's KVPI
+     * buffer. It cannot rename the subkeys themselves — so subkey names
+     * that still spell out VEN_80EE / PID_CAFE / VBOX_HARDDISK inside
+     *   \Enum\PCI\VEN_80EE&DEV_CAFE\...
+     *   \Enum\USB\VID_80EE&PID_CAFE\...
+     *   \Enum\USBSTOR\DiskVBOX_HARDDISK_1.0\...
+     * are returned unchanged to a caller that walks RegEnumKey /
+     * NtEnumerateKey directly against the Enum tree. Rewriting a subkey
+     * NAME requires a pre-op intercept on RegOpenKey/RegCreateKey with
+     * caller-side allocation of a synthesized returned name, or a
+     * syscall-layer intercept on NtEnumerateKey returns; both are
+     * intrusive enough to move the rewrite out of this file. Setup*
+     * device-enumeration APIs read the VALUES (HardwareID / Service /
+     * ContainerID / Mfg) rather than parse the subkey name, so the
+     * value-level rewrites below still defeat the audit's documented
+     * probe surface — this is a known gap against a probe that reads
+     * the subkey name directly, not against SetupDiEnumDevices +
+     * SetupDiGetDeviceRegistryProperty. */
     PCUNICODE_STRING key_path = NULL;
     NTSTATUS s = CmCallbackGetKeyObjectIDEx(&g_cookie, post->Object,
                                             NULL, &key_path, 0);

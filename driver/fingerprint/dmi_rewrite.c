@@ -389,37 +389,24 @@ patch_type4(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end)
      * an out-of-list code point whose meaning drifts across SMBIOS
      * spec revisions. */
 
-    /* Socket Designation. Use a plausible modern socket name chosen from
-     * the brand prefix: AM5 for AMD, LGA1700 for Intel. If the firmware
-     * string already looks sane and does not carry a VM token we leave
-     * it alone — some retail boards embed a shelf-position descriptor
-     * ("CPU1", "SOCKET 0") here that is more plausible than our fixed
-     * replacement. */
+    /* Socket Designation. The brand pool mixes Zen 3 (AM4) and Zen 4
+     * (AM5) parts; a hardcoded "AM5" produces a cross-leaf inconsistency
+     * whenever a 5600X/5800X slot is picked. Stamp the socket to match
+     * the family of the chosen brand so Type 4 stays coherent with both
+     * the brand pool and the vmexit.c leaf-1 rewrite. We always stamp
+     * (not only on VM-token hits) because the firmware's socket may be
+     * correct for the host board yet wrong for the spoofed brand. */
     if (socket_idx != 0) {
-        /* Walk the pool to find the socket string; if it contains a VM
-         * token (QEMU "CPU0 Socket", Hyper-V "LGA 1150" phantom, etc.),
-         * replace it. Otherwise leave it. */
-        PUCHAR p = pool;
-        UCHAR cur = 1;
-        while (p < end) {
-            PUCHAR start = p;
-            while (p < end && *p != 0) ++p;
-            if (p >= end) break;
-            if (cur == socket_idx) {
-                if (dmi_string_has_vm_token(start, (ULONG)(p - start))) {
-                    const char *sock = "AM5";
-                    ULONG sl = 3;
-                    if (have_brand && (brand[0] == 'I' || brand[0] == 'i')) {
-                        sock = "LGA1700"; sl = 7;
-                    }
-                    replace_pool_string(pool, end, socket_idx, sock, sl);
-                }
-                break;
-            }
-            ++p;
-            if (p < end && *p == 0) break;
-            ++cur;
+        const char *sock = "AM5";
+        ULONG sl = 3;
+        if (have_brand && (brand[0] == 'I' || brand[0] == 'i')) {
+            sock = "LGA1700"; sl = 7;
+        } else if (have_brand &&
+                   (dmi_contains_ci(brand, sizeof(brand), "5800X", 5) ||
+                    dmi_contains_ci(brand, sizeof(brand), "5600X", 5))) {
+            sock = "AM4"; sl = 3;
         }
+        replace_pool_string(pool, end, socket_idx, sock, sl);
     }
 
     /* Manufacturer: first ASCII letter run of the seed-selected brand
@@ -527,9 +514,23 @@ patch_type7(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end)
 
     switch (level0) {
     case 0:  /* L1 */
-        sz16 = 0x0040;          /* 64 KB, 1-KB granularity */
-        sz32 = 64;              /* same, 1-KB granularity */
-        cache_type = 0x05;      /* Unified reporting */
+        /* Zen 4 runs a split L1: 32 KB I$ + 32 KB D$ per core. Honor the
+         * firmware's System Cache Type at 0x11 so a separate Instruction
+         * (0x03) or Data (0x04) structure gets 32 KB, while a single
+         * Unified (0x05) per-core-cluster entry keeps the combined 64 KB
+         * shape. A one-size-fits-all 64 KB stamp drifts from Zen 4's
+         * actual micro-architecture whenever firmware chose split
+         * reporting. */
+        if (fixed_len > 0x11 &&
+            (fixed[0x11] == 0x03 || fixed[0x11] == 0x04)) {
+            sz16 = 0x0020;      /* 32 KB, 1-KB granularity */
+            sz32 = 32;
+            cache_type = fixed[0x11];   /* preserve I$ / D$ marker */
+        } else {
+            sz16 = 0x0040;      /* 64 KB combined (Unified reporting) */
+            sz32 = 64;
+            cache_type = 0x05;
+        }
         break;
     case 1:  /* L2 */
         sz16 = 0x0400;          /* 1024 KB, 1-KB granularity */
@@ -537,7 +538,6 @@ patch_type7(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end)
         cache_type = 0x05;
         break;
     case 2:  /* L3 */
-    default:
         if (ryzen9) {
             /* 64 MB = 1024 * 64 KB; MSB=1 -> encoded 0x8400. */
             sz16 = (USHORT)(0x8000u | 1024u);
@@ -549,6 +549,11 @@ patch_type7(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end)
         }
         cache_type = 0x05;
         break;
+    default:
+        /* L4+ structures (level 3..7 in the Configuration encoding) do
+         * not exist on Zen 4; leave the firmware shape as-is rather
+         * than stamp an L3 size onto a level we don't model. */
+        return;
     }
 
     fixed[0x07] = (UCHAR)(sz16 & 0xFFu);
@@ -649,22 +654,108 @@ patch_type11(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end)
 }
 
 /* ------------------------------------------------------------------
+ * Pre-walk facts that Type 16 and Type 17 patchers need before their
+ * single-pass rewrite. Populated once by dmi_prewalk() so the main
+ * walker can run forward without a second scan.
+ *
+ * type17_count / type17_total_mb cover EVERY Type 17 in the blob
+ * (not only those whose current Physical Memory Array Handle matches
+ * the first Type 16): patch_type17 re-anchors each DIMM to the first
+ * Type 16, so the Type 16 count field must reflect that post-rewrite
+ * state rather than the firmware's pre-rewrite reference pattern.
+ * ------------------------------------------------------------------ */
+struct dmi_prewalk_info {
+    USHORT    type16_handle;
+    BOOLEAN   have_type16_handle;
+    ULONG     type17_count;
+    ULONGLONG type17_total_mb;
+};
+
+static void
+dmi_prewalk(PUCHAR blob, ULONG len, struct dmi_prewalk_info *info)
+{
+    RtlZeroMemory(info, sizeof(*info));
+    if (!blob || len < 4) return;
+
+    PUCHAR p   = blob;
+    PUCHAR end = blob + len;
+
+    while (p + 4 <= end) {
+        UCHAR type = p[0];
+        UCHAR flen = p[1];
+        if (flen < 4 || p + flen > end) return;
+
+        if (type == 16 && !info->have_type16_handle) {
+            info->type16_handle = (USHORT)p[0x02] | ((USHORT)p[0x03] << 8);
+            info->have_type16_handle = TRUE;
+        } else if (type == 17 && flen >= 0x0E) {
+            info->type17_count++;
+
+            /* Decode Size at 0x0C (2 bytes) into MB.
+             *   0x0000 => no module installed      (contributes 0)
+             *   0xFFFF => unknown                  (contributes 0)
+             *   0x7FFF => use Extended Size at 0x1C (MB, bit 31 reserved)
+             *   bit 15 set => kB granularity in bits [14:0]
+             *   bit 15 clear => MB granularity in bits [14:0]
+             */
+            USHORT sz = (USHORT)p[0x0C] | ((USHORT)p[0x0D] << 8);
+            ULONGLONG mb = 0;
+            if (sz == 0 || sz == 0xFFFF) {
+                mb = 0;
+            } else if (sz == 0x7FFF) {
+                if (flen >= 0x20) {
+                    ULONG esz = (ULONG)p[0x1C]
+                              | ((ULONG)p[0x1D] <<  8)
+                              | ((ULONG)p[0x1E] << 16)
+                              | ((ULONG)p[0x1F] << 24);
+                    mb = (ULONGLONG)(esz & 0x7FFFFFFFul);
+                }
+            } else if (sz & 0x8000u) {
+                /* kB; round up to MB so we never undercount capacity. */
+                ULONG kb = sz & 0x7FFFu;
+                mb = (ULONGLONG)((kb + 1023u) / 1024u);
+            } else {
+                mb = (ULONGLONG)(sz & 0x7FFFu);
+            }
+            info->type17_total_mb += mb;
+        }
+
+        if (type == 127) return;   /* end-of-table */
+
+        /* Skip past the string pool (double-NUL terminates). */
+        PUCHAR pool = p + flen;
+        while (pool + 1 < end) {
+            if (pool[0] == 0 && pool[1] == 0) break;
+            ++pool;
+        }
+        p = pool + 2;
+        if (p > end) return;
+    }
+}
+
+/* ------------------------------------------------------------------
  * Type 16 — Physical Memory Array
  *
  * Fixed-area offsets referenced:
  *   0x04 Location (byte)                     0x03 = System board
  *   0x05 Use (byte)                          0x03 = System memory
  *   0x06 Memory Error Correction (byte)      0x03 = None (desktop)
- *   0x07 Maximum Capacity (4 bytes, KB)      128 GB = 0x08000000 KB
+ *   0x07 Maximum Capacity (4 bytes, KB)      sum(Type 17 sizes) * 2 or
+ *                                            32 GB floor, whichever is
+ *                                            larger (escape to Extended
+ *                                            Max Capacity if > 2 TB)
  *   0x0B Memory Error Information Handle     0xFFFE = not provided
- *   0x0D Number of Memory Devices (2 bytes)  4 slots (typical AM5)
+ *   0x0D Number of Memory Devices (2 bytes)  actual count from prewalk
  *   0x0F Extended Maximum Capacity (8 bytes, SMBIOS 2.7+)
  *
- * No strings in this structure. We normalize the fixed area to a
- * plausible 128 GB / 4-slot / no-ECC desktop shape.
+ * No strings in this structure. Maximum Capacity and Number of Memory
+ * Devices are both derived from the Type 17 instances in the blob so
+ * the "sum of Type 17 <= Max Capacity" / "Max Devices >= actual count"
+ * spec invariants hold across arbitrary firmware DIMM topologies.
  * ------------------------------------------------------------------ */
 static void
-patch_type16(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end)
+patch_type16(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end,
+             const struct dmi_prewalk_info *info)
 {
     (void)pool; (void)end;
     if (fixed_len < 0x0F) return;
@@ -673,28 +764,67 @@ patch_type16(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end)
     fixed[0x05] = 0x03;         /* System memory */
     fixed[0x06] = 0x03;         /* No error correction (desktop) */
 
-    /* Maximum capacity: 128 GB expressed in KB. 128 * 1024 * 1024 =
-     * 0x08000000. Fits in the 4-byte field without the Extended
-     * Maximum Capacity escape (0x80000000). */
-    ULONG max_kb = 0x08000000u;
-    fixed[0x07] = (UCHAR)(max_kb        & 0xFFu);
-    fixed[0x08] = (UCHAR)((max_kb >>  8) & 0xFFu);
-    fixed[0x09] = (UCHAR)((max_kb >> 16) & 0xFFu);
-    fixed[0x0A] = (UCHAR)((max_kb >> 24) & 0xFFu);
+    /* Maximum capacity: max(sum_of_Type17_sizes * 2, 32 GB) in KB. The
+     * doubling leaves room so the "sum of Type 17 size <= Max Capacity"
+     * SMBIOS invariant holds even under a hot-upgrade, and the 32 GB
+     * floor keeps the field plausible when the blob has no Type 17s
+     * (sum_mb == 0 would otherwise produce a 0-byte Max Capacity). */
+    ULONGLONG total_mb = info ? info->type17_total_mb : 0ull;
+    ULONGLONG doubled_kb = total_mb * 2ull * 1024ull;   /* KB */
+    ULONGLONG floor_kb   = 32ull * 1024ull * 1024ull;   /* 32 GB in KB */
+    ULONGLONG max_kb64   = doubled_kb > floor_kb ? doubled_kb : floor_kb;
+
+    if (max_kb64 >= 0x80000000ull && fixed_len >= 0x17) {
+        /* Stamp the escape sentinel in the 32-bit field and put the
+         * actual capacity (in BYTES) in Extended Maximum Capacity. */
+        ULONG escape = 0x80000000u;
+        fixed[0x07] = (UCHAR)(escape         & 0xFFu);
+        fixed[0x08] = (UCHAR)((escape >>  8) & 0xFFu);
+        fixed[0x09] = (UCHAR)((escape >> 16) & 0xFFu);
+        fixed[0x0A] = (UCHAR)((escape >> 24) & 0xFFu);
+
+        ULONGLONG max_bytes = max_kb64 * 1024ull;
+        fixed[0x0F] = (UCHAR)(max_bytes         & 0xFFull);
+        fixed[0x10] = (UCHAR)((max_bytes >>  8) & 0xFFull);
+        fixed[0x11] = (UCHAR)((max_bytes >> 16) & 0xFFull);
+        fixed[0x12] = (UCHAR)((max_bytes >> 24) & 0xFFull);
+        fixed[0x13] = (UCHAR)((max_bytes >> 32) & 0xFFull);
+        fixed[0x14] = (UCHAR)((max_bytes >> 40) & 0xFFull);
+        fixed[0x15] = (UCHAR)((max_bytes >> 48) & 0xFFull);
+        fixed[0x16] = (UCHAR)((max_bytes >> 56) & 0xFFull);
+    } else {
+        /* Plain 32-bit field in KB. Saturate at 0x7FFFFFFF (just under
+         * the 0x80000000 escape sentinel) on an old SMBIOS 2.6 blob
+         * that cannot carry Extended Maximum Capacity. */
+        ULONG max_kb = max_kb64 > 0x7FFFFFFFull
+                           ? 0x7FFFFFFFul
+                           : (ULONG)max_kb64;
+        fixed[0x07] = (UCHAR)(max_kb         & 0xFFu);
+        fixed[0x08] = (UCHAR)((max_kb >>  8) & 0xFFu);
+        fixed[0x09] = (UCHAR)((max_kb >> 16) & 0xFFu);
+        fixed[0x0A] = (UCHAR)((max_kb >> 24) & 0xFFu);
+
+        /* Extended Maximum Capacity: zero when the plain field is used. */
+        if (fixed_len >= 0x17) {
+            RtlZeroMemory(fixed + 0x0F, 8);
+        }
+    }
 
     /* Error-info handle = 0xFFFE (no information) when the firmware left
      * it pointing at a VM-authored error-info structure. */
     fixed[0x0B] = 0xFE;
     fixed[0x0C] = 0xFF;
 
-    /* Number of memory devices = 4 slots (dual-channel, 2 DPC). */
-    fixed[0x0D] = 0x04;
-    fixed[0x0E] = 0x00;
-
-    /* Extended Maximum Capacity: zero when the plain field is used. */
-    if (fixed_len >= 0x17) {
-        RtlZeroMemory(fixed + 0x0F, 8);
-    }
+    /* Number of Memory Devices: count from the prewalk. patch_type17
+     * re-anchors every DIMM to this Type 16, so the count mirrors the
+     * post-rewrite reality rather than the firmware's original handles.
+     * Fall back to 1 (not 0) when the firmware had no Type 17s at all,
+     * so the field never reports zero devices. */
+    ULONG count = info ? info->type17_count : 0;
+    if (count == 0) count = 1;
+    if (count > 0xFFFFu) count = 0xFFFFu;
+    fixed[0x0D] = (UCHAR)(count         & 0xFFu);
+    fixed[0x0E] = (UCHAR)((count >> 8)  & 0xFFu);
 }
 
 /* ------------------------------------------------------------------
@@ -717,9 +847,71 @@ patch_type16(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end)
  *   0x1A Part Number (string)    <-- scrub
  * ------------------------------------------------------------------ */
 static void
-patch_type17(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end)
+patch_type17(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end,
+             const struct dmi_prewalk_info *info)
 {
     if (fixed_len < 0x1B) return;
+
+    /* Re-anchor the Physical Memory Array Handle at 0x04..0x05 to the
+     * Type 16 we normalized — otherwise firmware that pointed Type 17s
+     * at a different (VM-era) Memory Array handle keeps a dangling
+     * reference after patch_type16. */
+    if (info && info->have_type16_handle) {
+        fixed[0x04] = (UCHAR)(info->type16_handle        & 0xFFu);
+        fixed[0x05] = (UCHAR)((info->type16_handle >> 8) & 0xFFu);
+    }
+
+    /* Form Factor at 0x0E: stamp DIMM (0x09) unless the firmware
+     * already picked a plausible packaging code (0x09..0x0F covers
+     * DIMM, TSOP, Row of chips, RIMM, SODIMM, SRIMM, FB-DIMM). */
+    {
+        UCHAR ff = fixed[0x0E];
+        if (ff < 0x09u || ff > 0x0Fu) fixed[0x0E] = 0x09u;
+    }
+
+    /* Memory Type at 0x12: stamp DDR5 (0x22) unless firmware picked a
+     * plausible DDR-family code (0x18..0x22 covers DDR..DDR5). */
+    {
+        UCHAR mt = fixed[0x12];
+        if (mt < 0x18u || mt > 0x22u) fixed[0x12] = 0x22u;
+    }
+
+    /* Size at 0x0C (2 bytes): 16 GB expressed as 0x4000 MB (bit 15
+     * clear => MB units). Only stamp when firmware left it 0 (no
+     * module reported) or 0xFFFF (unknown) — a plausible non-zero
+     * value is preserved along with its Extended Size escape. */
+    {
+        USHORT sz = (USHORT)fixed[0x0C] | ((USHORT)fixed[0x0D] << 8);
+        if (sz == 0 || sz == 0xFFFF) {
+            fixed[0x0C] = (UCHAR)(0x4000u & 0xFFu);
+            fixed[0x0D] = (UCHAR)((0x4000u >> 8) & 0xFFu);
+        }
+    }
+
+    /* Speed at 0x15 (2 bytes, MT/s): 5200 (0x1450) for DDR5-5200.
+     * Only stamp when 0 or 0xFFFF (unknown). */
+    if (fixed_len > 0x16) {
+        USHORT sp = (USHORT)fixed[0x15] | ((USHORT)fixed[0x16] << 8);
+        if (sp == 0 || sp == 0xFFFF) {
+            fixed[0x15] = (UCHAR)(0x1450u & 0xFFu);
+            fixed[0x16] = (UCHAR)((0x1450u >> 8) & 0xFFu);
+        }
+    }
+
+    /* Total Width at 0x08 and Data Width at 0x0A (2 bytes each): 64
+     * bits each (non-ECC desktop DDR5). Only stamp when 0 or 0xFFFF. */
+    {
+        USHORT tw = (USHORT)fixed[0x08] | ((USHORT)fixed[0x09] << 8);
+        if (tw == 0 || tw == 0xFFFF) {
+            fixed[0x08] = 64;
+            fixed[0x09] = 0;
+        }
+        USHORT dw = (USHORT)fixed[0x0A] | ((USHORT)fixed[0x0B] << 8);
+        if (dw == 0 || dw == 0xFFFF) {
+            fixed[0x0A] = 64;
+            fixed[0x0B] = 0;
+        }
+    }
 
     /* The per-DIMM salt is the structure's Handle (fixed_len includes
      * bytes 0..3; fixed pointer starts at the Type byte). Using the
@@ -863,6 +1055,12 @@ cfp_dmi_patch_blob(PUCHAR blob, ULONG len)
 {
     if (!blob || len < 4) return;
 
+    /* Pre-walk: patch_type16 needs the DIMM count and total MB and
+     * patch_type17 needs the Type 16 handle; both must be known before
+     * either structure is rewritten. The main pass runs forward once. */
+    struct dmi_prewalk_info info;
+    dmi_prewalk(blob, len, &info);
+
     PUCHAR p   = blob;
     PUCHAR end = blob + len;
 
@@ -889,8 +1087,8 @@ cfp_dmi_patch_blob(PUCHAR blob, ULONG len)
         case 4:   patch_type4 (p, fixed_len, pool_start, pool_end); break;
         case 7:   patch_type7 (p, fixed_len, pool_start, pool_end); break;
         case 11:  patch_type11(p, fixed_len, pool_start, pool_end); break;
-        case 16:  patch_type16(p, fixed_len, pool_start, pool_end); break;
-        case 17:  patch_type17(p, fixed_len, pool_start, pool_end); break;
+        case 16:  patch_type16(p, fixed_len, pool_start, pool_end, &info); break;
+        case 17:  patch_type17(p, fixed_len, pool_start, pool_end, &info); break;
         case 19:  patch_type19(p, fixed_len, pool_start, pool_end); break;
         case 32:  patch_type32(p, fixed_len, pool_start, pool_end); break;
         case 127: return;   /* end of table */

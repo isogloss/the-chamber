@@ -234,67 +234,127 @@ cfp_scrub_acpi_aml_tokens(PUCHAR aml, ULONG len)
     }
 }
 
-/* Replace an ACPI-table OEM ID (6 ASCII bytes at offset 10) when it matches
- * a known VM-authored vendor signature. The substitute is picked from a
- * retail-firmware pool whose index comes from the per-install seed, so
- * two installs do not land on the same substitute. */
+/* Replace ACPI-header vendor fields when they match a known VM-authored
+ * signature: OEM ID (6 bytes @ 10), OEM Table ID (8 bytes @ 16), OEM
+ * Revision (4 bytes @ 24) and Creator ID (4 bytes @ 28). Substitutes
+ * come from retail-firmware pools indexed by the per-install seed so
+ * two installs do not land on the same shape. Checksum recompute is
+ * handled by the caller (see cfp_rewrite_acpi_table). */
 static void
 cfp_scrub_acpi_oem_id(PUCHAR tbl, ULONG tbl_len)
 {
     if (!tbl || tbl_len < 36) return;
 
-    /* Retail OEM-ID pool. All six-character ASCII shapes used by common
-     * x86 retail firmware — the audit explicitly calls for AMI / Insyde /
-     * Phoenix-shaped substitutes. The specific strings here are the
-     * retail OEM IDs that already ship in widely-deployed boards, so a
-     * real guest booting on that firmware produces the same bytes. */
-    static const UCHAR pool[4][6] = {
+    /* Retail OEM-ID pool (6 bytes @ offset 10). All six-character ASCII
+     * shapes used by common x86 retail firmware — the audit explicitly
+     * calls for AMI / Insyde / Phoenix-shaped substitutes. The specific
+     * strings here are the retail OEM IDs that already ship in widely-
+     * deployed boards, so a real guest booting on that firmware produces
+     * the same bytes. */
+    static const UCHAR oem_id_pool[4][6] = {
         { 'A','L','A','S','K','A' },  /* AMI reference codename */
         { 'I','N','S','Y','D','E' },  /* Insyde BIOS */
         { 'P','T','L','T','D',' ' },  /* Phoenix Technologies Ltd */
         { 'A','M','I',' ',' ',' ' },  /* American Megatrends */
     };
 
-    UCHAR *oem = tbl + 10;
-    BOOLEAN is_bochs = (oem[0]=='B' && oem[1]=='O' && oem[2]=='C' &&
-                        oem[3]=='H' && oem[4]=='S');
-    BOOLEAN is_bxpc  = (oem[0]=='B' && oem[1]=='X' && oem[2]=='P' &&
-                        oem[3]=='C');
-    if (!is_bochs && !is_bxpc) return;
+    /* Retail OEM-Table-ID pool (8 bytes @ offset 16). */
+    static const UCHAR oem_tbl_id_pool[4][8] = {
+        { 'A','L','A','S','K','A',' ',' ' },
+        { 'I','N','S','Y','D','E',' ',' ' },
+        { 'P','T','L','T','D',' ',' ',' ' },
+        { 'A','M','I',' ','B','O','A','R' },
+    };
+
+    /* Retail Creator-ID pool (4 bytes @ offset 28). QEMU/SeaBIOS stamps
+     * "BXPC" here; AMI/Insyde/Microsoft ASL compilers stamp their own. */
+    static const UCHAR creator_id_pool[4][4] = {
+        { 'M','S','F','T' },  /* Microsoft ASL compiler */
+        { 'I','N','T','L' },  /* Intel ASL compiler */
+        { 'A','M','I',' ' },  /* AMI ASL compiler */
+        { 'I','N','S','Y' },  /* Insyde ASL compiler */
+    };
 
     UCHAR seed[4];
-    if (!cfp_cfg_get(CFP_FID_VOLUME_SERIAL_0, seed, sizeof(seed))) {
-        /* Fall back to a fixed slot if the seed is unavailable; the rewrite
-         * is still better than leaving BOCHS/BXPC in place. */
-        RtlCopyMemory(oem, pool[0], 6);
-        return;
-    }
-    ULONG idx = (ULONG)seed[0] % (sizeof(pool) / sizeof(pool[0]));
-    RtlCopyMemory(oem, pool[idx], 6);
+    BOOLEAN have_seed = cfp_cfg_get(CFP_FID_VOLUME_SERIAL_0, seed, sizeof(seed));
+    if (!have_seed) RtlZeroMemory(seed, sizeof(seed));
 
-    /* Checksum byte (offset 9) is broken by the rewrite. Recompute it so
-     * the table still passes Microsoft's own ACPI validator — the probe
-     * does not care, but a conforming table is less likely to invite
-     * secondary attention. */
-    if (tbl_len >= 10) {
-        tbl[9] = 0;
-        UCHAR sum = 0;
-        for (ULONG i = 0; i < tbl_len; ++i) sum = (UCHAR)(sum + tbl[i]);
-        tbl[9] = (UCHAR)(0 - sum);
+    /* OEM ID @ 10..15: 6 bytes. Match BOCHS / BXPC / QEMU / OVMF / VMW. */
+    UCHAR *oem = tbl + 10;
+    BOOLEAN oem_hit =
+        (oem[0]=='B' && oem[1]=='O' && oem[2]=='C' && oem[3]=='H' && oem[4]=='S') ||
+        (oem[0]=='B' && oem[1]=='X' && oem[2]=='P' && oem[3]=='C') ||
+        (oem[0]=='Q' && oem[1]=='E' && oem[2]=='M' && oem[3]=='U') ||
+        (oem[0]=='O' && oem[1]=='V' && oem[2]=='M' && oem[3]=='F') ||
+        (oem[0]=='V' && oem[1]=='M' && oem[2]=='W');
+    if (oem_hit) {
+        ULONG idx = (ULONG)seed[0] % 4;
+        RtlCopyMemory(oem, oem_id_pool[idx], 6);
     }
+
+    /* OEM Table ID @ 16..23 and OEM Revision @ 24..27: sweep [16..27]
+     * for 4-byte VM tokens. QEMU stamps "BXPC" into the table-ID too. */
+    BOOLEAN tbl_id_hit = FALSE;
+    for (ULONG i = 16; i + 4 <= 28; ++i) {
+        if ((tbl[i+0]=='B' && tbl[i+1]=='O' && tbl[i+2]=='C' && tbl[i+3]=='H') ||
+            (tbl[i+0]=='B' && tbl[i+1]=='X' && tbl[i+2]=='P' && tbl[i+3]=='C') ||
+            (tbl[i+0]=='Q' && tbl[i+1]=='E' && tbl[i+2]=='M' && tbl[i+3]=='U') ||
+            (tbl[i+0]=='O' && tbl[i+1]=='V' && tbl[i+2]=='M' && tbl[i+3]=='F') ||
+            (tbl[i+0]=='V' && tbl[i+1]=='M' && tbl[i+2]=='W' && (tbl[i+3]==' ' || tbl[i+3]=='_'))) {
+            tbl_id_hit = TRUE;
+            break;
+        }
+    }
+    if (tbl_id_hit) {
+        ULONG idx = (ULONG)seed[1] % 4;
+        RtlCopyMemory(tbl + 16, oem_tbl_id_pool[idx], 8);
+        /* OEM Revision (4 bytes @ 24): overwrite with a seed-stable
+         * retail-shaped value (printable ASCII avoided — real revisions
+         * are usually small integers). */
+        tbl[24] = 0x01; tbl[25] = 0x00; tbl[26] = 0x00; tbl[27] = 0x00;
+    }
+
+    /* Creator ID @ 28..31: 4 bytes. Match BXPC / BOCH / QEMU / OVMF / VMW. */
+    UCHAR *creator = tbl + 28;
+    BOOLEAN creator_hit =
+        (creator[0]=='B' && creator[1]=='X' && creator[2]=='P' && creator[3]=='C') ||
+        (creator[0]=='B' && creator[1]=='O' && creator[2]=='C' && creator[3]=='H') ||
+        (creator[0]=='Q' && creator[1]=='E' && creator[2]=='M' && creator[3]=='U') ||
+        (creator[0]=='O' && creator[1]=='V' && creator[2]=='M' && creator[3]=='F') ||
+        (creator[0]=='V' && creator[1]=='M' && creator[2]=='W');
+    if (creator_hit) {
+        ULONG idx = (ULONG)seed[2] % 4;
+        RtlCopyMemory(creator, creator_id_pool[idx], 4);
+    }
+}
+
+/* Recompute the one-byte header checksum (@ offset 9) so that the sum of
+ * every byte in the table is zero mod 256. Called after any mutation to
+ * the table body — probes do not check this, but a conforming table is
+ * less likely to invite secondary attention. */
+static void
+cfp_recompute_acpi_checksum(PUCHAR tbl, ULONG tbl_len)
+{
+    if (!tbl || tbl_len < 10) return;
+    tbl[9] = 0;
+    UCHAR sum = 0;
+    for (ULONG i = 0; i < tbl_len; ++i) sum = (UCHAR)(sum + tbl[i]);
+    tbl[9] = (UCHAR)(0 - sum);
 }
 
 /* Top-level ACPI-provider rewriter. Called when the caller asked for a
  * specific table (Action == 1). The table starts with a 36-byte header
- * followed by the AML body. We scrub the OEM ID in the header and sweep
- * the body for VM-vendor NameSegs. */
+ * followed by the AML body. Sweep the body for VM-vendor NameSegs first,
+ * then scrub vendor fields in the header, then recompute the checksum so
+ * downstream mutations do not leave a stale sum. */
 static void
 cfp_rewrite_acpi_table(PUCHAR tbl, ULONG tbl_len)
 {
     if (!tbl || tbl_len < 36) return;
     __try {
-        cfp_scrub_acpi_oem_id(tbl, tbl_len);
         cfp_scrub_acpi_aml_tokens(tbl + 36, tbl_len - 36);
+        cfp_scrub_acpi_oem_id(tbl, tbl_len);
+        cfp_recompute_acpi_checksum(tbl, tbl_len);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         /* user buffer vanished mid-rewrite — nothing to do */
     }
@@ -302,11 +362,11 @@ cfp_rewrite_acpi_table(PUCHAR tbl, ULONG tbl_len)
 
 /* Enumeration-call (Action == 0) rewriter: TableBuffer is a packed array of
  * 4-byte table signatures. Rewrite the single most distinctive VM tell
- * ('WAET' — the QEMU/KVM "Windows ACPI Emulated Devices Table") to a
- * benign shape that is also present on retail (BGRT). Do not touch other
- * signatures: BGRT is present on both retail and VM firmware, so
- * substituting 'WAET' with 'BGRT' produces a duplicate line in the list
- * that is far less distinctive than the literal 'WAET' marker. */
+ * ('WAET' — the QEMU/KVM "Windows ACPI Emulated Devices Table") to FPDT
+ * (Firmware Performance Data Table). FPDT is optional on retail firmware
+ * and not duplicated by the baseline table set, so the substitution does
+ * not produce a duplicate entry — substituting into BGRT (which retail
+ * firmware already ships) would. */
 static void
 cfp_rewrite_acpi_enum(PUCHAR tbl, ULONG tbl_len)
 {
@@ -316,9 +376,9 @@ cfp_rewrite_acpi_enum(PUCHAR tbl, ULONG tbl_len)
         for (ULONG i = 0; i + 4 <= n; i += 4) {
             if (tbl[i+0] == 'W' && tbl[i+1] == 'A' &&
                 tbl[i+2] == 'E' && tbl[i+3] == 'T') {
-                tbl[i+0] = 'B';
-                tbl[i+1] = 'G';
-                tbl[i+2] = 'R';
+                tbl[i+0] = 'F';
+                tbl[i+1] = 'P';
+                tbl[i+2] = 'D';
                 tbl[i+3] = 'T';
             }
         }
@@ -430,9 +490,13 @@ cfp_slpi_cache_store(ULONG pid, const UCHAR *src, ULONG len)
 
     /* Prefer replacing an existing entry for the same PID over LRU — keeps
      * the cache behaving sensibly if a process re-queries after a buffer
-     * resize, and limits the cache to at most one line per PID. */
+     * resize, and limits the cache to at most one line per PID. A smaller
+     * subsequent read must not evict the fuller first snapshot: the
+     * "byte-identical across reads" guarantee for the stable-topology
+     * probe depends on the larger observation surviving. */
     for (ULONG i = 0; i < CFP_SLPI_CACHE_ENTRIES; ++i) {
         if (g_slpi_cache[i].in_use && g_slpi_cache[i].pid == pid) {
+            if (len < g_slpi_cache[i].length) return;
             victim = i;
             found_slot = TRUE;
             break;
@@ -1094,11 +1158,16 @@ rewrite_power_information(CFP_IC_CTX *ctx)
          * the SMBIOS rewrite already surfaces. */
         p[11] = 0;    /* ApmPresent       -> FALSE */
         /* UpsPresent (12) / ThermalControl (13) / ProcessorThrottle (14)
-         * / Min/MaxThrottle (15,16) — pass through; silicon reports them
-         * truthfully on Zen 4. */
-        /* FastSystemS4 (17) / Hiberboot (18) / WakeAlarmPresent (19) /
-         * AoAc (20) / DiskSpinDown (21) / HiberFileType (22) /
-         * AoAcConnectivitySupported (23) — pass through. */
+         * — pass through; silicon reports them truthfully on Zen 4. */
+        p[15] = 5;    /* ProcessorMinThrottle -> 5   (retail desktop) */
+        p[16] = 100;  /* ProcessorMaxThrottle -> 100 */
+        p[17] = 1;    /* FastSystemS4     -> TRUE  */
+        p[18] = 1;    /* Hiberboot        -> TRUE  */
+        p[19] = 0;    /* WakeAlarmPresent -> FALSE */
+        p[20] = 0;    /* AoAc             -> FALSE (desktop, not Modern Standby) */
+        /* DiskSpinDown (21) — pass through; depends on attached storage. */
+        p[22] = 1;    /* HiberFileType    -> 1 (NTFS hiberfile)   */
+        /* AoAcConnectivitySupported (23) — pass through. */
         /* spare3[6] at 24..29 — pass through. */
         p[30] = 0;    /* SystemBatteriesPresent -> FALSE (desktop shape) */
         /* BatteriesAreShortTerm (31) stays whatever the caller saw. */

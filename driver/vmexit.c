@@ -276,6 +276,13 @@ static void rewrite_leaf_8000001F(int regs[4])
 static void inject_db_if_tf(VMCB *vmcb)
 {
     if ((vmcb->save.rflags & RFLAGS_TF) != 0) {
+        /* Bare-metal delivery of a TF-triggered #DB latches DR6.BS (bit 14)
+         * before the handler runs (AMD APM Vol 2 13.1.1.3). SVM VMCB
+         * event-injection does not synthesize that bit, so set it here
+         * before writing event_inject; the rest of DR6 is left intact so
+         * any prior breakpoint-match state the guest expects to inspect
+         * (B0..B3, BD, BT) survives the injected trap. */
+        vmcb->save.dr6 |= (1ULL << 14);
         vmcb->ctl.event_inject = (1ULL << 31) | (3ULL << 8) | 1ULL;
     }
 }
@@ -559,6 +566,7 @@ static void handle_rdpmc(PER_CPU_CTX *ctx, VMCB *vmcb)
 
     /* RDPMC is one of the decoded intercepts with next_rip populated. */
     vmcb->save.rip = vmcb->ctl.next_rip;
+    inject_db_if_tf(vmcb);
 }
 
 /* ------------------------------------------------------------------ */
@@ -740,6 +748,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
      * advancing RIP, which short-circuited the #GP. */
     if (handle_msr_identity_rewrite(ctx, vmcb, msr, is_write)) {
         vmcb->save.rip = vmcb->ctl.next_rip;
+        inject_db_if_tf(vmcb);
         return;
     }
 
@@ -765,6 +774,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
             ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
         }
         vmcb->save.rip = vmcb->ctl.next_rip;
+        inject_db_if_tf(vmcb);
         return;
     }
 
@@ -809,6 +819,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
             ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
         }
         vmcb->save.rip = vmcb->ctl.next_rip;
+        inject_db_if_tf(vmcb);
         return;
     }
 
@@ -822,6 +833,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
             ctx->gpr_save[3] = 0;
         }
         vmcb->save.rip = vmcb->ctl.next_rip;
+        inject_db_if_tf(vmcb);
         return;
     }
 
@@ -846,6 +858,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
             ctx->gpr_save[3] = (ULONGLONG)(ULONG)(v >> 32);
         }
         vmcb->save.rip = vmcb->ctl.next_rip;
+        inject_db_if_tf(vmcb);
         return;
     }
 
@@ -864,6 +877,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
             ctx->gpr_save[3] = 0;
         }
         vmcb->save.rip = vmcb->ctl.next_rip;
+        inject_db_if_tf(vmcb);
         return;
     }
     if (msr == 0xC0010113UL) {
@@ -874,6 +888,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
             ctx->gpr_save[3] = (ULONGLONG)(ULONG)(v >> 32);
         }
         vmcb->save.rip = vmcb->ctl.next_rip;
+        inject_db_if_tf(vmcb);
         return;
     }
 
@@ -888,6 +903,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
             ctx->gpr_save[3] = (ULONGLONG)(ULONG)(v >> 32);
         }
         vmcb->save.rip = vmcb->ctl.next_rip;
+        inject_db_if_tf(vmcb);
         return;
     }
 
@@ -931,6 +947,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
                 ctx->gpr_save[3] = 0;
             }
             vmcb->save.rip = vmcb->ctl.next_rip;
+            inject_db_if_tf(vmcb);
             return;
         }
 
@@ -978,6 +995,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
     }
 
     vmcb->save.rip = vmcb->ctl.next_rip;
+    inject_db_if_tf(vmcb);
 }
 
 /* ------------------------------------------------------------------ */
