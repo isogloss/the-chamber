@@ -12,8 +12,27 @@
 
 #include "fingerprint_cfg.h"
 
-#define CFP_TAG         'cFPC'  /* appears as 'CPFc' in poolmon */
-#define CFG_BLOB_SIZE   632
+/* Pool tag strategy: at image compile time the tag is a neutral default
+ * that resembles a common storage/filter tag ('FsFl' → "lFsF" in poolmon).
+ * At runtime, as soon as we have a validated CFG blob, we switch to the
+ * per-install tag the launcher derived into CHAMBER_CFG_V2.pool_tag[].
+ * The compile-time literal was 'cFPC' ("CPFc" in poolmon) — a per-driver
+ * fingerprint that made the fp image stand out against the HV image's
+ * own randomized tags. Sourcing the tag from the same CFG array keeps
+ * every chamber-authored allocation under a single rotating identity. */
+static ULONG g_cfp_tag = CHAMBER_POOL_TAG;
+
+#define CFP_TAG         (g_cfp_tag)
+
+/* CFG blob is stored as a padded REG_BINARY whose on-the-wire length is
+ * jittered across installs. The launcher derives the pad length from
+ * CHAMBER_CFG_V2.driver_nonce modulo a small window so a scanner that
+ * matches on a fixed 632-byte blob size no longer fires. The authoritative
+ * payload length (CFG_BLOB_SIZE) is still 632 — the pad lives after it
+ * and is ignored by the walker. */
+#define CFG_BLOB_SIZE        632
+#define CFG_BLOB_MAX_PAD     64
+#define CFG_BLOB_MAX_LEN     (CFG_BLOB_SIZE + CFG_BLOB_MAX_PAD)
 
 /* Local cached copy. Allocated at cfp_cfg_load, freed at cfp_cfg_unload.
  * Reads are lock-free: the blob is only replaced on explicit reload, which
@@ -23,6 +42,11 @@
 static PUCHAR   g_cfg_blob    = NULL;
 static ULONG    g_cfg_len     = 0;
 static BOOLEAN  g_cfg_loaded  = FALSE;
+/* Tag the current blob was allocated under, captured before the
+ * per-install tag swap. ExFreePoolWithTag must match the allocator's
+ * tag, so cfp_cfg_unload uses this remembered value rather than the
+ * (now-swapped) g_cfp_tag. */
+static ULONG    g_cfg_blob_tag = 0;
 
 /* -------- offset table (byte-exact against CFG v2 wire format) ----- */
 
@@ -139,30 +163,60 @@ cfp_read_cfgblob(_In_  PUNICODE_STRING service_key,
         return status;
     }
 
-    if (full->Type != REG_BINARY || full->DataLength != CFG_BLOB_SIZE) {
+    /* Accept any REG_BINARY whose length is between CFG_BLOB_SIZE and
+     * CFG_BLOB_SIZE + CFG_BLOB_MAX_PAD. The launcher writes the actual
+     * payload plus a nonce-derived pad so a bare length match no longer
+     * identifies the chamber's CFG value. */
+    if (full->Type != REG_BINARY ||
+        full->DataLength < CFG_BLOB_SIZE ||
+        full->DataLength > CFG_BLOB_MAX_LEN) {
         ExFreePoolWithTag(full, CFP_TAG);
         return STATUS_INVALID_PARAMETER;
     }
 
-    PUCHAR blob = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, CFG_BLOB_SIZE, CFP_TAG);
+    ULONG alloc_tag = CFP_TAG;
+    PUCHAR blob = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, CFG_BLOB_SIZE, alloc_tag);
     if (!blob) {
         ExFreePoolWithTag(full, CFP_TAG);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlCopyMemory(blob, full->Data, CFG_BLOB_SIZE);
     ExFreePoolWithTag(full, CFP_TAG);
+    g_cfg_blob_tag = alloc_tag;
 
-    /* Validate magic + version + length. Launcher writes magic=0x32474643
-     * ('CFG2'), version=2, total_length=632. If any of those do not match
-     * we reject — falling back to defaults would make the two drivers
-     * disagree about identity, which defeats the whole wave. */
+    /* Validate magic/version/length against the authoritative values.
+     * The on-disk magic may be either the compile-time constant
+     * ('CFG2' = 0x32474643) or, when the launcher opts into magic
+     * rotation, the value in CHAMBER_CFG_V2.chamber_cfg_magic_override
+     * at offset 104. The second form lets the chamber ship an image
+     * whose CFG blob does not carry a static four-ASCII signature at
+     * offset 0. If neither matches, reject — a fallback to defaults
+     * would desync the HV and fp identities. */
     ULONG magic   = *(PULONG)(blob + OFF_MAGIC);
     ULONG version = *(PULONG)(blob + OFF_VERSION);
     ULONG tlen    = *(PULONG)(blob + OFF_TOTAL_LENGTH);
 
-    if (magic != 0x32474643UL || version != 2 || tlen != CFG_BLOB_SIZE) {
-        ExFreePoolWithTag(blob, CFP_TAG);
+    ULONGLONG magic_override = *(PULONGLONG)(blob + OFF_CFG_MAGIC_OVERRIDE);
+    ULONG magic_override_lo = (ULONG)(magic_override & 0xFFFFFFFFULL);
+
+    BOOLEAN magic_ok = (magic == 0x32474643UL) ||
+                       (magic_override_lo != 0 && magic == magic_override_lo);
+
+    if (!magic_ok || version != 2 || tlen != CFG_BLOB_SIZE) {
+        ExFreePoolWithTag(blob, alloc_tag);
+        g_cfg_blob_tag = 0;
         return STATUS_REVISION_MISMATCH;
+    }
+
+    /* Switch the active pool tag from the compile-time neutral default
+     * to the per-install tag the launcher derived. The fp driver's own
+     * allocations now share a prefix with the HV driver's randomized
+     * tags rather than wearing the hard-coded 'cFPC' giveaway. The six
+     * slots in pool_tag[] mirror the HV's subsystems; slot 5 ("dispatch")
+     * is the closest in role to the fp's control-device dispatch. */
+    ULONG new_tag = *(PULONG)(blob + OFF_POOL_TAG + 5 * sizeof(ULONG));
+    if (new_tag != 0) {
+        g_cfp_tag = new_tag;
     }
 
     *out_buf = blob;
@@ -198,11 +252,16 @@ cfp_cfg_unload(void)
 {
     if (g_cfg_blob) {
         RtlSecureZeroMemory(g_cfg_blob, g_cfg_len);
-        ExFreePoolWithTag(g_cfg_blob, CFP_TAG);
+        /* Use the tag the blob was allocated under, not the possibly-
+         * updated g_cfp_tag — they differ once the per-install tag
+         * swap ran. */
+        ExFreePoolWithTag(g_cfg_blob,
+                          g_cfg_blob_tag ? g_cfg_blob_tag : CFP_TAG);
         g_cfg_blob = NULL;
     }
-    g_cfg_len    = 0;
-    g_cfg_loaded = FALSE;
+    g_cfg_len      = 0;
+    g_cfg_loaded   = FALSE;
+    g_cfg_blob_tag = 0;
 }
 
 /* ---------------- accessor ---------------- */

@@ -11,9 +11,61 @@
 
 PER_CPU_CTX *g_cpu_ctx = NULL;
 ULONG        g_cpu_count = 0;
+/* Wave 8: remember the (jittered) size the per_cpu_ctx array was
+ * allocated with, so svm_shutdown_all_cpus frees exactly what
+ * svm_init_all_cpus allocated. Tracked separately from g_cpu_count
+ * because the allocation may be padded past the strict ctx-array
+ * footprint. */
+static SIZE_T g_cpu_ctx_alloc_size = 0;
 
 extern NTSTATUS svm_init_bitmaps(void);  /* svm_vmcb.c */
 extern VOID     svm_free_bitmaps(void);
+
+/* Wave 8: per-boot jitter seed.
+ *
+ * The identity.c subsystem exposes a persistent seed that would make
+ * jitter stable across reboots; wiring to it is a cross-bucket
+ * dependency, so we fall back to a captured-once boot snapshot here.
+ * Either way, every allocation site that calls boot_jitter_seed()
+ * within a single boot sees the same value, so repeated reseeds
+ * produce the same sizes (idempotent) while differing across boots
+ * (no deterministic signature at a fixed offset). */
+static ULONG g_boot_jitter_seed = 0;
+
+static ULONG boot_jitter_seed(void)
+{
+    if (g_boot_jitter_seed == 0) {
+        LARGE_INTEGER tc;
+        KeQueryTickCount(&tc);
+        /* XOR with a stack address to defeat an attacker who can read
+         * the tick count: the KASLR base of the driver's stack is not
+         * observable from user-mode telemetry. */
+        g_boot_jitter_seed =
+            tc.LowPart ^ (ULONG)(ULONG_PTR)&g_boot_jitter_seed;
+        if (g_boot_jitter_seed == 0) g_boot_jitter_seed = 0xA5A5A5A5UL;
+    }
+    return g_boot_jitter_seed;
+}
+
+/* Derive a jittered size.
+ *
+ * Input: base (bytes), span (bytes), site_tag (any 32-bit site-unique
+ * value). Output: base + N*align, where N is in [0, span/align) picked
+ * by the LCG state seeded from boot_jitter_seed ^ site_tag. The pick
+ * is deterministic within a boot for a given site_tag, so repeated
+ * stealth_apply / reseed passes allocate the same size. */
+static SIZE_T jitter_size(SIZE_T base, SIZE_T span,
+                          SIZE_T align, ULONG site_tag)
+{
+    ULONG s = boot_jitter_seed() ^ site_tag;
+    ULONG slots;
+    if (align == 0 || span == 0) return base;
+    slots = (ULONG)(span / align);
+    if (slots == 0) return base;
+    /* LCG (Numerical Recipes); one step is enough to mix site_tag in. */
+    s = s * 1664525UL + 1013904223UL;
+    return base + (SIZE_T)(s % slots) * align;
+}
 
 BOOLEAN svm_is_supported(void) {
     int regs[4];
@@ -71,15 +123,26 @@ static NTSTATUS svm_preallocate_cpu(ULONG cpu_index) {
      * memory the HV owns. Without this, VM_HSAVE_PA.host_rsp saves a
      * pointer into the loader thread's kernel stack, which the OS
      * reclaims for other calls after DriverEntry returns -- first
-     * VMEXIT then reads garbage.  16 KiB per CPU, 16-byte aligned.
+     * VMEXIT then reads garbage.
      *
-     * BIG POOL NOTE: 16 KiB > 4080 (POOL_BUDDY_MAX, ~PAGE_SIZE -
-     * POOL_HEADER_SIZE), so this allocation lands in the big-pool
-     * allocator and is enumerable via !bigpool / SystemBigPoolInformation.
-     * Pool-tag randomization alone does NOT hide it; the allocation
-     * size + address pattern remains identifiable. Accept the surface
-     * and keep the tag indistinguishable from common minifilter tags. */
-    ctx->host_stack_size = 16 * 1024;
+     * Wave 8: this allocation lands in the big-pool allocator (size
+     * well above POOL_BUDDY_MAX ~ 4080) and is enumerable via
+     * SystemBigPoolInformation. A fixed 16 KiB * g_cpu_count cluster
+     * under one tag is a strict Microsoft-driver anti-pattern -- no
+     * shipping Microsoft driver allocates a run of same-size NPP big
+     * blocks that matches CPU count. Jitter the size per site_tag so
+     * each CPU's stack lands in a different big-pool bucket, and keep
+     * the sizes seed-derived (deterministic within a boot, differs
+     * across boots) so repeated reseeds do not grow or leak memory.
+     *
+     * Base 16 KiB + up to 16 KiB jitter in 4 KiB steps. Minimum 16 KiB
+     * stays safely above the deepest vmrun-loop call chain the HV
+     * takes, and 4 KiB alignment keeps the pool header aligned the way
+     * ExAllocatePool2 expects. site_tag mixes CPU index into the seed
+     * so each CPU's stack gets a different size. */
+    ctx->host_stack_size = jitter_size(
+        16 * 1024, 16 * 1024, 4 * 1024,
+        0x48535448u /* 'HSTH' */ ^ cpu_index);
     ctx->host_stack_va   = ExAllocatePool2(
         POOL_FLAG_NON_PAGED, ctx->host_stack_size,
         POOLTAG("host_stack"));
@@ -125,21 +188,39 @@ NTSTATUS svm_init_all_cpus(void) {
     /* BIG POOL NOTE: PER_CPU_CTX is ~1 KiB/CPU; on a 7700X (16 logical
      * CPUs) the array is ~16 KiB. Comfortably above POOL_BUDDY_MAX
      * (~4080), so this allocation sits in big pool and is enumerable
-     * via !bigpool / SystemBigPoolInformation. No way around this -- a
-     * per-CPU array of variable size has to be a single allocation for
-     * cache-line adjacency. Accept the surface. */
+     * via !bigpool / SystemBigPoolInformation.
+     *
+     * Wave 8: pad the allocation by a seed-derived amount past the
+     * strict per-CPU footprint so the NPP block size is not exactly
+     * sizeof(PER_CPU_CTX) * KeQueryActiveProcessorCount(). That exact
+     * product is a Microsoft-driver anti-pattern (no shipping
+     * Microsoft driver allocates a single NPP block whose size is an
+     * integer multiple of its own PER_CPU_CTX layout -- that layout is
+     * project-specific). The padding is simply unused trailing bytes;
+     * callers index g_cpu_ctx[0..g_cpu_count) the same way. */
+    {
+        SIZE_T base = sizeof(PER_CPU_CTX) * g_cpu_count;
+        g_cpu_ctx_alloc_size = jitter_size(
+            base, 8 * 1024, PAGE_SIZE,
+            0x58435043u /* 'CPCX' */);
+    }
     g_cpu_ctx = (PER_CPU_CTX *)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
-        sizeof(PER_CPU_CTX) * g_cpu_count,
+        g_cpu_ctx_alloc_size,
         POOLTAG("per_cpu_ctx"));
-    if (!g_cpu_ctx) return STATUS_INSUFFICIENT_RESOURCES;
+    if (!g_cpu_ctx) {
+        g_cpu_ctx_alloc_size = 0;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    /* Only zero the active ctx range; the jitter padding is left as the
+     * ExAllocatePool2 POOL_FLAG_NON_PAGED result already zeroes it. */
     RtlZeroMemory(g_cpu_ctx, sizeof(PER_CPU_CTX) * g_cpu_count);
 
     /* PASSIVE_LEVEL: warm the shared MSRPM/IOPM bitmaps once. */
     st = svm_init_bitmaps();
     if (!NT_SUCCESS(st)) {
         ExFreePoolWithTag(g_cpu_ctx, POOLTAG("per_cpu_ctx"));
-        g_cpu_ctx = NULL; g_cpu_count = 0;
+        g_cpu_ctx = NULL; g_cpu_count = 0; g_cpu_ctx_alloc_size = 0;
         return st;
     }
 
@@ -271,6 +352,7 @@ NTSTATUS svm_shutdown_all_cpus(void) {
     ExFreePoolWithTag(g_cpu_ctx, POOLTAG("per_cpu_ctx"));
     g_cpu_ctx = NULL;
     g_cpu_count = 0;
+    g_cpu_ctx_alloc_size = 0;
     CHAMBER_LOG("SVM shutdown complete\n");
     return STATUS_SUCCESS;
 }

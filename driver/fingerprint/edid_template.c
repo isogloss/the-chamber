@@ -28,6 +28,31 @@
 
 #include "fingerprint_cfg.h"
 
+/* Pool of plausible panel-model strings used to fill the monitor-name
+ * detailed descriptor (descriptor 1). Each entry is up to 12 ASCII chars;
+ * the writer pads with spaces and terminates with 0x0A at offset 0x59. The
+ * index is seed-derived so cross-boot EDID reads differ in the model name
+ * as well as the manufacturer / product / serial fields. No real-vendor
+ * marketing names: generic panel-code shapes only. */
+static const char * const g_edid_model_pool[] = {
+    "LP270Q7HM",
+    "LM250WR3 ",
+    "M270QAN02",
+    "LM340UW1 ",
+    "LTN156HL02",
+    "N133HCE-E",
+    "B140HAN06",
+    "UW344FHD",
+    "QX270 M01",
+    "WQ320 D4",
+    "IPS QHD",
+    "IPS 4K",
+    "VA 1440P",
+    "OLED FHD",
+    "HVA 165HZ",
+    "FHD GAME",
+};
+
 /* 128-byte canonical EDID for a 1920x1080@60Hz LCD, with manufacturer /
  * product / serial fields we overwrite from the seed. The remaining bytes
  * encode a reasonable set of standard + detailed timing blocks and base
@@ -111,14 +136,36 @@ cfp_edid_build(UCHAR out_128[128])
     out_128[0x10] = 1 + (nonce[9] % 52);
     out_128[0x11] = 25 + (nonce[10] % 9);
 
-    /* Detailed descriptor 3 (serial string) at offset 0x6C + 5 = 0x71.
-     * Overwrite 12 ASCII chars from nonce[11..15] + a repeating pad. */
+    /* Monitor-name descriptor (descriptor 1) payload at
+     * 0x36 + 18*1 + 5 = 0x4D..0x58, terminator 0x0A at 0x59. Pick a
+     * model string from the pool via the seed, pad to 12 chars. */
+    {
+        ULONG pool_n = sizeof(g_edid_model_pool) / sizeof(g_edid_model_pool[0]);
+        ULONG idx = ((ULONG)nonce[0] + (ULONG)nonce[1] + (ULONG)nonce[2]) % pool_n;
+        const char *model = g_edid_model_pool[idx];
+        ULONG len = 0;
+        while (len < 12 && model[len] != '\0') {
+            out_128[0x4D + len] = (UCHAR)model[len];
+            ++len;
+        }
+        for (; len < 12; ++len) {
+            out_128[0x4D + len] = ' ';
+        }
+        out_128[0x59] = 0x0A;
+    }
+
+    /* Serial-string descriptor (descriptor 2) payload at
+     * 0x36 + 18*2 + 5 = 0x5F..0x6A, terminator 0x0A at 0x6B. The earlier
+     * revision targeted 0x71, which lands inside descriptor 3 (the Range
+     * Limits block) and produced a structurally invalid EDID. Overwrite
+     * 12 ASCII chars from nonce[11..14] via a small LCG so each boot
+     * yields a distinct string while leaving the range limits intact. */
     static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     ULONG s = ((ULONG)nonce[11] << 24) | ((ULONG)nonce[12] << 16) |
               ((ULONG)nonce[13] <<  8) | ((ULONG)nonce[14]      );
     for (ULONG i = 0; i < 12; ++i) {
         s = s * 1664525UL + 1013904223UL;
-        out_128[0x71 + i] = (UCHAR)alphabet[(s >> 16) % 36];
+        out_128[0x5F + i] = (UCHAR)alphabet[(s >> 16) % 36];
     }
 
     /* Checksum: sum of bytes 0..127 must be 0 mod 256. */

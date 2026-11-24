@@ -183,6 +183,7 @@ static void stop_watchdog(void);
 static void reset_watchdog(void);
 
 static void scrub_service_key_name(PDRIVER_OBJECT Driver);
+static void scrub_object_header_name_info(PDRIVER_OBJECT Driver);
 
 /* --- Crash marker file ops (via ZwCreateFile / ZwWriteFile) --- */
 static NTSTATUS crash_marker_present(BOOLEAN *out_present)
@@ -513,6 +514,93 @@ static void scrub_service_key_name(PDRIVER_OBJECT Driver)
     }
 }
 
+/* --- Wave 8: scrub OBJECT_HEADER_NAME_INFO.Name ----------------------
+ *
+ * The Phase 1.7 ServiceKeyName scrub above only touched DriverExtension
+ * ->ServiceKeyName. Every named kernel object ALSO carries an
+ * OBJECT_HEADER_NAME_INFO behind its OBJECT_HEADER, and for a
+ * DRIVER_OBJECT that holds the "\Driver\<svc>" directory path that
+ * ObQueryNameInformation returns. Leaving it intact means an enumerator
+ * walking \Driver still sees the original (launcher-randomized) service
+ * name. We overwrite the Name buffer in place with the same LCG noise
+ * ServiceKeyName uses so a reader sees a well-formed but meaningless
+ * UNICODE_STRING.
+ *
+ * Layout on Win10/11 x64 (stable across build numbers since at least
+ * 1607): OBJECT_HEADER is 0x30 bytes immediately before the object
+ * body; OBJECT_HEADER::InfoMask lives at offset 0x1A. Bit 1 of
+ * InfoMask indicates OBJECT_HEADER_NAME_INFO is present; the structure
+ * sits either 0x20 bytes (no CreatorInfo) or 0x40 bytes (CreatorInfo
+ * present ahead of it) before the OBJECT_HEADER. OBJECT_HEADER_NAME_INFO
+ * itself is 0x20 bytes: Directory(PVOID), Name(UNICODE_STRING=0x10),
+ * ReferenceCount+Reserved(0x8).
+ *
+ * The write is wrapped in SEH -- if a future Windows build shifts the
+ * layout this routine aborts cleanly instead of a KMODE bugcheck. The
+ * scrub is best-effort, not safety-critical. */
+#define CHAMBER_OBJECT_HEADER_BODY_OFFSET  0x30u
+#define CHAMBER_OBJECT_HEADER_INFOMASK_OFF 0x1Au
+#define CHAMBER_OBJHDR_INFOMASK_CREATOR    0x01u
+#define CHAMBER_OBJHDR_INFOMASK_NAME       0x02u
+#define CHAMBER_OBJHDR_NAME_INFO_SIZE      0x20u
+#define CHAMBER_OBJHDR_CREATOR_INFO_SIZE   0x20u
+
+typedef struct _CHAMBER_OBJECT_HEADER_NAME_INFO_LAYOUT {
+    PVOID          Directory;
+    UNICODE_STRING Name;
+    LONG           ReferenceCount;
+    ULONG          Reserved;
+} CHAMBER_OBJECT_HEADER_NAME_INFO_LAYOUT;
+
+static void scrub_object_header_name_info(PDRIVER_OBJECT Driver)
+{
+    PUCHAR obj_header;
+    UCHAR  info_mask;
+    PUCHAR name_info_base;
+    CHAMBER_OBJECT_HEADER_NAME_INFO_LAYOUT *ni;
+    USHORT chars, i;
+    ULONGLONG seed;
+
+    if (!Driver) return;
+
+    __try {
+        obj_header = (PUCHAR)Driver - CHAMBER_OBJECT_HEADER_BODY_OFFSET;
+        info_mask  = obj_header[CHAMBER_OBJECT_HEADER_INFOMASK_OFF];
+        if (!(info_mask & CHAMBER_OBJHDR_INFOMASK_NAME)) {
+            /* No NameInfo header -- nothing to scrub. */
+            return;
+        }
+        name_info_base = obj_header -
+            ((info_mask & CHAMBER_OBJHDR_INFOMASK_CREATOR)
+              ? (CHAMBER_OBJHDR_CREATOR_INFO_SIZE +
+                 CHAMBER_OBJHDR_NAME_INFO_SIZE)
+              :  CHAMBER_OBJHDR_NAME_INFO_SIZE);
+        ni = (CHAMBER_OBJECT_HEADER_NAME_INFO_LAYOUT *)name_info_base;
+
+        if (!ni->Name.Buffer || !ni->Name.MaximumLength) return;
+        /* Sanity: Name.Buffer must live in kernel address space.
+         * Canonical x64 kernel VAs start at 0xFFFF800000000000. */
+        if ((ULONG_PTR)ni->Name.Buffer < 0xFFFF800000000000ULL) return;
+
+        chars = ni->Name.MaximumLength / sizeof(WCHAR);
+        seed  = __rdtsc() ^ (ULONGLONG)(ULONG_PTR)ni;
+        for (i = 0; i + 1 < chars; i++) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            ni->Name.Buffer[i] = (WCHAR)(L'a' + ((seed >> 33) % 26));
+        }
+        if (chars > 0) ni->Name.Buffer[chars - 1] = L'\0';
+        if (chars > 0) {
+            ni->Name.Length = (USHORT)((chars - 1) * sizeof(WCHAR));
+        } else {
+            ni->Name.Length = 0;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* A future Windows layout change or a poisoned InfoMask lands
+         * here; the scrub is best-effort, swallow and proceed. */
+        return;
+    }
+}
+
 /* --- IRP handlers --- */
 NTSTATUS IrpCreateClose(PDEVICE_OBJECT Device, PIRP Irp)
 {
@@ -795,8 +883,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
 
     /* Phase 1.7: scrub the kernel-owned ServiceKeyName copy. Done early so
      * that even a concurrent enumerator racing with our bringup sees noise
-     * instead of the registry subkey name. */
+     * instead of the registry subkey name.
+     *
+     * Wave 8: also scrub the OBJECT_HEADER_NAME_INFO for the DRIVER_OBJECT
+     * itself. Without this, an enumerator walking \Driver resolves our
+     * DRIVER_OBJECT by its registered service-key name even though the
+     * ServiceKeyName copy is now noise. Both scrubs are best-effort and
+     * never fail the load path. */
     scrub_service_key_name(Driver);
+    scrub_object_header_name_info(Driver);
 
     /* Version dispatch on the seed-derived config blob. The wave-3 v1
      * shape is retired in place: the installer must have produced v2

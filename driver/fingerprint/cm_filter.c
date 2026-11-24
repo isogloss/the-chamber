@@ -38,6 +38,7 @@ BOOLEAN cfp_edid_build(UCHAR out_128[128]);
 
 static LARGE_INTEGER   g_cookie    = {0};
 static BOOLEAN         g_registered = FALSE;
+static PDRIVER_OBJECT  g_driver    = NULL;
 
 /* --- helpers --- */
 
@@ -153,6 +154,28 @@ compute_wsz_override(PCUNICODE_STRING key_path, PCUNICODE_STRING value_name,
         if (cfp_cfg_get(CFP_FID_PRODUCT_ID, ov, 24)) {
             wchars = bytes_to_wstring(ov, 24, out_buf, out_chars);
             return (wchars + 1) * sizeof(WCHAR);
+        }
+    }
+
+    /* --- HKLM\SYSTEM\HardwareConfig\{GUID}\LastConfig ---
+     * Early-boot code paths (and some driver installers) read the
+     * machine-identity SMBIOS blob from this value verbatim. The
+     * launcher's offline rewrite does not cover it because the GUID
+     * subkey is created per-boot by HAL. Treat the value as a REG_SZ
+     * HardwareConfig identifier; rewrite to the MachineGuid shape so
+     * a later code path that joins this against the Cryptography key
+     * sees a consistent pair. */
+    if (unicode_contains_i(key_path, L"SYSTEM\\HardwareConfig") &&
+        unicode_equals_i(value_name, L"LastConfig")) {
+        if (cfp_cfg_get(CFP_FID_MACHINE_GUID, ov, 16)) {
+            WCHAR full[80];
+            guid_to_wstring(ov, full);
+            ULONG n = 0;
+            for (ULONG i = 0; full[i] && n + 1 < out_chars; ++i) {
+                out_buf[n++] = full[i];
+            }
+            if (out_chars) out_buf[n] = 0;
+            return (n + 1) * sizeof(WCHAR);
         }
     }
 
@@ -279,6 +302,22 @@ patch_kvpi(PKEY_VALUE_PARTIAL_INFORMATION kvpi,
             }
             break;
         }
+        /* HardwareConfig\{GUID}\LastConfig in its REG_BINARY shape: the
+         * real bare-metal SMBIOS blob (or a short identifier under a
+         * HAL-written GUID subkey). If the value is at least 16 bytes
+         * we overwrite the first 16 with the SMBIOS UUID so a sample
+         * that hashes the blob picks up our seed-derived identity
+         * rather than the host's. */
+        if (unicode_contains_i(key_path, L"SYSTEM\\HardwareConfig") &&
+            unicode_equals_i(value_name, L"LastConfig")) {
+            if (kvpi->DataLength >= 16) {
+                UCHAR uuid[16];
+                if (cfp_cfg_get(CFP_FID_SMBIOS_UUID, uuid, sizeof(uuid))) {
+                    RtlCopyMemory(kvpi->Data, uuid, 16);
+                }
+            }
+            break;
+        }
         break;
     }
 
@@ -334,11 +373,24 @@ cfp_cm_callback(PVOID ctx, PVOID arg1, PVOID arg2)
 }
 
 NTSTATUS
-cfp_cm_register(void)
+cfp_cm_register(PDRIVER_OBJECT drv)
 {
     UNICODE_STRING alt;
-    RtlInitUnicodeString(&alt, L"331456.1.0.0");
-    NTSTATUS s = CmRegisterCallbackEx(cfp_cm_callback, &alt, NULL, NULL,
+    /* Microsoft-registered Security Enhancer altitude range is
+     * 330000-339998. Picking 331457.0 (just above the FsFilter Security
+     * Enhancer minimum) keeps us inside an allocated range so a reseed
+     * does not collide with an in-tree filter the launcher can observe;
+     * the real per-install allocation is a build-time swap target.
+     * 331456.1.0.0 (the previous literal) is not in the allocation table
+     * and a strict Windows build (one with cmchkr enabled) refuses to
+     * register against it. */
+    RtlInitUnicodeString(&alt, L"331457.0");
+    /* Pass the real DriverObject (not NULL) so the Cm manager holds a
+     * lifetime reference on the driver image; an unload race (where the
+     * image is about to leave while a post-op callback is in flight)
+     * then blocks on the Cm reference instead of racing on NULL. */
+    g_driver = drv;
+    NTSTATUS s = CmRegisterCallbackEx(cfp_cm_callback, &alt, drv, NULL,
                                       &g_cookie, NULL);
     if (NT_SUCCESS(s)) g_registered = TRUE;
     return s;

@@ -47,6 +47,18 @@
 volatile LONG   g_pause_active = 0;
 volatile LONG64 g_dump_seq     = 0;
 
+/* Originator CPU for the current KeIpiGenericCall broadcast. We record it
+ * before broadcast so the park worker can skip itself: on this CPU the
+ * guest VMMCALL that invoked us may have originated from an injected
+ * thread running under g_target_cr3, in which case the stale VMCB.save.cr3
+ * would otherwise cause the originator to count itself as "parked" even
+ * though it is actively executing the dump handler in host context. (The
+ * audit's self-deadlock variant that this guards against assumes a true
+ * rendezvous-spin pause; today's broadcast is non-blocking, but skipping
+ * the originator still gives g_parked_count the correct "how many sibling
+ * vCPUs were racing" meaning rather than off-by-one.) */
+static volatile LONG g_pause_originator_cpu = -1;
+
 /* --- Externs we use from the kernel, without pulling a full header. --- */
 NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId,
                                                 PEPROCESS *Process);
@@ -570,6 +582,18 @@ static ULONGLONG snapshot_locked(PEPROCESS target,
     if (target_cr3 == 0) return 0;
     g_pause_target_cr3 = target_cr3;
 
+    /* Detection-surface note (Wave-7 audit, "pause-world-dump" bucket):
+     * KeIpiGenericCall drops a correlated per-CPU interrupt which shows
+     * up as a simultaneous InterruptCount / DpcCount bump on every CPU
+     * in SystemProcessorPerformanceInformation. A real fix (spread the
+     * arrivals, or hide the bump) lives in the driver-stealth-hide
+     * bucket; flagging only here. All of the time-counter back-fill
+     * fixes the audit calls for (TSC_OFFSET, KTHREAD.KernelTime/UserTime,
+     * KPRCB.DpcTime/IdleTime, KUSER_SHARED_DATA.TickCountQuad,
+     * ThreadState anomaly) assume a multi-millisecond actual pause
+     * window; the current broadcast is non-blocking (see KNOWN BUG at
+     * top of file) and therefore has no such window to compensate for.
+     * They re-appear once the targeted-DPC rewrite lands. */
     matched = pause_broadcast_and_wait();
 
     if (probe_user_buf) {
@@ -600,6 +624,7 @@ static ULONGLONG snapshot_locked(PEPROCESS target,
 record_history:
 
     InterlockedExchange(&g_pause_active, 0);
+    InterlockedExchange(&g_pause_originator_cpu, -1);
 
     KeQuerySystemTimePrecise(&now);
     RtlZeroMemory(&rec, sizeof(rec));

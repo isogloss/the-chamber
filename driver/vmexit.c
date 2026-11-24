@@ -41,6 +41,7 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb);
 static void handle_rdpmc(PER_CPU_CTX *ctx, VMCB *vmcb);
 static void handle_vmmcall(PER_CPU_CTX *ctx, VMCB *vmcb);
 static void handle_npf(PER_CPU_CTX *ctx, VMCB *vmcb);
+static void handle_vmrun(PER_CPU_CTX *ctx, VMCB *vmcb);
 
 /* Zen 4 extended Core PMC: PerfCtrCoreI lives at the odd MSR
  * 0xC0010201 + 2*i. Six counters total on family 19h. */
@@ -126,6 +127,10 @@ void vmexit_handler(PER_CPU_CTX *ctx)
 
     case VMEXIT_NPF:
         handle_npf(ctx, vmcb);
+        break;
+
+    case VMEXIT_VMRUN:
+        handle_vmrun(ctx, vmcb);
         break;
 
     default:
@@ -309,6 +314,50 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
         rewrite_leaf_8000001F(regs);
     }
 
+    /* Wave 8: vendor-gate + SVM-cap scrub (unconditional, runs after any
+     * optional rewrite_leaf_* call above).
+     *
+     * Leaf 0x8000_0001 ECX advertises long-mode extensions. On bare-metal
+     * Zen 4 bit 2 (SVM) is set. We intercept VMRUN as code 0x80 and have
+     * no faithful SVM emulation, so leaving SVM advertised makes a guest
+     * `wrmsr(EFER, ... | SVME)` followed by VMRUN see an arch-illegal #UD
+     * from our default handler -- a tell. The least-invasive repair is to
+     * clear the advertised SVM capability so a well-behaved guest never
+     * tries VMRUN. Pin TOPO_EXT (bit 22) and PerfCtrExtCore (bit 23) on
+     * (they are set by Zen 4 bare metal; forcing them keeps the ECX image
+     * stable even on partial-passthrough paths). */
+    if (leaf == 0x80000001U) {
+        regs[2] &= ~(1u << 2);                       /* SVM off           */
+        regs[2] |=  (1u << 22) | (1u << 23);         /* TOPO_EXT / PCtrEx */
+    }
+
+    /* Leaf 0x15 (TSC/crystal-clock ratio) and 0x16 (processor base/max/bus
+     * MHz) are Intel-only reporting leaves. Zen 4 does not define them; a
+     * host passthrough would return either zeros or garbage depending on
+     * micro-arch revision, and either is a vendor-mismatch tell on an
+     * AuthenticAMD vendor string. Force them to all-zero explicitly.
+     * Leaf 0x1F (extended Intel topology) is similarly Intel-only; zero
+     * it too on the AMD vendor path. */
+    if (leaf == 0x15U || leaf == 0x16U || leaf == 0x1FU) {
+        regs[0] = 0;
+        regs[1] = 0;
+        regs[2] = 0;
+        regs[3] = 0;
+    }
+
+    /* Leaf 0x8000_001F (encrypted-memory capabilities): preserve SME
+     * (EAX bit 0) from host passthrough because Zen 4 silicon reports it
+     * as-defined, but clear SEV (bit 1), SEV-ES (bit 3) and the SEV-related
+     * ASID / cbit fields in EBX/ECX/EDX. A guest that reads a non-zero
+     * SEV ASID count would infer either an EPYC-class part (wrong SKU) or
+     * an active SEV guest context (wrong environment). */
+    if (leaf == 0x8000001FU) {
+        regs[0] &= 0x1u;    /* keep SME, drop SEV / SEV-ES / SNP / VMPL */
+        regs[1] = 0;        /* Cbit position / PhysAddrReduction / ASIDs */
+        regs[2] = 0;        /* total encrypted guests */
+        regs[3] = 0;        /* minimum SEV-enabled ASID */
+    }
+
     if (leaf >= 0x40000000U && leaf <= 0x4FFFFFFFU) {
         /* Zero the entire hypervisor-reserved range so VMAware / pafish
          * probes at well-known leaves (0x40000080, 0x40000100) see the
@@ -482,10 +531,19 @@ static BOOLEAN handle_msr_identity_rewrite(PER_CPU_CTX *ctx, VMCB *vmcb,
 
 /* EFER writes must update VMCB.save.efer, not the host's physical EFER.
  * At VMEXIT the CPU is in host context, so WRMSR mutates host policy.
- * Whitelist only the bits AMD permits the guest to flip, force SVME on. */
-#define EFER_WRITABLE_MASK (EFER_SVME | 0x1ULL /*SCE*/ | (1ULL<<8) /*LME*/ | \
-                            (1ULL<<10) /*LMA*/ | (1ULL<<11) /*NXE*/ |        \
-                            (1ULL<<12) /*LMSLE*/ | (1ULL<<13) /*FFXSR*/ |    \
+ * Whitelist only the bits AMD permits the guest to flip, force SVME on.
+ *
+ * Wave 8 correction: the prior mask had comment-vs-bit errors. AMD APM Vol 2
+ * section 3.1.7 defines:
+ *   bit  0  SCE   bit  8  LME   bit 10  LMA   bit 11  NXE
+ *   bit 12  SVME  bit 13  LMSLE bit 14  FFXSR bit 15  TCE
+ * The previous mask labelled bit 12 as "LMSLE" (it is SVME, already covered
+ * by EFER_SVME), bit 13 as "FFXSR" (it is LMSLE), and omitted FFXSR (bit 14)
+ * entirely so a guest WRMSR that turned on FFXSR silently dropped the bit on
+ * read-back -- a Zen 4 round-trip tell. */
+#define EFER_WRITABLE_MASK (EFER_SVME | 0x1ULL /*SCE*/ | (1ULL<<8)  /*LME*/  | \
+                            (1ULL<<10) /*LMA*/ | (1ULL<<11) /*NXE*/ |         \
+                            (1ULL<<13) /*LMSLE*/ | (1ULL<<14) /*FFXSR*/ |     \
                             (1ULL<<15) /*TCE*/)
 
 /* VMCB clean-bits group 1 ("Interrupts" on AMD APM Table 15-5 but on
@@ -504,14 +562,19 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
      *   0x40000000..0x400001FF - Hyper-V enlightenment + crash +
      *                            re-enlightenment + synthetic debug
      *   0x4B564D00..0x4B564DFF - KVM
-     * Absorb writes; return zero on reads. */
+     *
+     * Wave 8: bare-metal AuthenticAMD raises #GP(0) on both RDMSR and
+     * WRMSR to these ranges because they are not implemented. Silently
+     * returning zero / absorbing writes was itself a hypervisor tell:
+     * every real AMD part faults, every HV-with-hint-serving stub does
+     * not. Inject #GP(0) here instead; the guest observes an
+     * instruction fault at the RDMSR/WRMSR site, which is the correct
+     * bare-metal shape. Do NOT advance RIP -- the fault fires at the
+     * MSR instruction itself. */
     if ((msr >= 0x40000000U && msr <= 0x400001FFU) ||
         (msr >= 0x4B564D00U && msr <= 0x4B564DFFU)) {
-        if (!is_write) {
-            vmcb->save.rax   = 0;
-            ctx->gpr_save[3] = 0;
-        }
-        vmcb->save.rip = vmcb->ctl.next_rip;
+        /* event_inject: valid | ec_valid | type=exception | vector=0x0D (#GP) */
+        vmcb->ctl.event_inject = (1ULL << 31) | (1ULL << 11) | (3ULL << 8) | 13ULL;
         return;
     }
 
@@ -561,8 +624,19 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
             vmcb->save.efer = value;
             vmcb->ctl.vmcb_clean_bits &= ~VMCB_CLEAN_BIT_CR;
         } else {
-            /* Report the guest's stored EFER view with SVME masked out. */
-            value = vmcb->save.efer & ~EFER_SVME;
+            /* Wave 8: report vmcb->save.efer AS-STORED, SVME included.
+             *
+             * Prior behaviour masked SVME off on read while the write path
+             * force-ORs it on. A guest sequence `v = rdmsr(EFER); wrmsr(EFER, v)`
+             * would therefore observe value churn: bit 12 read as 0, written
+             * back as 0, then re-set to 1 inside the VMCB -- next read still
+             * 0. The lie is self-consistent but the mere act of SVME flapping
+             * through the shadow leaves a diff that a paravirt probe can
+             * catch by comparing (rdmsr post-wrmsr == wrmsr-input). Returning
+             * the stored value makes the round-trip stable. The host's own
+             * SVME policy remains unaffected because this handler never
+             * touches physical EFER. */
+            value = vmcb->save.efer;
             vmcb->save.rax   = (ULONGLONG)(ULONG)value;
             ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
         }
@@ -570,8 +644,11 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
         return;
     }
 
-    if (msr == (ULONG)SVM_MSR_VM_HSAVE_PA || msr == (ULONG)SVM_MSR_VM_CR) {
-        /* Hide our SVM host-save pointer and VM control from the guest. */
+    if (msr == (ULONG)SVM_MSR_VM_HSAVE_PA) {
+        /* Hide our SVM host-save pointer from the guest. HSAVE_PA reads
+         * back as 0 on a Zen 4 part when the OS has not programmed SVM
+         * host-save, which matches a guest that sees SVM-capability
+         * cleared in CPUID (see handle_cpuid). */
         if (!is_write) {
             vmcb->save.rax   = 0;
             ctx->gpr_save[3] = 0;
@@ -580,12 +657,53 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
         return;
     }
 
-    /* SMM_ADDR (0xC0010112), SMM_MASK (0xC0010113): hide SMM configuration;
-     * guest reads the bare-metal default of 0 and writes are absorbed. */
-    if (msr == 0xC0010112UL || msr == 0xC0010113UL) {
+    if (msr == (ULONG)SVM_MSR_VM_CR) {
+        /* Wave 8: VM_CR (0xC001_0114) must look like firmware that locked
+         * SVM OFF via the standard BIOS toggle. Bits per APM Vol 2 15.30:
+         *   bit 0 DPD, bit 1 R_INIT, bit 2 DIS_A20M
+         *   bit 3 LOCK  (writes to VM_CR take effect; cleared only by
+         *                           a non-standard pre-boot path -- stays 1
+         *                           in-session on virtually every retail box)
+         *   bit 4 SVMDIS (SVM disabled in BIOS)
+         * Report LOCK=1 and SVMDIS=1 on read so a guest that reads VM_CR to
+         * confirm the cleared CPUID SVM bit sees a consistent "firmware
+         * disabled SVM" story. A zero return here (with SVM cleared in
+         * CPUID) would be an inconsistent pairing that no shipping BIOS
+         * produces. Absorb writes -- LOCK=1 means a well-behaved guest
+         * would see its writes rejected; silent-absorb is the closest
+         * bare-metal-shaped outcome without an #GP. */
+        if (!is_write) {
+            ULONGLONG v = (1ULL << 3) | (1ULL << 4);   /* LOCK | SVMDIS */
+            vmcb->save.rax   = (ULONGLONG)(ULONG)v;
+            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(v >> 32);
+        }
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+
+    /* Wave 8: SMM_ADDR (0xC001_0112) / SMM_MASK (0xC001_0113). A zero return
+     * is itself anomalous: every shipping Zen 4 board ships with TSEG
+     * programmed by the UEFI SMM relocation path, so SMM_ADDR holds the
+     * TSEG base and SMM_MASK has the AVALID (bit 0) and TVALID (bit 1) bits
+     * set plus the TSEG size field populated. Return a plausible non-zero
+     * pair: SMM_ADDR = 0x0 (keep base stub-visible) + SMM_MASK with AVALID
+     * and TVALID set and a 2 MiB TSEG size encoded in bits [17:2]. This is
+     * conservative -- it does not leak the real host TSEG geometry, and it
+     * matches the "SMM is set up" story every retail firmware emits. */
+    if (msr == 0xC0010112UL) {
         if (!is_write) {
             vmcb->save.rax   = 0;
             ctx->gpr_save[3] = 0;
+        }
+        vmcb->save.rip = vmcb->ctl.next_rip;
+        return;
+    }
+    if (msr == 0xC0010113UL) {
+        if (!is_write) {
+            /* AVALID | TVALID | TSEG size encoded (2 MiB region). */
+            ULONGLONG v = (1ULL << 0) | (1ULL << 1) | (0x15ULL << 2);
+            vmcb->save.rax   = (ULONGLONG)(ULONG)v;
+            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(v >> 32);
         }
         vmcb->save.rip = vmcb->ctl.next_rip;
         return;
@@ -606,13 +724,53 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
     }
 
     if (!handle_msr_allowlist_pass(msr)) {
-        /* Unknown MSR: absorb write, return 0 on read.  Never let the
-         * guest choose which MSR the host RDMSRs / WRMSRs. */
-        if (!is_write) {
-            vmcb->save.rax   = 0;
-            ctx->gpr_save[3] = 0;
+        /* Wave 8: inject #GP(0) by default on unknown MSRs rather than
+         * silent-zero. Serving zero for every unmapped encoding is a
+         * uniform-shape tell: bare metal faults, hints-serving stubs
+         * return zero. The default is now the bare-metal shape and
+         * explicit MSRs that *should* read zero live above (VM_HSAVE_PA,
+         * SMM_ADDR). Writes still absorb -- a stray WRMSR must not reach
+         * the host -- but by injecting #GP we also make the guest see
+         * the fault the hardware would have produced.
+         *
+         * Microcode-patch level (MSR 0x8B) is a frequent probe target.
+         * On AuthenticAMD a RDMSR 0x8B returns the patch id in EAX with
+         * EDX=0. Serve a plausible shadow (Zen 4 B2 published patch id)
+         * on read; absorb writes. Keep the value conservative and NOT
+         * derived from seeded entropy. */
+        if (msr == 0x8BUL) {
+            if (!is_write) {
+                /* AMD family 0x19 model 0x61 stepping 2 (Raphael B2)
+                 * published microcode patch level. Low 32 bits only;
+                 * EDX is 0 on AMD per architecture. */
+                ULONGLONG v = 0x0A601206ULL;
+                vmcb->save.rax   = (ULONGLONG)(ULONG)v;
+                ctx->gpr_save[3] = 0;
+            }
+            vmcb->save.rip = vmcb->ctl.next_rip;
+            return;
         }
-        vmcb->save.rip = vmcb->ctl.next_rip;
+
+        /* MSR 0x17 (IA32_PLATFORM_ID) is Intel-only. On AuthenticAMD it
+         * raises #GP; honour that shape rather than returning a shadow. */
+        if (msr == 0x17UL) {
+            vmcb->ctl.event_inject =
+                (1ULL << 31) | (1ULL << 11) | (3ULL << 8) | 13ULL;
+            return;
+        }
+
+        if (is_write) {
+            /* Absorb the write -- never choose the MSR hw actually sees --
+             * but still inject #GP so a guest that WRMSRs an unknown
+             * encoding sees the same fault as bare metal. */
+            vmcb->ctl.event_inject =
+                (1ULL << 31) | (1ULL << 11) | (3ULL << 8) | 13ULL;
+            return;
+        }
+
+        /* Read: inject #GP(0) at the RDMSR site. */
+        vmcb->ctl.event_inject =
+            (1ULL << 31) | (1ULL << 11) | (3ULL << 8) | 13ULL;
         return;
     }
 
@@ -653,6 +811,11 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
 #define THE_CHAMBER_HCALL_VERSION     1
 #define THE_CHAMBER_HCALL_SHUTDOWN    2
 /* CHAMBER_HCALL_DUMP_CR3 (3) is defined in dump.h and dispatched below. */
+/* Wave 8: slot for the syscall-rewrite result descriptor. See the
+ * handle_vmmcall case comment for the binding contract. */
+#ifndef THE_CHAMBER_HCALL_REWRITE_RESULT
+#define THE_CHAMBER_HCALL_REWRITE_RESULT  5
+#endif
 
 static void inject_ud(VMCB *vmcb) {
     /* AMD Table 15-5: event_inject layout:
@@ -685,6 +848,16 @@ static void handle_vmmcall(PER_CPU_CTX *ctx, VMCB *vmcb)
         break;
     case THE_CHAMBER_HCALL_SHUTDOWN:
         InterlockedExchange(&ctx->shutdown_requested, 1);
+        break;
+    case THE_CHAMBER_HCALL_REWRITE_RESULT:
+        /* Wave 8: slot reserved for the syscall-rewrite path. The
+         * operator-side rewrite loop in launcher/injector hands a
+         * result descriptor back through this hypercall (RCX = result
+         * pointer, RDX = size). The handler currently returns success
+         * unconditionally -- the rewrite path consumer in another
+         * bucket binds the real sink. Keep the slot wired so the guest
+         * hypercall does not land in the inject_ud default. */
+        vmcb->save.rax = 0;
         break;
     case CHAMBER_HCALL_SELF_INTEGRITY:
         /* Phase 7.2 code-integrity self-check. First call latches the
@@ -736,6 +909,25 @@ static void handle_vmmcall(PER_CPU_CTX *ctx, VMCB *vmcb)
     }
 
     vmcb->save.rip = vmcb->ctl.next_rip;
+}
+
+/* ------------------------------------------------------------------ */
+/* VMRUN intercept (AMD 15.5).                                        */
+/*                                                                    */
+/* Wave 8: handle_cpuid clears the SVM capability bit at CPUID        */
+/* 0x8000_0001 ECX[2], and handle_msr reports VM_CR with LOCK=1 and   */
+/* SVMDIS=1. A well-behaved guest will therefore never issue VMRUN:   */
+/* it believes SVM is unavailable. A probe that issues VMRUN anyway   */
+/* -- to force the "am I in a VM" oracle -- would, on bare metal with */
+/* SVM disabled by firmware, see #UD (the processor raises #UD on     */
+/* VMRUN when EFER.SVME is clear). Model that exactly by injecting    */
+/* #UD at the current RIP without advancing. */
+/* ------------------------------------------------------------------ */
+
+static void handle_vmrun(PER_CPU_CTX *ctx, VMCB *vmcb)
+{
+    UNREFERENCED_PARAMETER(ctx);
+    vmexit_inject_ud(vmcb);
 }
 
 /* ------------------------------------------------------------------ */

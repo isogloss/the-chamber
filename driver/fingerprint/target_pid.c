@@ -17,14 +17,21 @@
 #define CFP_TAG                      'cFPC'
 #define CFP_MAX_PIDS                 32
 
-/* IOCTL control codes. Device type 0x8001 (not 0x8000 — reserve a distinct
- * device-type nibble from the HV driver's IOCTL space so a routing mistake
- * in the launcher cannot accidentally hit a HV IOCTL). */
-#define CFP_IOCTL_DEVICE_TYPE        0x8001
+/* IOCTL control codes. Use FILE_DEVICE_UNKNOWN (0x22), the standard for
+ * a custom control device — the previous 0x8001 was one nibble away
+ * from the HV driver's 0x8000 and a cross-driver correlator could pair
+ * them on that distance alone. FILE_DEVICE_UNKNOWN is also what
+ * IoCreateDeviceSecure in entry.c uses, so the control-code header
+ * check (IoValidateDeviceIoControlAccess for buffered-IO IOCTLs) now
+ * passes verbatim rather than only by accident. */
+#define CFP_IOCTL_DEVICE_TYPE        FILE_DEVICE_UNKNOWN
 
 #define IOCTL_CFP_ADD_PID       CTL_CODE(CFP_IOCTL_DEVICE_TYPE, 0x801, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 #define IOCTL_CFP_REMOVE_PID    CTL_CODE(CFP_IOCTL_DEVICE_TYPE, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS)
-#define IOCTL_CFP_QUERY_LIST    CTL_CODE(CFP_IOCTL_DEVICE_TYPE, 0x803, METHOD_BUFFERED, FILE_READ_ACCESS)
+/* QUERY_LIST removed: it was readable by any admin/SYSTEM sample and
+ * leaked the spoof-PID set verbatim. The launcher does not need to read
+ * its own PIDs back from the driver — it holds them locally. See
+ * target_pid.c history for the removed dispatch case. */
 #define IOCTL_CFP_CLEAR         CTL_CODE(CFP_IOCTL_DEVICE_TYPE, 0x804, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 typedef struct _CFP_IOCTL_PID {
@@ -151,7 +158,6 @@ cfp_target_handle_ioctl(_In_ PIRP irp,
     ULONG   code     = iosp->Parameters.DeviceIoControl.IoControlCode;
     PVOID   buf      = irp->AssociatedIrp.SystemBuffer;
     ULONG   in_len   = iosp->Parameters.DeviceIoControl.InputBufferLength;
-    ULONG   out_len  = iosp->Parameters.DeviceIoControl.OutputBufferLength;
     NTSTATUS status  = STATUS_INVALID_DEVICE_REQUEST;
 
     *info = 0;
@@ -171,20 +177,15 @@ cfp_target_handle_ioctl(_In_ PIRP irp,
         break;
     }
 
-    case IOCTL_CFP_QUERY_LIST: {
-        if (out_len < sizeof(CFP_IOCTL_LIST)) { status = STATUS_BUFFER_TOO_SMALL; break; }
-        CFP_IOCTL_LIST *out = (CFP_IOCTL_LIST *)buf;
-        HANDLE snap[CFP_MAX_PIDS];
-        ULONG n = cfp_target_snapshot(snap, CFP_MAX_PIDS);
-        out->count = n;
-        for (ULONG i = 0; i < n; ++i) {
-            out->pids[i] = (ULONG)(ULONG_PTR)snap[i];
-        }
-        for (ULONG i = n; i < CFP_MAX_PIDS; ++i) out->pids[i] = 0;
-        *info = sizeof(CFP_IOCTL_LIST);
-        status = STATUS_SUCCESS;
-        break;
-    }
+    /* IOCTL_CFP_QUERY_LIST deliberately removed: a readable spoof list
+     * is a correlator any admin/SYSTEM process (including an arbitrary
+     * sample launched outside the launcher) could query to enumerate
+     * every PID the chamber is spoofing. The launcher holds the PID
+     * set in its own memory; it does not need to read it back from the
+     * driver. If a future diagnostic needs the list, gate the dispatch
+     * on a CFG_V2 shared-secret handshake (nonce derived from
+     * CHAMBER_CFG_V2.seed, exchanged over a METHOD_IN_DIRECT buffer),
+     * not on admin/SYSTEM access. */
 
     case IOCTL_CFP_CLEAR:
         cfp_target_cleanup();

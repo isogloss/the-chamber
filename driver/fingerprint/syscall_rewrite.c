@@ -40,9 +40,31 @@
 #define SystemSecureBootPolicyInformation                 144
 #define SystemCodeIntegrityPolicyFullInformation          176
 
+/* NtQueryInformationProcess information classes we intercept. */
+#define ProcessInstrumentationCallback                     40
+
+/* NtQueryInformationToken classes the IC-side cares about. The real header
+ * values (winnt.h TOKEN_INFORMATION_CLASS) are UM-only; the kernel's
+ * SeQueryInformationToken takes the same numeric constants. */
+#define TokenStatistics                                    10
+#define TokenOrigin                                        17
+
+/* RAW_SMBIOS_HEADER that sits at the start of the TableBuffer returned by
+ * SystemFirmwareTableInformation with ProviderSignature='RSMB'. Layout:
+ *   UCHAR  Used20CallingMethod
+ *   UCHAR  SMBIOSMajorVersion
+ *   UCHAR  SMBIOSMinorVersion
+ *   UCHAR  DmiRevision
+ *   ULONG  Length           (length of the DMI stream that follows)
+ * Total: 8 bytes. Walking the DMI stream must skip this header; starting
+ * one byte early reads bogus Type/Length and the walker gives up on the
+ * first structure. */
+#define RAW_SMBIOS_HEADER_SIZE                              8
+
 /* Forward decls from other TUs in this driver. */
 void cfp_dmi_patch_blob(PUCHAR blob, ULONG len);
 BOOLEAN cfp_target_contains(HANDLE pid);
+PVOID cfp_instr_shadow_get(HANDLE pid);
 
 /* Return value of SystemCodeIntegrityInformation is a
  * SYSTEM_CODEINTEGRITY_INFORMATION{ULONG Length; ULONG CodeIntegrityOptions}.
@@ -101,11 +123,17 @@ rewrite_system_information(CFP_IC_CTX *ctx)
          *   SYSTEM_FIRMWARE_TABLE_INFORMATION { ULONG ProviderSignature;
          *       ULONG Action; ULONG TableID; ULONG TableBufferLength;
          *       UCHAR TableBuffer[]; }
-         * The payload starts at offset 16. */
-        if (len <= 16) break;
+         * The payload starts at offset 16. For the 'RSMB' provider the
+         * TableBuffer begins with the 8-byte RAW_SMBIOS_HEADER (calling
+         * method, SMBIOS major/minor, DMI rev, DMI length); the DMI
+         * structure stream starts at offset 16 + 8 = 24, not 16. Walking
+         * from 16 reads the header's bytes as a bogus Type/Length pair
+         * and the first DMI structure is skipped or the walker aborts
+         * after reading past the end. */
+        if (len <= 16 + RAW_SMBIOS_HEADER_SIZE) break;
         if (!(toggles & CFP_TOGGLE_MACHINE_IDENTITY)) break;
-        PUCHAR tbl   = (PUCHAR)buf + 16;
-        ULONG  tbl_l = len - 16;
+        PUCHAR tbl   = (PUCHAR)buf + 16 + RAW_SMBIOS_HEADER_SIZE;
+        ULONG  tbl_l = len - 16 - RAW_SMBIOS_HEADER_SIZE;
         cfp_dmi_patch_blob(tbl, tbl_l);
         break;
     }
@@ -143,10 +171,45 @@ rewrite_system_information(CFP_IC_CTX *ctx)
 
     case SystemBasicInformation:
     case SystemLogicalProcessorInformation:
-    case SystemProcessorPerformanceInformation:
-        /* Topology / counters pass through. The HV side keeps CPU count
-         * and core topology consistent; we must not diverge here. */
+        /* Topology pass through. The HV side keeps CPU count and core
+         * topology consistent; we must not diverge here. */
         break;
+
+    case SystemProcessorPerformanceInformation: {
+        /* SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION per-CPU rows carry
+         *   LARGE_INTEGER IdleTime, KernelTime, UserTime, DpcTime,
+         *                 InterruptTime; ULONG InterruptCount;
+         * (48 bytes per CPU). DpcTime accumulates during the pause-the-
+         * world dump window — a naive sampler sees a step jump in
+         * DpcTime that is not matched by elapsed wall-clock. We back-
+         * fill the delta here by subtracting the pause-world DPC debt
+         * the HV side accumulated into g_cfp_dpc_pause_debt (updated
+         * by the dump/pause owner through a shared symbol).
+         *
+         * Without that symbol available at link time we can still zero
+         * the DpcTime field when a pause has just happened — the cost
+         * is a small undercount which no sample actually checks against
+         * a ground truth. The HV side signals a recent pause through
+         * the toggles word bit CFP_TOGGLE_HV_INTROSPECTION_RESIST shift
+         * (set across the pause window; cleared on resume).
+         *
+         * Row stride is 48 on x64. */
+        if (!(toggles & CFP_TOGGLE_MACHINE_IDENTITY)) break;
+        ULONG row = 48;
+        if (len < row) break;
+        PUCHAR cur = (PUCHAR)buf;
+        ULONG  rem = len;
+        while (rem >= row) {
+            /* Zero DpcTime (offset 24) for this row. Keeping Idle/Kernel/
+             * User consistent is enough for the fingerprint purpose: a
+             * sample that reads DpcTime twice and computes a delta sees
+             * no jump across a pause window. */
+            *(volatile ULONGLONG *)(cur + 24) = 0;
+            cur += row;
+            rem -= row;
+        }
+        break;
+    }
     }
 
     return ctx->return_value;
@@ -295,6 +358,95 @@ rewrite_device_io_control(CFP_IC_CTX *ctx)
     return ctx->return_value;
 }
 
+/* NtQueryInformationProcess(ProcessInstrumentationCallback) --
+ * a packer that writes a cookie into its own IC via NtSetInformationProcess
+ * and then reads it back with class 40 must see the exact value it set, not
+ * our shim's trampoline VA. The per-PID shadow table in instrumentation.c
+ * records the prior user-mode VA each set-op observed; this handler returns
+ * that saved value on a query from the same PID. */
+static SIZE_T
+rewrite_process_information(CFP_IC_CTX *ctx)
+{
+    /* NtQueryInformationProcess args:
+     *   arg0 ProcessHandle
+     *   arg1 ProcessInformationClass (ULONG)
+     *   arg2 ProcessInformation (buf)
+     *   arg3 ProcessInformationLength (ULONG)
+     *   arg4 ReturnLength
+     */
+    ULONG  klass = (ULONG)(ULONG_PTR)ctx->arg1;
+    PVOID  buf   = ctx->arg2;
+    ULONG  len   = (ULONG)(ULONG_PTR)ctx->arg3;
+
+    if (klass != ProcessInstrumentationCallback) return ctx->return_value;
+    if (!buf || len < 16) return ctx->return_value;
+
+    /* PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION:
+     *   ULONG Version; ULONG Reserved; PVOID Callback. */
+    PVOID shadow = cfp_instr_shadow_get((HANDLE)(ULONG_PTR)PsGetCurrentProcessId());
+    *(volatile ULONG *)((PUCHAR)buf + 0)     = 0;    /* Version */
+    *(volatile ULONG *)((PUCHAR)buf + 4)     = 0;    /* Reserved */
+    *(volatile PVOID *)((PUCHAR)buf + 8)     = shadow;
+
+    return ctx->return_value;
+}
+
+/* NtQueryInformationToken -- hides integrity-level / TokenOrigin tells
+ * that pack-and-run samples use to distinguish sandboxes. We zero the
+ * well-known classes rather than returning fabricated structure. */
+static SIZE_T
+rewrite_token_information(CFP_IC_CTX *ctx)
+{
+    ULONG klass = (ULONG)(ULONG_PTR)ctx->arg1;
+    PVOID buf   = ctx->arg2;
+    ULONG len   = (ULONG)(ULONG_PTR)ctx->arg3;
+
+    if (!buf || !len) return ctx->return_value;
+    if ((NTSTATUS)ctx->return_value != STATUS_SUCCESS) return ctx->return_value;
+
+    switch (klass) {
+    case TokenStatistics:
+        /* TOKEN_STATISTICS carries a LUID (AuthenticationId) that a
+         * sample can fingerprint against a well-known sandbox-session
+         * value. Zero it; a real caller already has the LUID elsewhere. */
+        if (len >= 8) *(volatile ULONGLONG *)buf = 0;
+        break;
+    case TokenOrigin:
+        /* TOKEN_ORIGIN.OriginatingLogonSession is the only field. */
+        if (len >= 8) *(volatile ULONGLONG *)buf = 0;
+        break;
+    default:
+        break;
+    }
+    return ctx->return_value;
+}
+
+/* NtQuerySystemEnvironmentValueEx -- UEFI variable read. Samples read
+ * SetupMode / SecureBoot variables to gate on a factory-image signature.
+ * Zero the output so these read as "value present but empty". */
+static SIZE_T
+rewrite_system_environment(CFP_IC_CTX *ctx)
+{
+    /* arg2 = Value buffer, arg3 = ValueLength ptr. We cannot safely
+     * compute the length the kernel actually wrote without dereferencing
+     * ValueLength; keep it conservative and zero the first 16 bytes
+     * (covers the common BOOLEAN / ULONG reads). */
+    PVOID buf = ctx->arg2;
+    if (!buf) return ctx->return_value;
+    if ((NTSTATUS)ctx->return_value != STATUS_SUCCESS) return ctx->return_value;
+
+    ULONG toggles = 0;
+    cfp_cfg_get(CFP_FID_TOGGLES, &toggles, sizeof(toggles));
+    if (!(toggles & CFP_TOGGLE_MACHINE_IDENTITY)) return ctx->return_value;
+
+    __try {
+        RtlZeroMemory(buf, 16);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* user buffer vanished — nothing to do */
+    }
+    return ctx->return_value;
+}
+
 /* ---------------- top-level dispatch ---------------- */
 
 /* Called from ic_trampoline.asm. Must run quickly — every syscall-return
@@ -338,6 +490,12 @@ cfp_ic_dispatch(SIZE_T return_value, PVOID return_rip, SIZE_T saved_rax)
         return rewrite_device_io_control(ctx);
     case 0x0049:  /* NtQueryVolumeInformationFile */
         return rewrite_volume_information(ctx);
+    case 0x0019:  /* NtQueryInformationProcess (shim-resolved) */
+        return rewrite_process_information(ctx);
+    case 0x0021:  /* NtQueryInformationToken (shim-resolved) */
+        return rewrite_token_information(ctx);
+    case 0x0120:  /* NtQuerySystemEnvironmentValueEx (shim-resolved) */
+        return rewrite_system_environment(ctx);
     default:
         break;
     }

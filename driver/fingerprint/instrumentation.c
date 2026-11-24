@@ -61,7 +61,13 @@ typedef struct _PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION {
 
 typedef struct _CFP_INSTR_ARM {
     HANDLE   pid;
-    PVOID    user_trampoline;      /* user-mode VA in the target */
+    PVOID    user_trampoline;      /* user-mode VA the shim installed */
+    PVOID    shadow_cookie;        /* last value the target itself set
+                                    * via NtSetInformationProcess(class 40)
+                                    * — returned verbatim to that same
+                                    * target on a class-40 query so a
+                                    * packer that round-trips its own
+                                    * cookie reads its own bytes back */
     BOOLEAN  armed;
 } CFP_INSTR_ARM;
 
@@ -103,6 +109,7 @@ cfp_instr_pend(HANDLE pid, PVOID user_trampoline)
     }
     g_arms[g_arm_count].pid             = pid;
     g_arms[g_arm_count].user_trampoline = user_trampoline;
+    g_arms[g_arm_count].shadow_cookie   = NULL;
     g_arms[g_arm_count].armed           = FALSE;
     ++g_arm_count;
 out:
@@ -125,6 +132,47 @@ cfp_instr_take_pending(HANDLE pid)
     }
     KeReleaseSpinLock(&g_arm_lock, old);
     return tr;
+}
+
+/* Remember the user-mode VA a target's own NtSetInformationProcess call
+ * passed. The IC dispatcher filters the paired NtQueryInformationProcess
+ * (class 40) return and substitutes this value so a packer that round-
+ * trips its IC cookie reads its own bytes, not our shim's trampoline VA.
+ *
+ * Called from the IC return path for every set-op the target itself
+ * issued against class 40; takes the new cookie value from the syscall
+ * arg buffer. Safe to call at any IRQL up to DISPATCH_LEVEL. */
+void
+cfp_instr_shadow_set(HANDLE pid, PVOID cookie)
+{
+    KIRQL old;
+    KeAcquireSpinLock(&g_arm_lock, &old);
+    for (ULONG i = 0; i < g_arm_count; ++i) {
+        if (g_arms[i].pid == pid) {
+            g_arms[i].shadow_cookie = cookie;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_arm_lock, old);
+}
+
+/* Return the shadow cookie this PID last set (or NULL if the PID never
+ * issued a class-40 set, which matches the "no instrumentation callback"
+ * contract real Windows returns). Pairs with cfp_instr_shadow_set. */
+PVOID
+cfp_instr_shadow_get(HANDLE pid)
+{
+    KIRQL old;
+    PVOID c = NULL;
+    KeAcquireSpinLock(&g_arm_lock, &old);
+    for (ULONG i = 0; i < g_arm_count; ++i) {
+        if (g_arms[i].pid == pid) {
+            c = g_arms[i].shadow_cookie;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_arm_lock, old);
+    return c;
 }
 
 static void

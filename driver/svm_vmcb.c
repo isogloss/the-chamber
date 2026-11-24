@@ -12,6 +12,7 @@
 #include <intrin.h>
 #include "the_chamber.h"
 #include "svm.h"
+#include "timing.h"
 
 /* ---- MSR numbers needed for the state-save mirror (AMD Appendix A / 15.5) ---- */
 #define MSR_IA32_PAT         0x00000277ULL   /* G_PAT          */
@@ -20,6 +21,14 @@
 #define MSR_CSTAR            0xC0000083ULL   /* compat RIP      */
 #define MSR_SFMASK           0xC0000084ULL   /* SYSCALL flags   */
 #define MSR_KERNEL_GS_BASE   0xC0000102ULL   /* KernelGSBase    */
+
+/* LBR virtualization control bits (VMCB offset 0x0B8, AMD 15.23).
+ * Bit 0 enables LBR virtualization so the DebugCtl / LastBranch state in
+ * the state-save area is swapped by VMRUN/VMEXIT rather than left pointing
+ * at host-side branch records.  Without this, a guest that reads the LBR
+ * stack sees host RIPs from the vmexit handler path, which is a direct
+ * hypervisor fingerprint on Zen 4. */
+#define LBR_VIRTUALIZATION_ENABLE (1ULL << 0)
 
 /* Permission bitmap sizes.
  * AMD 15.11:   MSR permission map (MSRPM) is 8 KiB (2 pages).
@@ -257,10 +266,28 @@ static void svm_ensure_bitmaps(void) {
                     msrpm_set_intercept(b, 0xC0010206ULL);  /* PerfEvtSelCore3 */
                     msrpm_set_intercept(b, 0xC0010208ULL);  /* PerfEvtSelCore4 */
                     msrpm_set_intercept(b, 0xC001020AULL);  /* PerfEvtSelCore5 */
+                    /* APERF/MPERF (0xE7 / 0xE8): a guest that reads these
+                     * while TSC is offset-corrected sees APERF ticks
+                     * accruing through every host handler cycle, so the
+                     * APERF/TSC ratio collapses by 10-100x on exit-heavy
+                     * workloads.  Intercept both so handle_msr can serve
+                     * them from a per-CPU snapshot captured at VMEXIT,
+                     * mirroring the PerfCtrCoreN snapshot protocol in
+                     * vmexit.c. */
+                    msrpm_set_intercept(b, 0x000000E7ULL);  /* MPERF */
+                    msrpm_set_intercept(b, 0x000000E8ULL);  /* APERF */
+                    /* TSC_AUX (0xC0000103): an explicit RDMSR must match
+                     * the value RDTSCP's ECX port would report for this
+                     * logical processor so a probe that cross-checks the
+                     * two paths does not catch an identity mismatch.
+                     * Intercepting here routes RDMSR/WRMSR through
+                     * handle_msr; RDTSCP's ECX port is served by a
+                     * dedicated vmexit handler (see cross_file_notes). */
+                    msrpm_set_intercept(b, 0xC0000103ULL);  /* TSC_AUX */
                     /* MSRs NOT intercepted here (deliberately passthrough):
                      *   0x48 SPEC_CTRL, 0x49 PRED_CMD       mitigation controls
-                     *   0xE7 MPERF, 0xE8 APERF              frequency readouts
                      *   0x277 IA32_PAT                       guest-owned PAT
+                     *   0xC0010015 HWCR                     no SVM-state bits
                      *   0xC0010201/03/05/07/09/0B PerfCtrCore0..5
                      *   STAR/LSTAR/CSTAR/SFMASK/FS_BASE/GS_BASE/KernelGSBase
                      * handle_msr still services them when another exit
@@ -361,6 +388,26 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
     /* AMD 15.25.3: enable Nested Paging and install the NPT top-level table. */
     ctl->np_enable = NP_ENABLE;
     ctl->n_cr3     = g_npt_cr3_pa;
+
+    /* AMD 15.23: enable LBR virtualization so the guest's DebugCtl /
+     * LastBranchFromIP / LastBranchToIP / LastExcpFromIP / LastExcpToIP
+     * state in the save area is swapped on VMRUN / VMEXIT instead of being
+     * polluted by host-side branch records taken inside the vmexit
+     * handler path.  Without this, a guest that reads the LBR stack after
+     * an intercepted instruction sees host RIPs from vmexit.c / timing.c,
+     * which is a direct hypervisor fingerprint on Zen 4. */
+    ctl->lbr_virtualization = LBR_VIRTUALIZATION_ENABLE;
+
+    /* Seed tsc_offset with a pre-handler-cost bias so the first intercepted
+     * instruction does not snap from 0 to a large negative value on the
+     * initial timing_update() call.  Guest-visible RDTSC = host_tsc +
+     * tsc_offset, so a negative bias of g_fixed_vmexit_cost cycles makes
+     * the very first guest RDTSC land already compensated for roughly one
+     * VMRUN round-trip.  timing_update() then grows the offset further as
+     * exits accumulate; the discontinuity at CPU 0's first exit is capped
+     * to (END-START) + g_timing_tail_cycles instead of the full fixed
+     * cost. */
+    ctl->tsc_offset = (ULONGLONG)(-(LONG64)g_fixed_vmexit_cost);
 
     /* ==================== State-save area (Table 15-3) ================== */
 

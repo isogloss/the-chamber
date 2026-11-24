@@ -11,7 +11,10 @@
 ;                           ; with host GS.Base / KernelGsBase
 ;   FXSAVE64 ctx.fxsave     ; preserve x87/SSE across the C handler
 ;   call   vmexit_handler
-;   FXRSTOR64 ctx.fxsave
+;   FXRSTOR64 ctx.fxsave    ; restore guest FPU BEFORE capturing END so the
+;                           ;   fxrstor latency is inside (END - START),
+;                           ;   not leaking into guest-visible RDTSC.
+;   capture TIMING_HOST_INTERVAL_END
 ;   call   timing_update
 ;
 ; Guest R15 preservation: on VMEXIT the host register file holds the guest's
@@ -85,6 +88,23 @@ svm_launch PROC
     mov qword ptr [rdx + 8], 0          ; dedicated scratch init
     mov rsp, rdx                        ; switch stacks
 
+    ; Defensive LFENCE-serializing enablement.  DE_CFG (0xC0011029) bit 1
+    ; makes LFENCE dispatch-serializing on AMD Zen; modern Windows sets
+    ; this at boot, but re-setting it per-CPU here guarantees the TSC
+    ; fences below actually serialize rather than silently permit OOO
+    ; execution to straddle RDTSC.  Idempotent read-modify-write; preserved
+    ; across the loop lifetime of this CPU.
+    push rax
+    push rcx
+    push rdx
+    mov ecx, 0C0011029h                 ; DE_CFG
+    rdmsr
+    or eax, 2                           ; set bit 1 (LFENCE serializing)
+    wrmsr
+    pop rdx
+    pop rcx
+    pop rax
+
     clgi
 
 host_vmexit_loop:
@@ -113,9 +133,16 @@ host_vmexit_loop:
 
     ; Host-interval START captured right after vmrun returns, BEFORE
     ; vmsave + handler.  Preserve guest vmcb_pa in rax across rdtsc.
+    ; LFENCE before AND after RDTSC: the pre-fence prevents older
+    ; speculative work from retiring into the TSC sample; the post-fence
+    ; prevents younger dispatch (shl/or/mov) from being reordered ahead of
+    ; the TSC read and inflating the captured timestamp with instructions
+    ; that haven't logically executed yet.  Both are needed to kill
+    ; speculative jitter around the sample.
     push rax                            ; [rsp]=guest vmcb_pa; rsp%16=8
     lfence
     rdtsc
+    lfence
     shl rdx, 32
     or rax, rdx
     mov [r15 + TIMING_HOST_INTERVAL_START], rax
@@ -162,13 +189,26 @@ host_vmexit_loop:
     test eax, eax
     jnz host_done
 
+    ; FXRSTOR64 BEFORE the END capture: the restore latency varies with
+    ; guest FPU state (empty FXSAVE area fast-pathed vs full 512-byte
+    ; replay), and was previously outside the (END - START) bracket,
+    ; leaking that variance to guest-visible RDTSC.  Doing the restore
+    ; here folds the latency into the measured interval so timing_update
+    ; sees it.  Guest GPRs are still in ctx->gpr_save; reload happens
+    ; below.
+    lea rax, [r15 + FXSAVE_AREA]
+    fxrstor64 [rax]
+
     ; Capture END BEFORE timing_update so END and START are matched from
     ; the same iteration (if END followed timing_update, END would pair
     ; with the NEXT iteration's START and timing.c's END<START guard
     ; would fire every call).  timing_update's own cycles plus the GPR
     ; reload sled are charged to g_timing_tail_cycles in timing.c.
+    ; Pre- AND post-RDTSC lfences bracket the sample to kill speculative
+    ; jitter from either side.
     lfence
     rdtsc
+    lfence
     shl rdx, 32
     or rax, rdx
     mov [r15 + TIMING_HOST_INTERVAL_END], rax
@@ -178,9 +218,6 @@ host_vmexit_loop:
     call timing_update
     add rsp, 32
     mov r15, [rsp]                      ; reload ctx after call
-
-    lea rax, [r15 + FXSAVE_AREA]
-    fxrstor64 [rax]
 
     ; Reload guest GPRs for the next VMRUN.  R15 last so ctx access ends.
     mov rbx, [r15 + GPR_SAVE_OFFSET +   8]

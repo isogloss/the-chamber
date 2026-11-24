@@ -79,6 +79,21 @@ cfp_ic_trampoline PROC
         mov     r8,  gs:[1480h]             ; shim-stashed syscall number
         call    cfp_ic_dispatch
 
+        ; --- clear TEB shim slots.
+        ; The shim's prologue writes gs:[0x1480] (syscall number) and
+        ; gs:[0x1488] (per-thread CTX pointer) before every syscall; if
+        ; we leave them set, user-mode __readgsqword(0x1480 / 0x1488)
+        ; from ANY code the target runs between syscalls reads a non-
+        ; zero kernel-mode-managed cookie and that is a straight tell.
+        ; Zero both slots now, after the dispatcher has consumed them,
+        ; so a target reading these TEB offsets outside a dispatch
+        ; window sees the Microsoft-reserved zero. rax holds the
+        ; rewritten return value from the dispatcher; scratch through
+        ; rcx so rax is preserved for the save-slot write below. ---
+        xor     ecx, ecx
+        mov     gs:[1480h], rcx
+        mov     gs:[1488h], rcx
+
         ; --- write rewritten return value into the saved RAX slot.
         ; User-mode code after syscall reads the return from RAX (the
         ; x64 syscall calling convention), NOT from RCX. Kernel places

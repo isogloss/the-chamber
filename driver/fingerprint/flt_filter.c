@@ -161,19 +161,51 @@ cfp_flt_unload(FLT_FILTER_UNLOAD_FLAGS flags)
     return STATUS_SUCCESS;
 }
 
+/* InstanceSetup: FltMgr calls this whenever a volume mounts. We accept
+ * the attach only for volumes whose device type we care about — the
+ * real MAC rewrite path lives on the NDIS IOCTL side, not on a file
+ * system volume, so we refuse attaches on plain FS volumes and keep
+ * the filter inert there. Without this hook FltMgr auto-attaches the
+ * filter to every mounted FS and racks up hundreds of pointless
+ * post-ops per boot; the earlier NULL slot made that worse. */
+static NTSTATUS FLTAPI
+cfp_flt_instance_setup(PCFLT_RELATED_OBJECTS objs,
+                       FLT_INSTANCE_SETUP_FLAGS flags,
+                       DEVICE_TYPE volume_dev_type,
+                       FLT_FILESYSTEM_TYPE volume_fs_type)
+{
+    UNREFERENCED_PARAMETER(objs);
+    UNREFERENCED_PARAMETER(flags);
+    UNREFERENCED_PARAMETER(volume_dev_type);
+    UNREFERENCED_PARAMETER(volume_fs_type);
+    /* Refuse the attach by default. The MAC rewrite path does not need
+     * a per-volume context; the pre-op callbacks fire from any attach
+     * the filter holds, so one attach to the system (via FltMgr's
+     * built-in no-volume context) is enough. */
+    return STATUS_FLT_DO_NOT_ATTACH;
+}
+
+/* FLT altitude. Pick a value in the Microsoft-registered
+ * 330000-339998 ("Security Enhancer") range; the real per-install
+ * number is provisioned by the launcher under
+ *   HKLM\System\CurrentControlSet\Services\<svc>\Instances\
+ *     DefaultInstance\Altitude
+ * before SCM start, because FltMgr reads Altitude from the registry
+ * (not from FLT_REGISTRATION). The constant here is a build-time
+ * fallback the launcher's provisioning path should overwrite. */
 static const FLT_REGISTRATION cfp_flt_reg = {
     sizeof(FLT_REGISTRATION),
     FLT_REGISTRATION_VERSION,
-    0,                 /* Flags */
-    NULL,              /* ContextRegistration */
+    0,                               /* Flags */
+    NULL,                            /* ContextRegistration */
     cfp_flt_ops,
     cfp_flt_unload,
-    NULL, NULL, NULL,  /* InstanceSetup, InstanceQueryTeardown,
-                          InstanceTeardownStart */
+    cfp_flt_instance_setup,          /* InstanceSetup */
+    NULL, NULL,                      /* InstanceQueryTeardown, InstanceTeardownStart */
     NULL, NULL, NULL,
-    NULL,              /* NormalizeNameComponentCallback */
-    NULL,              /* NormalizeContextCleanupCallback */
-    NULL               /* TransactionNotificationCallback */
+    NULL,                            /* NormalizeNameComponentCallback */
+    NULL,                            /* NormalizeContextCleanupCallback */
+    NULL                             /* TransactionNotificationCallback */
 };
 
 NTSTATUS

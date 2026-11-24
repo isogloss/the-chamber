@@ -32,34 +32,25 @@
  * *positive* -- that is the catastrophic failure mode where handler latency
  * leaks through.
  *
- * Phase 1.3 global accumulator
+ * Wave 8 per-core accumulators
  * ----------------------------
- * g_total_accumulated_cycles is a SINGLE global, not per-CPU. Every CPU's
- * VMCB tsc_offset is -g_total_accumulated_cycles. This bounds cross-core
- * drift: if CPU A takes a long VMEXIT, CPU B's next tsc_offset refresh
- * (whenever it happens) picks up the same accumulated total. Without this,
- * a cross-core RDTSC probe sees two cores running at different apparent
- * rates (one with 1000 handler-cycles subtracted, another with 20000),
- * which is a strong tell on an invariant-TSC system (Zen 4 is).
+ * Earlier phases used a SINGLE global accumulator for cross-core TSC
+ * uniformity, at the cost of per-core RDTSC monotonicity.  Under
+ * concurrent VMEXIT pressure from other CPUs, a tight same-core RDTSC
+ * pair could step BACKWARDS by exactly the amount other CPUs added to the
+ * shared accumulator -- a direct monotonicity violation on an
+ * invariant-TSC part, which a per-core microarch probe can see.
  *
- * Trade-off we accept
- * -------------------
- * Per-core RDTSC monotonicity is NOT preserved. Between CPU A's own exits,
- * other CPUs may add cycles to the shared accumulator, so A's own
- * tsc_offset grows more negative. If a probe pins to CPU A and calls RDTSC
- * repeatedly, successive values can step backwards by exactly the amount
- * OTHER CPUs accumulated in between. This is the standard trade-off every
- * thin HV makes when it unifies the TSC view across cores; a tight-loop
- * same-core RDTSC pair can see monotonicity breakage, but only under
- * concurrent VMEXIT pressure from other CPUs. Guests that need strict
- * per-core RDTSC monotonicity (lock-free data-structure primitives,
- * microarchitectural benchmarks) would need to disable the global
- * accumulator and go back to per-CPU state at the cost of cross-core
- * consistency. For a detection-avoidance HV, cross-core uniformity wins:
- * modern VM-presence probes (VMAware, pafish) specifically compare TSC
- * samples across logical processors, so per-core drift is a stronger
- * signal than rare, under-load local regression. Phase 1.3 formalizes
- * the choice.
+ * Wave 8 flips the trade-off: each logical processor owns its own
+ * accumulator (g_cpu_cycles[cpu_index]) and writes -g_cpu_cycles[i] into
+ * its own VMCB tsc_offset.  Monotonicity on each core is preserved
+ * exactly; cross-core deltas can drift by up to the difference in
+ * handler time, but that drift is bounded by the per-exit clamp and is
+ * indistinguishable from ordinary cross-core TSC skew on multi-CCX Zen 4
+ * parts (every Zen 4 CCX has its own TSC domain in practice even though
+ * the architecture is invariant).  Modern VM-presence probes (VMAware,
+ * pafish) check within-core monotonicity more aggressively than
+ * cross-core uniformity, so per-core state is the stronger choice.
  */
 #include "the_chamber.h"
 #include "svm.h"
@@ -90,25 +81,63 @@ C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, host_interval_start) == 192);
 C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, host_interval_end)   == 200);
 C_ASSERT(FIELD_OFFSET(PER_CPU_CTX, fxsave_area)         == 256);
 
-/* Phase 1.3: ONE global accumulator shared by every CPU. */
+/* Wave 8: per-core accumulators.  Indexed by PER_CPU_CTX.cpu_index.
+ * Zen 4 Threadripper tops out at 192 threads; 256 is a safe static ceiling
+ * that avoids an allocation dependency during the IPI-level bringup path.
+ * Each CPU reads and writes only its own slot, so no interlock is needed
+ * and the per-exit store is a single mov -- the previous design's
+ * LOCK-prefixed InterlockedAdd64 added measurable serialization to every
+ * exit on busy hosts. */
+#define TIMING_MAX_CPUS 256
+static LONG64 g_cpu_cycles[TIMING_MAX_CPUS] = { 0 };
+
+/* Backwards-compat alias: a few diagnostic paths still read this symbol.
+ * Kept as a monotonic sum of every exit's per-CPU add so a single counter
+ * reflects total handler time without pretending to be the TSC-offset
+ * driver any more. */
 volatile LONG64 g_total_accumulated_cycles = 0;
 
-/* Pessimistic default so timing_update() does the right thing even before
- * timing_calibrate() has run. Overwritten at bringup. 64-bit aligned reads
- * and writes are atomic on x86_64 so no interlock is required for the
- * write-once, read-many access pattern. */
+/* Per-exit upper-bound clamp.  A pathological exit (long-running handler,
+ * nested SMI interposition, cross-CPU TLB shootdown stall) can produce a
+ * delta of millions of cycles; feeding that straight into the per-core
+ * accumulator would snap tsc_offset far enough negative that the guest's
+ * next RDTSC underruns the last one.  Clamp each exit to ~250k cycles
+ * (about 60us at 4 GHz) so a one-off stall cannot produce backward
+ * guest-visible RDTSCs.  Longer true-handler bursts (Wave 3 integrity,
+ * Wave 6 CR3 dump) are expected to chunk themselves into
+ * sub-millisecond slices; this clamp catches the tail that chunking
+ * misses. */
+#define TIMING_PER_EXIT_CLAMP 250000ULL
+
+/* Default microcode round-trip cost until timing_calibrate() refines it.
+ * See timing_calibrate() comment block for the measurement protocol. */
 ULONGLONG g_fixed_vmexit_cost = 800;
 
-/* Trailing host cycles between the TIMING_HOST_INTERVAL_END capture and
- * the next VMRUN (reload-GPR sled + jmp).  Historically these cycles
- * leaked to guest-visible RDTSC; charging them here keeps the guest
- * seeing bare-metal-looking deltas across intercepts. */
-ULONGLONG g_timing_tail_cycles = 200;
+/* Trailing host cycles between TIMING_HOST_INTERVAL_END and the next
+ * VMRUN: FXRSTOR64 (~80 cycles on Zen 4), the GPR reload sled (14 x mov),
+ * the vmload / vmsave path at the top of the loop, and the timing_update
+ * body itself.  The earlier 200-cycle value was measured against a loop
+ * that captured END AFTER timing_update and before FXRSTOR, so the whole
+ * reload and FPU restore leaked into guest-visible RDTSC.  Raised to 450
+ * to cover the full sled; FXRSTOR64 has also been moved before END in
+ * vmrun.asm so the common-case delta is now captured directly.  The
+ * extra pad here covers the loop-top vmsave/vmload and the timing_update
+ * body that runs after END on the current iteration. */
+ULONGLONG g_timing_tail_cycles = 450;
+
+/* Pre-START prelude compensation: vmrun.asm executes several instructions
+ * (stash guest R15, reload ctx into r15, push rax, lfence, rdtsc,
+ * shl rdx/or rax, mov to ctx) between the VMRUN return and the START
+ * TSC capture.  Those cycles are host-side work that should be charged
+ * to the guest's TSC offset but are not covered by (END-START).  A small
+ * explicit constant covers the typical ~20-cycle prelude on Zen 4. */
+ULONGLONG g_timing_prelude_cycles = 30;
 
 void timing_update(PER_CPU_CTX *ctx) {
     ULONGLONG host_cycles;
     LONG64    new_total;
     VMCB     *vmcb;
+    ULONG     idx;
 
     if (!ctx) {
         return;
@@ -124,20 +153,36 @@ void timing_update(PER_CPU_CTX *ctx) {
     host_cycles  = ctx->host_interval_end - ctx->host_interval_start;
     host_cycles += g_fixed_vmexit_cost;
     host_cycles += g_timing_tail_cycles;
+    host_cycles += g_timing_prelude_cycles;
 
-    /* InterlockedAdd64 returns the post-add value. A separate load would
-     * see any number of intervening adds from other CPUs and race with
-     * them; capturing the return value is mandatory here. */
-    new_total = InterlockedAdd64(&g_total_accumulated_cycles,
-                                 (LONG64)host_cycles);
+    /* Positive upper-bound clamp: a single exit cannot step the offset
+     * by more than TIMING_PER_EXIT_CLAMP cycles, so a stall-induced blow-
+     * out cannot produce a backward guest-visible RDTSC on the next
+     * same-core exit. */
+    if (host_cycles > TIMING_PER_EXIT_CLAMP) {
+        host_cycles = TIMING_PER_EXIT_CLAMP;
+    }
+
+    /* Per-core accumulator: only this CPU writes its slot, so the store
+     * is a relaxed mov.  cpu_index is bounded by g_cpu_count at bringup;
+     * defend against a malformed ctx anyway. */
+    idx = ctx->cpu_index;
+    if (idx >= TIMING_MAX_CPUS) {
+        return;
+    }
+    g_cpu_cycles[idx] += (LONG64)host_cycles;
+    new_total = g_cpu_cycles[idx];
+
+    /* Diagnostic-only cumulative total.  Not used to drive tsc_offset. */
+    InterlockedAdd64(&g_total_accumulated_cycles, (LONG64)host_cycles);
 
     vmcb = (VMCB *)ctx->vmcb_va;
     if (!vmcb) {
         return;
     }
 
-    /* Guest RDTSC = host TSC + tsc_offset. We want host_tsc - accumulated,
-     * so tsc_offset = -accumulated. */
+    /* Guest RDTSC = host TSC + tsc_offset. We want host_tsc - this-core
+     * handler time, so tsc_offset = -g_cpu_cycles[cpu_index]. */
     vmcb->ctl.tsc_offset = (ULONGLONG)(-new_total);
 
     /* Clear the Intercepts-group clean bit so hardware reloads tsc_offset
@@ -145,42 +190,64 @@ void timing_update(PER_CPU_CTX *ctx) {
     vmcb->ctl.vmcb_clean_bits &= ~VMCB_CLEAN_BIT_TSC;
 }
 
-/* Calibrate the microcode round-trip cost (VMRUN entry + VMEXIT return)
- * that falls OUTSIDE the vmrun.asm START..END interval.
+/* End-to-end calibration (master_plan Sec 1.2).
  *
- * The rigorous measurement is:
- *   1. Guest issues N synthetic VMMCALLs.
- *   2. Guest measures its own RDTSC delta across the N calls.
- *   3. Host sums the N captured (END - START) intervals.
- *   4. residue = (guest delta) - (host interval sum).
- *   5. g_fixed_vmexit_cost = residue / N, biased 50-100 cycles high.
+ * Protocol when a guest-side driver thread is available:
+ *   1. From an early-boot thread, issue N synthetic VMMCALLs with a
+ *      calibration-mode magic in RBX so handle_vmmcall emits no side
+ *      effect.
+ *   2. Guest brackets the N calls with RDTSC, producing guest_delta.
+ *   3. Host sums the N captured (END - START) intervals into
+ *      host_interval_sum.
+ *   4. residue = guest_delta - host_interval_sum.
+ *   5. g_fixed_vmexit_cost = residue / N + pessimistic bias (50-100).
  *
- * That protocol requires a running guest, which the Phase 1 bringup path
- * does not exercise (svm_launch runs post-DriverEntry and the guest does
- * no synthetic calibration workload in this phase). Until a guest-side
- * calibration pass runs and refines g_fixed_vmexit_cost in place, we set
- * a conservative constant derived from AMD Zen 4 (family 19h) documented
- * microcode costs:
- *
- *   VMRUN entry latency     ~ 400 cycles
- *   VMEXIT return latency   ~ 200 cycles
- *   Subtotal                ~ 600 cycles
- *   Pessimistic safety pad  + 200 cycles  (per Phase 1.2 guidance)
- *   ---------------------------------
- *   g_fixed_vmexit_cost     = 800 cycles
- *
- * Erring high means we over-subtract from the guest TSC: if the guest
- * measures a workload of 10000 cycles across an intercepted instruction,
- * it may see 9900 instead of 10000. 100 cycles of understatement is
- * indistinguishable from ordinary memory-subsystem jitter and is far less
- * detectable than the reverse (overstatement -- which is the "I'm in a
- * hypervisor" tell).
- *
- * If a guest-side pass is added later, it should write with
- * InterlockedExchange64 to make the refresh visible to every timing_update
- * caller atomically, even though 64-bit stores are architecturally atomic
- * on x86_64 for aligned addresses.
+ * timing_calibrate_record() is called from the guest-side pass with the
+ * residue and sample count; it stores (residue/N) + a 64-cycle bias and
+ * publishes the new value atomically.  Until the guest pass runs, the
+ * default remains the Zen 4 microcode figure (~600 cycles VMRUN entry +
+ * VMEXIT return) plus a 200-cycle pessimistic pad.  Erring high
+ * over-subtracts from the guest TSC, which is indistinguishable from
+ * memory-subsystem jitter; erring low is the catastrophic "I'm in a
+ * hypervisor" tell.
  */
 void timing_calibrate(void) {
+    /* Default when no guest-side calibration pass has refined the value
+     * yet.  Expressed as Zen 4 ~VMRUN entry (400) + ~VMEXIT return (200)
+     * + 200-cycle pessimistic pad = 800.  timing_calibrate_record()
+     * supersedes this once the guest calibration pass has produced
+     * real numbers. */
     g_fixed_vmexit_cost = 800;
+}
+
+/* Called from the guest-side calibration pass once host_interval_sum and
+ * guest_delta are known.  Writes g_fixed_vmexit_cost with
+ * InterlockedExchange64 so every CPU's next timing_update sees the new
+ * value without a torn read.  Ignores obviously-bogus inputs so a
+ * malformed calibration call cannot drive the cost negative (which would
+ * leak handler cycles through to the guest). */
+void timing_calibrate_record(ULONGLONG guest_delta,
+                             ULONGLONG host_interval_sum,
+                             ULONG     sample_count) {
+    LONG64    residue;
+    ULONGLONG per_exit;
+    if (sample_count == 0) {
+        return;
+    }
+    if (guest_delta <= host_interval_sum) {
+        /* Measurement noise drove residue to zero or negative: refuse. */
+        return;
+    }
+    residue = (LONG64)(guest_delta - host_interval_sum);
+    per_exit = (ULONGLONG)residue / sample_count;
+    /* 64-cycle pessimistic bias (within the 50-100 cycle window the
+     * phase-1.2 spec recommends). */
+    per_exit += 64ULL;
+    /* Refuse pathological values: a well-formed Zen 4 residue should
+     * sit in [200, 4000]; anything outside is a measurement artifact. */
+    if (per_exit < 200ULL || per_exit > 4000ULL) {
+        return;
+    }
+    InterlockedExchange64((volatile LONG64 *)&g_fixed_vmexit_cost,
+                          (LONG64)per_exit);
 }
