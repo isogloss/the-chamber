@@ -48,6 +48,15 @@
 #include "npt.h"
 #include "dump_trigger.h"
 
+/* Forward declarations — these functions are called earlier in this
+ * TU than their definitions (see dump_trigger_disarm at line ~140 and
+ * dump_trigger_arm_* below), and dump_trigger.c is textually included
+ * at the tail of dump.c, so without an explicit forward decl the first
+ * call picks up an implicit `extern int fn()` signature and collides
+ * with the real static definition further down. */
+static void trigger_reset_slot_locked(TRIGGER_STATE *t);
+static void trigger_broadcast_tlb_flush(void);
+
 /* --- Trigger state ------------------------------------------------- */
 
 /* Each armed trigger owns a 2 MB-aligned GPA set (the host-physical
@@ -178,8 +187,6 @@ NTSTATUS dump_trigger_init(void)
 
     return STATUS_SUCCESS;
 }
-
-static void trigger_reset_slot_locked(TRIGGER_STATE *t);
 
 void dump_trigger_shutdown(void)
 {
