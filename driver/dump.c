@@ -93,20 +93,10 @@ static volatile LONG g_pause_originator_cpu = -1;
 
 /* --- Externs we use from the kernel, without pulling a full header. ---
  * KeStackAttachProcess / KeUnstackDetachProcess / KAPC_STATE come from
- * <ntifs.h> above; KeSetTargetProcessorDpcEx comes from <wdm.h>. */
+ * <ntifs.h> above; KeSetTargetProcessorDpcEx comes from <wdm.h>;
+ * MEMORY_INFORMATION_CLASS + ZwQueryVirtualMemory come from <ntifs.h>. */
 NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId,
                                                 PEPROCESS *Process);
-
-typedef enum _MEMORY_INFORMATION_CLASS {
-    MemoryBasicInformation = 0
-} MEMORY_INFORMATION_CLASS;
-
-NTSTATUS ZwQueryVirtualMemory(HANDLE ProcessHandle,
-                              PVOID BaseAddress,
-                              MEMORY_INFORMATION_CLASS Class,
-                              PVOID Buffer,
-                              SIZE_T Length,
-                              PSIZE_T ReturnLength);
 
 /* --- Pause primitive state ---------------------------------------- */
 
