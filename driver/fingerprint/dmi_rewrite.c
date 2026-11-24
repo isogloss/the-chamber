@@ -401,10 +401,26 @@ patch_type4(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end)
         ULONG sl = 3;
         if (have_brand && (brand[0] == 'I' || brand[0] == 'i')) {
             sock = "LGA1700"; sl = 7;
-        } else if (have_brand &&
-                   (dmi_contains_ci(brand, sizeof(brand), "5800X", 5) ||
-                    dmi_contains_ci(brand, sizeof(brand), "5600X", 5))) {
-            sock = "AM4"; sl = 3;
+        } else if (have_brand) {
+            /* Detect Zen 3 (AM4) by the family-leading digit immediately
+             * after "Ryzen N ": "Ryzen 5 5600X", "Ryzen 9 5950X3D", any
+             * future 5xxx addition to the pool. The earlier exact
+             * 5800X/5600X substring match would silently stamp AM5 on a
+             * freshly added 5900X/5700X/5950X. Scan for the first ASCII
+             * digit after a space; '5' => AM4, '7'/'8'/'9' => AM5. */
+            BOOLEAN is_zen3 = FALSE;
+            BOOLEAN saw_space = FALSE;
+            ULONG i;
+            for (i = 0; i < sizeof(brand); i++) {
+                UCHAR c = brand[i];
+                if (c == 0) break;
+                if (c == ' ') { saw_space = TRUE; continue; }
+                if (saw_space && c >= '0' && c <= '9') {
+                    is_zen3 = (c == '5');
+                    break;
+                }
+            }
+            if (is_zen3) { sock = "AM4"; sl = 3; }
         }
         replace_pool_string(pool, end, socket_idx, sock, sl);
     }
@@ -764,15 +780,25 @@ patch_type16(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end,
     fixed[0x05] = 0x03;         /* System memory */
     fixed[0x06] = 0x03;         /* No error correction (desktop) */
 
-    /* Maximum capacity: max(sum_of_Type17_sizes * 2, 32 GB) in KB. The
-     * doubling leaves room so the "sum of Type 17 size <= Max Capacity"
-     * SMBIOS invariant holds even under a hot-upgrade, and the 32 GB
-     * floor keeps the field plausible when the blob has no Type 17s
-     * (sum_mb == 0 would otherwise produce a 0-byte Max Capacity). */
+    /* Maximum capacity: round sum_of_Type17_sizes up to the next
+     * populated-slot step so Max Capacity == N * per-slot-step, which
+     * matches how retail firmware reports a board with empty slots.
+     * Falling back to the sum as a floor keeps the SMBIOS invariant
+     * (sum of Type 17 <= Max Capacity) exact when every slot is filled.
+     * When the blob has no Type 17s at all, set Max Capacity to the
+     * declared slot count * a plausible per-slot step (default 32 GB
+     * per slot on AM5 boards). */
     ULONGLONG total_mb = info ? info->type17_total_mb : 0ull;
-    ULONGLONG doubled_kb = total_mb * 2ull * 1024ull;   /* KB */
-    ULONGLONG floor_kb   = 32ull * 1024ull * 1024ull;   /* 32 GB in KB */
-    ULONGLONG max_kb64   = doubled_kb > floor_kb ? doubled_kb : floor_kb;
+    ULONG     count    = info ? info->type17_count : 0;
+    /* Per-slot step: 32 GB covers the common AM5 ceiling (DDR5 32 GB
+     * UDIMMs). For zero-DIMM blobs, assume 4 slots * 32 GB = 128 GB. */
+    ULONGLONG per_slot_mb = 32ull * 1024ull;
+    ULONGLONG slots       = count > 0 ? (ULONGLONG)count : 4ull;
+    ULONGLONG capacity_mb = slots * per_slot_mb;
+    /* If Type 17 sum already exceeds the slot-step estimate, use the
+     * sum itself (saturates upward; keeps the invariant). */
+    if (total_mb > capacity_mb) capacity_mb = total_mb;
+    ULONGLONG max_kb64 = capacity_mb * 1024ull;
 
     if (max_kb64 >= 0x80000000ull && fixed_len >= 0x17) {
         /* Stamp the escape sentinel in the 32-bit field and put the
@@ -817,14 +843,20 @@ patch_type16(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end,
 
     /* Number of Memory Devices: count from the prewalk. patch_type17
      * re-anchors every DIMM to this Type 16, so the count mirrors the
-     * post-rewrite reality rather than the firmware's original handles.
-     * Fall back to 1 (not 0) when the firmware had no Type 17s at all,
-     * so the field never reports zero devices. */
+     * post-rewrite reality. When the firmware produced no Type 17s at
+     * all, reporting "0 devices" against a non-zero Maximum Capacity is
+     * itself a tell — but so is synthesising a DIMM count the blob
+     * cannot back up with Type 17 records. In that case leave the
+     * firmware-written field alone and let the sample draw its own
+     * (benign) conclusion that the DIMM population is unknown; do NOT
+     * overwrite 0 with 1 because that stamps a device count the
+     * downstream Type 17 walker cannot corroborate. */
     ULONG count = info ? info->type17_count : 0;
-    if (count == 0) count = 1;
-    if (count > 0xFFFFu) count = 0xFFFFu;
-    fixed[0x0D] = (UCHAR)(count         & 0xFFu);
-    fixed[0x0E] = (UCHAR)((count >> 8)  & 0xFFu);
+    if (count > 0) {
+        if (count > 0xFFFFu) count = 0xFFFFu;
+        fixed[0x0D] = (UCHAR)(count         & 0xFFu);
+        fixed[0x0E] = (UCHAR)((count >> 8)  & 0xFFu);
+    }
 }
 
 /* ------------------------------------------------------------------
@@ -855,10 +887,16 @@ patch_type17(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end,
     /* Re-anchor the Physical Memory Array Handle at 0x04..0x05 to the
      * Type 16 we normalized — otherwise firmware that pointed Type 17s
      * at a different (VM-era) Memory Array handle keeps a dangling
-     * reference after patch_type16. */
+     * reference after patch_type16. When the blob has no Type 16 at
+     * all (edge case: hostile firmware), stamp the "no such handle"
+     * sentinel 0xFFFE so the sample sees a clean no-array shape rather
+     * than a dangling VM-era handle. */
     if (info && info->have_type16_handle) {
         fixed[0x04] = (UCHAR)(info->type16_handle        & 0xFFu);
         fixed[0x05] = (UCHAR)((info->type16_handle >> 8) & 0xFFu);
+    } else {
+        fixed[0x04] = 0xFE;
+        fixed[0x05] = 0xFF;
     }
 
     /* Fetch the launcher-chosen CPU brand so Form Factor / Memory Type /
@@ -868,9 +906,22 @@ patch_type17(PUCHAR fixed, UCHAR fixed_len, PUCHAR pool, PUCHAR end,
      * itself a tell. Pool decision rule mirrors patch_type4. */
     UCHAR brand17[48];
     BOOLEAN have_brand17 = cfp_cfg_get(CFP_FID_CPU_BRAND, brand17, sizeof(brand17));
-    BOOLEAN brand_is_zen3 = have_brand17 &&
-        (dmi_contains_ci(brand17, sizeof(brand17), "5800X", 5) ||
-         dmi_contains_ci(brand17, sizeof(brand17), "5600X", 5));
+    BOOLEAN brand_is_zen3 = FALSE;
+    if (have_brand17) {
+        /* Same family-digit scan as patch_type4 so Type 17 stays aligned
+         * with Type 4's socket decision for any pool rotation. */
+        BOOLEAN saw_space = FALSE;
+        ULONG i;
+        for (i = 0; i < sizeof(brand17); i++) {
+            UCHAR c = brand17[i];
+            if (c == 0) break;
+            if (c == ' ') { saw_space = TRUE; continue; }
+            if (saw_space && c >= '0' && c <= '9') {
+                brand_is_zen3 = (c == '5');
+                break;
+            }
+        }
+    }
 
     /* Form Factor at 0x0E: DIMM (0x09) is the only desktop form factor
      * that stays coherent with our Type 16 / Type 7 shape. SODIMM,

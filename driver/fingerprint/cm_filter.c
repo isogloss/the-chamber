@@ -510,18 +510,27 @@ cfp_rewrite_enum_sibling_sz(PKEY_VALUE_PARTIAL_INFORMATION kvpi,
         return;
     }
     if (unicode_equals_i(value_name, L"Driver")) {
-        /* Driver values are typically "{classGUID}\0000" — rewrite the
-         * leading 38 chars so a vendor-stamped GUID no longer leaks
-         * while the \NNNN instance suffix the PnP stack cares about
-         * stays intact. */
-        (void)cfp_write_guid_in_place(buf, cwchars,
-                                      cfp_key_salt(key_path) ^ 0xD71C3A5EUL);
-        /* The in-place GUID write clears cap_chars past char 38 to 0;
-         * restore the original suffix by re-scanning for the first
-         * following '\' in a scratch copy is intrusive, so we accept
-         * that the instance suffix drops to NUL. A packed sample that
-         * only reads the GUID portion still binds; the PnP stack reads
-         * through PnP APIs, not through our filter path. */
+        /* Driver values are typically "{classGUID}\NNNN" where NNNN is
+         * the per-instance decimal index. Write the GUID (0..37), then
+         * '\', then four decimal digits derived from the same salt,
+         * then NUL. A probe scanning for the \NNNN shape sees the right
+         * framing; same-key / same-boot reads are stable because the
+         * suffix comes from the key salt, not from a random. */
+        ULONG salt = cfp_key_salt(key_path) ^ 0xD71C3A5EUL;
+        if (cwchars < 44) {
+            (void)cfp_write_guid_in_place(buf, cwchars, salt);
+            return;
+        }
+        (void)cfp_write_guid_in_place(buf, 39, salt);  /* 38 GUID + implicit NUL at 38 inside the helper */
+        /* Overwrite indices 38..43 with "\NNNN" + NUL. */
+        buf[38] = L'\\';
+        ULONG n = salt;
+        for (ULONG d = 0; d < 4; ++d) {
+            buf[42 - d] = (WCHAR)(L'0' + (n % 10));
+            n /= 10;
+        }
+        buf[43] = 0;
+        for (ULONG i = 44; i < cwchars; ++i) buf[i] = 0;
         return;
     }
     /* ClassGUID: pass through. The real class GUID (Disk, USBDevice,
@@ -678,15 +687,16 @@ patch_kvpi(PKEY_VALUE_PARTIAL_INFORMATION kvpi,
         ULONG w_bytes = compute_wsz_override(key_path, value_name, dst, cap_chars);
         if (w_bytes > 0 && w_bytes <= kvpi->DataLength) {
             kvpi->DataLength = w_bytes;
-        } else {
-            /* Enum\{PCI,USB,USBSTOR}\... sibling values: Service /
-             * Driver / ContainerID / Mfg carry the same vendor identity
-             * as HardwareID and must be rewritten in sync. The helper
-             * is a no-op for other value names at these subkeys and for
-             * all values outside the Enum tree, so running it after the
-             * compute_wsz_override miss is cheap and safe. */
-            cfp_rewrite_enum_sibling_sz(kvpi, key_path, value_name);
         }
+        /* Enum\{PCI,USB,USBSTOR}\... sibling values: Service /
+         * Driver / ContainerID / Mfg carry the same vendor identity
+         * as HardwareID and must be rewritten in sync. Always call
+         * the helper (not only on compute_wsz_override miss) so a
+         * future Enum-subpath entry added to compute_wsz_override
+         * does not silently skip sibling rewrites at that value. The
+         * helper is a no-op for value names it does not match and
+         * for all values outside the Enum tree. */
+        cfp_rewrite_enum_sibling_sz(kvpi, key_path, value_name);
         break;
     }
 
