@@ -42,6 +42,11 @@
  * which cfp_ic_dispatch is validated.
  */
 
+/* ntifs.h brings KAPC_STATE / KeStackAttachProcess / KeUnstackDetachProcess
+ * / PsLookupProcessByProcessId / ZwAllocateVirtualMemory / ZwFreeVirtualMemory
+ * / ZwSetInformationProcess — none of which live in ntddk.h or wdm.h on the
+ * WDK 19041 layout. ntifs.h #includes ntddk.h itself so order is safe. */
+#include <ntifs.h>
 #include "fingerprint_cfg.h"
 
 /* Pool tag resolves through the shared symbol in cfg_shared.c: every
