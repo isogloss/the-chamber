@@ -10,24 +10,42 @@
  *   3. cfp_instr_init : IC arm table
  *   4. Create control device + symlink (launcher opens this for IOCTLs)
  *   5. cfp_cm_register: CmRegisterCallbackEx for registry surfaces
- *   6. cfp_flt_register: FltRegisterFilter for NDIS IOCTLs
- *   7. cfp_instr_register: PsSetCreateProcessNotifyRoutineEx for per-PID arming
+ *   6. cfp_flt_register: no-op since Wave 8.5 — FLT was the wrong
+ *      framework for NDIS IOCTLs (IRP_MJ_DEVICE_CONTROL against
+ *      \Device\Ndis never traverses a mounted FS volume's filter
+ *      stack, so FltMgr never dispatches); the call remains in the
+ *      sequence so the register/unregister pair stays symmetric and
+ *      a later wave can put real file-system work behind the same
+ *      handle if ever needed. See flt_filter.c for the rationale.
+ *   7. cfp_instr_register: PsSetCreateProcessNotifyRoutineEx +
+ *      PsSetLoadImageNotifyRoutine for per-PID arming and shim
+ *      injection on first qualifying image load.
  *
  * Any step failing tears down the earlier ones in reverse order and
  * returns the failure. A partial teardown never leaks a registered
  * callback.
  *
- * Device and symlink names are per-boot random (see build_random_name
- * below). The launcher learns the randomized name through the same
- * CFG channel the HV driver uses; after the first IOCTL handshake
- * (IOCTL_CFP_ARM_PID) the DOS symlink is torn down so the launcher's
- * held kernel handle is the only remaining way in.
+ * Device and symlink names are CFG-derived (see build_cfg_name
+ * below): the launcher writes CHAMBER_CFG_V2.device_suffix at
+ * CFG-derive time, this driver reads it back from its own
+ * Services\<svc>\Parameters\CfgBlob, and both sides agree on the
+ * same \Device\<suffix> / \DosDevices\<suffix> without needing a
+ * runtime return channel. If CFG has not loaded (cfp_cfg_load
+ * failed) we fall back to a per-boot random suffix the launcher
+ * cannot predict — the driver still loads but the launcher cannot
+ * reach the control device until the next session. After the first
+ * IOCTL handshake (IOCTL_CFP_ARM_PID landing with a valid
+ * ARM_REQUEST) the DOS symlink is torn down so the launcher's held
+ * kernel handle is the only remaining way in.
  */
 
 #include "fingerprint_cfg.h"
 #include <wdmsec.h>     /* IoCreateDeviceSecure + SDDL_* constants */
 
-#define CFP_TAG         'cFPC'
+/* Pool tag resolves through the shared symbol in cfg_shared.c so this
+ * TU does not bake 'cFPC' into .rdata and every allocation here wears
+ * the same per-install identity the CFG swap assigns. */
+#define CFP_TAG         (g_cfp_pool_tag)
 
 /* -----------------------------------------------------------------------
  * Local stealth implementation.
@@ -227,10 +245,25 @@ cfp_stealth_revert(PDRIVER_OBJECT drv)
      * KLDR entry. */
 }
 
-/* Per-boot random suffix for the control device name and its DOS
- * symbolic link. Fixed names (\Device\CFPControl + \DosDevices\CFPControl)
- * were a static string any sample could enumerate; the launcher opens
- * the device via the random name the driver hands back through CFG. */
+/* Per-install suffix for the control device name and its DOS symbolic
+ * link. Fixed names (\Device\CFPControl + \DosDevices\CFPControl) were
+ * a static string any sample could enumerate; a per-boot random suffix
+ * fixed the string-leak but left the launcher unable to find the
+ * device (there is no return channel from kernel to launcher for the
+ * generated name).
+ *
+ * The suffix comes from CHAMBER_CFG_V2.device_suffix[12], which the
+ * launcher derives from the seed at CFG-blob-build time and writes
+ * into both this driver's Services\<svc>\Parameters\CfgBlob and its
+ * own compiled-in copy. Both sides derive the same ASCII suffix, so
+ * the launcher opens \DosDevices\<suffix> directly without needing to
+ * read anything back. A separate reboot regenerates the seed (if the
+ * installer opts into reseeds) and therefore the suffix.
+ *
+ * If CFG has not loaded (cfp_cfg_load failed), we fall back to a
+ * per-boot random suffix — the fp driver then runs in a degraded
+ * state where only the HV side is reachable, and cfp_cfg_load's
+ * failure is the primary error surface. */
 #define CFP_DEV_NAME_BASE   L"\\Device\\"
 #define CFP_DOS_NAME_BASE   L"\\DosDevices\\"
 #define CFP_NAME_SUFFIX_LEN 16
@@ -272,7 +305,10 @@ static volatile LONG  g_first_handshake_done = 0;
 
 /* Build a random 16-char hex suffix and append it to `base` into `dst`.
  * The suffix seed mixes KeQueryTickCount with the driver image base so a
- * reboot picks fresh bytes even without CFG access yet. */
+ * reboot picks fresh bytes even without CFG access yet. Reserved for the
+ * degraded (no CFG) fallback — a random suffix the launcher cannot
+ * predict; the fp driver still loads, cm_filter / IC still run, but the
+ * launcher cannot open the control device. */
 static void
 build_random_name(const WCHAR *base, WCHAR *dst, USHORT cap_chars,
                   PUNICODE_STRING out)
@@ -296,6 +332,62 @@ build_random_name(const WCHAR *base, WCHAR *dst, USHORT cap_chars,
     out->Buffer        = dst;
     out->Length        = (USHORT)(bi * sizeof(WCHAR));
     out->MaximumLength = (USHORT)(cap_chars * sizeof(WCHAR));
+}
+
+/* Build the device / symlink name from the CFG-supplied 12-byte ASCII
+ * suffix (NUL-terminated or fully filled). Returns TRUE on success
+ * with `out` pointing into `dst`. The launcher derives the same suffix
+ * from the seed so it can open \DosDevices\<suffix> directly — no
+ * runtime channel is required to communicate the name back to user
+ * mode. A zero-length / all-NUL suffix is treated as "CFG absent" and
+ * the caller falls back to the random path. */
+static BOOLEAN
+build_cfg_name(const WCHAR *base, WCHAR *dst, USHORT cap_chars,
+               PUNICODE_STRING out)
+{
+    UCHAR suffix[12];
+    if (!cfp_cfg_get(CFP_FID_DEVICE_SUFFIX, suffix, sizeof(suffix))) {
+        return FALSE;
+    }
+
+    /* Treat an all-zero suffix (or a leading NUL) as unset: the
+     * launcher writes a non-empty suffix on every real install, so a
+     * zero here means the compile-time placeholder was never patched.
+     * Validate every byte lives in [A-Za-z0-9_-]; a byte outside that
+     * range would make the ObCreateObject name parser reject the open
+     * and is almost certainly a stale / corrupt CFG — fall back
+     * instead of emitting a device name that cannot be opened. */
+    BOOLEAN all_zero = TRUE;
+    for (SIZE_T j = 0; j < sizeof(suffix); ++j) {
+        UCHAR b = suffix[j];
+        if (b == 0) break;
+        all_zero = FALSE;
+        BOOLEAN ok = (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') ||
+                     (b >= '0' && b <= '9') || b == '_' || b == '-';
+        if (!ok) return FALSE;
+    }
+    if (all_zero) return FALSE;
+
+    USHORT bi = 0;
+    while (base[bi] && bi + 1 < cap_chars) {
+        dst[bi] = base[bi];
+        ++bi;
+    }
+    for (SIZE_T j = 0; j < sizeof(suffix) && bi + 1 < cap_chars; ++j) {
+        UCHAR b = suffix[j];
+        if (b == 0) break;
+        dst[bi++] = (WCHAR)b;
+    }
+    dst[bi] = 0;
+
+    if (bi == 0 || bi * sizeof(WCHAR) > (SIZE_T)(cap_chars * sizeof(WCHAR))) {
+        return FALSE;
+    }
+
+    out->Buffer        = dst;
+    out->Length        = (USHORT)(bi * sizeof(WCHAR));
+    out->MaximumLength = (USHORT)(cap_chars * sizeof(WCHAR));
+    return TRUE;
 }
 
 /* Extended arm IOCTL carries both PID and user-mode trampoline VA.
@@ -425,23 +517,29 @@ DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg_path)
     cfp_target_init();
     cfp_instr_init();
 
-    /* 4. Control device under a per-boot random name. SDDL grants
-     *    access only to the launcher's own SID (not the broad
-     *    admin+SYSTEM group the compile-time literal used): the
-     *    launcher process runs under a service identity the installer
-     *    created for exactly this purpose, so a non-launcher admin or
-     *    SYSTEM-level sample cannot open the device at all. The SDDL
-     *    string is a build-time stand-in for the launcher-service SID
-     *    (S-1-5-80-...) the installer produces per install; the
-     *    launcher's installer rewrites this field before signing.
-     *    Until the rewrite is wired in, we fall back to
-     *    SDDL_DEVOBJ_SYS_ALL_ADM_ALL. */
-    build_random_name(CFP_DEV_NAME_BASE, g_dev_name_buf,
-                      CFP_NAME_MAX_CHARS, &g_dev_name);
+    /* 4. Control device. The name's suffix comes from CHAMBER_CFG_V2
+     *    .device_suffix (launcher-written, byte-for-byte reproducible
+     *    on the launcher side); if that is unavailable the fp driver
+     *    falls back to a per-boot random suffix the launcher cannot
+     *    open — degraded but not unsafe.
+     *
+     *    SDDL on the fallback (non-rewritten) path grants only SYSTEM
+     *    access (SDDL_DEVOBJ_SYS_ALL = "D:P(A;;GA;;;SY)"); the launcher
+     *    runs elevated under LocalSystem (service identity the
+     *    installer created), so a non-SYSTEM admin or non-launcher
+     *    SYSTEM-level sample cannot open the device at all. A later
+     *    installer wave rewrites this field to the launcher-service
+     *    SID (S-1-5-80-<hash>) before signing for the full
+     *    "launcher-only" posture. */
+    if (!build_cfg_name(CFP_DEV_NAME_BASE, g_dev_name_buf,
+                        CFP_NAME_MAX_CHARS, &g_dev_name)) {
+        build_random_name(CFP_DEV_NAME_BASE, g_dev_name_buf,
+                          CFP_NAME_MAX_CHARS, &g_dev_name);
+    }
     status = IoCreateDeviceSecure(
         drv, 0, &g_dev_name, FILE_DEVICE_UNKNOWN,
         FILE_DEVICE_SECURE_OPEN, FALSE,
-        &SDDL_DEVOBJ_SYS_ALL_ADM_ALL,
+        &SDDL_DEVOBJ_SYS_ALL,
         NULL, &g_device);
     if (!NT_SUCCESS(status)) {
         cfp_cfg_unload();
@@ -451,8 +549,11 @@ DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg_path)
     g_device->Flags |= DO_BUFFERED_IO;
     g_device->Flags &= ~DO_DEVICE_INITIALIZING;
 
-    build_random_name(CFP_DOS_NAME_BASE, g_symlink_buf,
-                      CFP_NAME_MAX_CHARS, &g_symlink_name);
+    if (!build_cfg_name(CFP_DOS_NAME_BASE, g_symlink_buf,
+                        CFP_NAME_MAX_CHARS, &g_symlink_name)) {
+        build_random_name(CFP_DOS_NAME_BASE, g_symlink_buf,
+                          CFP_NAME_MAX_CHARS, &g_symlink_name);
+    }
     status = IoCreateSymbolicLink(&g_symlink_name, &g_dev_name);
     if (!NT_SUCCESS(status)) {
         IoDeleteDevice(g_device);

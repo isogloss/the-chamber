@@ -220,6 +220,64 @@ void timing_calibrate(void) {
     g_fixed_vmexit_cost = 800;
 }
 
+/* Pause-window carve-out around the per-exit clamp.
+ *
+ * dump.c's pause DPC spins for up to PAUSE_WINDOW_100NS (2 s) on each
+ * CPU that matches the capture target CR3. During the spin the host TSC
+ * keeps advancing. timing_update() on the next VMEXIT sees that delta
+ * in (END - START) but TIMING_PER_EXIT_CLAMP caps it at ~60us; the
+ * remaining ~2 s would reappear in guest-visible RDTSC on the next
+ * read -- a loud "something froze the box" signal.
+ *
+ * This path is the sanctioned exception: the pause duration is bounded,
+ * known-benign, and must be charged in full to the per-core accumulator
+ * before the DPC returns and the guest resumes. It also refreshes the
+ * VMCB tsc_offset directly, because the handler's own timing_update()
+ * for the exit that queued the DPC has already run; no later exit on
+ * this CPU is guaranteed to arrive before the guest's first post-resume
+ * RDTSC.
+ *
+ * Caller: pause_dpc_routine (dump.c), DISPATCH_LEVEL, pinned to the
+ * CPU identified by cpu_idx. We write only our own CPU's VMCB, so no
+ * cross-CPU VMCB race against VMRUN. */
+void timing_add_pause_cycles(ULONG cpu_idx, ULONGLONG cycles) {
+    LONG64       new_total;
+    PER_CPU_CTX *ctx;
+    VMCB        *vmcb;
+
+    if (cpu_idx >= TIMING_MAX_CPUS) {
+        return;
+    }
+    if (cycles == 0) {
+        return;
+    }
+
+    /* Deliberately unclamped: the pause window is a ~2 s bounded wait
+     * that the originator controls, not a pathological per-exit stall.
+     * Clamping it to TIMING_PER_EXIT_CLAMP (60us) is exactly the bug
+     * this path works around. */
+    g_cpu_cycles[cpu_idx] += (LONG64)cycles;
+    new_total = g_cpu_cycles[cpu_idx];
+
+    /* Keep the diagnostic total in step so observers that only sample
+     * g_total_accumulated_cycles do not under-count the pause window. */
+    InterlockedAdd64(&g_total_accumulated_cycles, (LONG64)cycles);
+
+    if (!g_cpu_ctx || cpu_idx >= g_cpu_count) {
+        return;
+    }
+    ctx  = &g_cpu_ctx[cpu_idx];
+    vmcb = (VMCB *)ctx->vmcb_va;
+    if (!vmcb) {
+        return;
+    }
+
+    /* Guest RDTSC = host TSC + tsc_offset, so cancelling the pause
+     * window needs tsc_offset = -g_cpu_cycles[cpu_idx]. */
+    vmcb->ctl.tsc_offset = (ULONGLONG)(-new_total);
+    vmcb->ctl.vmcb_clean_bits &= ~VMCB_CLEAN_BIT_TSC;
+}
+
 /* Called from the guest-side calibration pass once host_interval_sum and
  * guest_delta are known.  Writes g_fixed_vmexit_cost with
  * InterlockedExchange64 so every CPU's next timing_update sees the new

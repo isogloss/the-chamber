@@ -7,7 +7,19 @@ namespace TheChamber.Services;
 /// IOCTL function codes exposed by the_chamber.sys for the Wave 6 dump
 /// surface. Function codes 0x820..0x826 cohabit the HV control device
 /// with the earlier STATUS/KICK/SHUTDOWN block (0x801..0x803, defined in
-/// <see cref="TheChamber.Interop.DeviceIoControl"/>).
+/// <see cref="TheChamber.Interop.DeviceIoControl"/>) and the Wave 8.5
+/// fingerprint-coordination code 0x830
+/// (<see cref="IoctlGetFingerprintDeviceName"/>).
+///
+/// The fingerprint driver (chamber_fingerprint.sys) publishes its own
+/// control device under a per-boot random suffix and carries a disjoint
+/// IOCTL space rooted in FILE_DEVICE_UNKNOWN; its codes are bundled
+/// below as <see cref="CfpIoctls"/> so one call site covers both
+/// driver surfaces without accidentally tying their device types
+/// together (the whole point of the fingerprint driver using
+/// FILE_DEVICE_UNKNOWN is to keep a cross-driver correlator from
+/// pairing the two images on IOCTL space alone — see
+/// driver/fingerprint/target_pid.c for the full rationale).
 ///
 /// Each IOCTL is METHOD_BUFFERED — the IO manager copies the input
 /// buffer into the system-managed SystemBuffer for the driver and copies
@@ -60,6 +72,18 @@ internal static class DumpIoctls
     public const uint FnArmPayload = 0x824;
     public const uint FnDisarmTriggers = 0x825;
     public const uint FnQueryDumpHistory = 0x826;
+
+    // Wave 8.5 fingerprint-coordination function code on the HV control
+    // device. The HV driver and the fingerprint driver share one CFG v2
+    // blob (see driver/fingerprint/cfg_shared.c:cfp_read_cfgblob), so
+    // the HV side is authoritative for the fingerprint driver's current
+    // per-boot random device suffix and the launcher can learn it off
+    // the HV handle it already holds. This keeps the launcher from
+    // having to guess, enumerate, or bake the suffix into the operator-
+    // facing settings file — the whole suffix-randomization scheme in
+    // driver/fingerprint/entry.c is undone the moment a cleartext copy
+    // of the suffix lives anywhere discoverable.
+    public const uint FnGetFingerprintDeviceName = 0x830;
 
     /// <summary>
     /// IOCTL_THE_CHAMBER_DUMP_NOW — manual trigger. Input:
@@ -116,6 +140,22 @@ internal static class DumpIoctls
     /// </summary>
     public static readonly uint IoctlQueryDumpHistory =
         CtlCode(FnQueryDumpHistory, FileReadAccess);
+
+    /// <summary>
+    /// IOCTL_CFP_GET_DEVICE_NAME — asks the HV driver for the current
+    /// per-boot random DOS-namespace suffix of the fingerprint driver's
+    /// control device. No input; output is a
+    /// <see cref="FingerprintDeviceNameResponse"/> whose
+    /// <c>SuffixLengthChars</c> names how many UTF-16 characters of
+    /// <c>Suffix</c> are valid (never null-terminated by the driver,
+    /// so the launcher trims on <c>SuffixLengthChars</c> not on
+    /// <c>wcslen</c>). FILE_READ_ACCESS matches the read-only nature
+    /// of the query; a sample with only a read handle to the HV device
+    /// can still ask, and the driver side gates on handle-origin SID
+    /// rather than on IOCTL access bits.
+    /// </summary>
+    public static readonly uint IoctlGetFingerprintDeviceName =
+        CtlCode(FnGetFingerprintDeviceName, FileReadAccess);
 
     // --- Marshalling layouts ---
     //
@@ -227,5 +267,107 @@ internal static class DumpIoctls
         Oep = 2,
         WriteThreshold = 3,
         PayloadReceived = 4,
+    }
+
+    /// <summary>
+    /// Output of IOCTL_CFP_GET_DEVICE_NAME. The driver writes
+    /// <c>SuffixLengthChars</c> UTF-16 code units of the suffix (no
+    /// terminating NUL — the field is a count, not a C-string length)
+    /// into <c>Suffix</c>. The suffix is the DOS-namespace basename
+    /// only, e.g. <c>cfp7a9b1e2c3d4e5f6a</c>; the launcher constructs
+    /// the full device path by prepending <c>\\.\</c>. 128 code units
+    /// of capacity comfortably contains the entry.c name scheme (16
+    /// hex chars of randomness after any base prefix) and keeps the
+    /// whole output inside METHOD_BUFFERED's SystemBuffer budget.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 8, CharSet = CharSet.Unicode)]
+    public struct FingerprintDeviceNameResponse
+    {
+        /// <summary>Count of UTF-16 code units in <c>Suffix</c> that are valid.</summary>
+        public uint SuffixLengthChars;
+        public uint Reserved;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string Suffix;
+    }
+}
+
+/// <summary>
+/// IOCTL function codes exposed by chamber_fingerprint.sys. These sit
+/// in a disjoint device-type space from the HV driver's codes
+/// (FILE_DEVICE_UNKNOWN vs FILE_DEVICE_CHAMBER=0x8000); a cross-driver
+/// correlator cannot pair the two images on IOCTL device type alone.
+/// Codes 0x801..0x805 are already live on the driver side (see
+/// driver/fingerprint/target_pid.c + driver/fingerprint/entry.c);
+/// 0x806 (SET_SHIM_IMAGE) is reserved for the launcher-side push of
+/// the user-mode chamber_shim.dll bytes that the fingerprint driver
+/// maps into each spoofed process at PsSetCreateProcessNotifyRoutineEx
+/// post-create.
+/// </summary>
+internal static class CfpIoctls
+{
+    // FILE_DEVICE_UNKNOWN matches driver/fingerprint/target_pid.c's
+    // CFP_IOCTL_DEVICE_TYPE. Changing it would silently break every
+    // IOCTL on this device; the driver computes the same CTL_CODE and
+    // compares bit-for-bit.
+    private const uint FileDeviceUnknown = 0x00000022;
+    private const uint FileReadAccess = 0x1;
+    private const uint FileWriteAccess = 0x2;
+    private const uint MethodBuffered = 0;
+
+    internal static uint CtlCode(uint function, uint access) =>
+        (FileDeviceUnknown << 16) | (access << 14) | (function << 2) | MethodBuffered;
+
+    // Live driver-side codes. Keep in lockstep with
+    // driver/fingerprint/target_pid.c (0x801/0x802/0x804) and
+    // driver/fingerprint/entry.c (0x805).
+    public const uint FnAddPid = 0x801;
+    public const uint FnRemovePid = 0x802;
+    public const uint FnClear = 0x804;
+    public const uint FnArmPid = 0x805;
+
+    // Wave 8.5 reservation. Driver side will dispatch 0x806 against
+    // the shim-image staging buffer once the user-mode ntdll shim is
+    // production-ready (today's ic_trampoline.asm is the handshake
+    // skeleton). The launcher code path is live and idempotent so a
+    // driver that already carries the dispatch sees a matching push
+    // the first time the operator arms a trigger.
+    public const uint FnSetShimImage = 0x806;
+
+    public static readonly uint IoctlAddPid = CtlCode(FnAddPid, FileWriteAccess);
+    public static readonly uint IoctlRemovePid = CtlCode(FnRemovePid, FileWriteAccess);
+    public static readonly uint IoctlClear = CtlCode(FnClear, FileWriteAccess);
+    public static readonly uint IoctlArmPid = CtlCode(FnArmPid, FileWriteAccess);
+    public static readonly uint IoctlSetShimImage = CtlCode(FnSetShimImage, FileWriteAccess);
+
+    /// <summary>
+    /// Input to IOCTL_CFP_ADD_PID and IOCTL_CFP_REMOVE_PID. Matches
+    /// driver/fingerprint/target_pid.c:CFP_IOCTL_PID exactly (ULONG pid
+    /// plus a ULONG reserved slot keeping the struct 8-byte aligned).
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 8)]
+    public struct CfpPidRequest
+    {
+        public uint Pid;
+        public uint Reserved;
+    }
+
+    /// <summary>
+    /// Input to IOCTL_CFP_SET_SHIM_IMAGE. The shim bytes travel inline
+    /// in the METHOD_BUFFERED SystemBuffer after the fixed header; the
+    /// driver reads <c>ImageSize</c> bytes starting at
+    /// <c>sizeof(SetShimImageRequest)</c>. <c>ExpectedSha256</c> gives
+    /// the driver a cheap integrity gate before it stages the image,
+    /// so a torn push cannot leave a half-copied buffer live.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 8)]
+    public struct SetShimImageRequest
+    {
+        /// <summary>Byte count of the shim image that follows this header.</summary>
+        public uint ImageSize;
+        /// <summary>Reserved for future flags (e.g. staging-lane selector).</summary>
+        public uint Flags;
+        /// <summary>SHA-256 of the image bytes; the driver verifies before staging.</summary>
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+        public byte[] ExpectedSha256;
     }
 }

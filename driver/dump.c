@@ -2,8 +2,35 @@
  *
  * No active-debug surface. Triggers are NPT-only (invisible to guest)
  * or operator-initiated via IOCTL. The pause primitive is targeted-DPC
- * rendezvous (no KeIpiGenericCall spin). TSC jumps across the pause
- * window are masked by the TSC_OFFSET accumulator.
+ * rendezvous (no KeIpiGenericCall spin).
+ *
+ * Time-view masking across the pause window (see pause_dpc_routine and
+ * kuser_time_rewind below):
+ *
+ *   - Guest-visible RDTSC / TSC-bypass QPC: each paused CPU's DPC
+ *     captures __rdtsc() on spin entry and again just before release,
+ *     then calls timing_add_pause_cycles() to charge the full delta to
+ *     its own tsc_offset. The ordinary per-exit timing_update() clamps
+ *     at TIMING_PER_EXIT_CLAMP (~60us) and cannot cover a 2 s spin;
+ *     this path is the sanctioned clamp bypass for the bounded pause
+ *     window.
+ *
+ *   - Non-bypass QPC, GetTickCount / GetTickCount64,
+ *     GetSystemTimeAsFileTime, QueryUnbiasedInterruptTime:
+ *     KUSER_SHARED_DATA fields (InterruptTime, SystemTime,
+ *     TickCountQuad, QpcInterruptTimeBias) advance during the pause
+ *     because the clock ISR runs at CLOCK_LEVEL and preempts the
+ *     DISPATCH_LEVEL pause DPCs. snapshot_locked captures them before
+ *     broadcast and rewinds them after the walk, before releasing the
+ *     DPCs, so the guest's first post-resume read sees the pre-pause
+ *     values.
+ *
+ * Residual: KTHREAD.KernelTime / UserTime / Cycle for the target
+ * thread. Those fields also advance in the target-process ETHREAD /
+ * KTHREAD during the pause; writing them back requires offset
+ * knowledge for the running ntoskrnl build which the driver does not
+ * carry. Flagged here; the per-thread accrual is minor compared to
+ * the KUSER-wide clocks and is a lower-priority tell.
  *
  * Layout:
  *
@@ -20,6 +47,9 @@
  *       bounded wait if the match is positive. Non-matching CPUs
  *       return at once; matching CPUs that hit the 2-second ceiling
  *       also return so a stuck originator cannot wedge the box.
+ *       On the match path, brackets the spin with __rdtsc() and
+ *       charges the delta to this CPU's tsc_offset via
+ *       timing_add_pause_cycles.
  *
  *   dump_run_targeted / dump_snapshot_pause_target
  *       Resolve target PID -> EPROCESS, attach briefly to capture CR3,
@@ -42,21 +72,20 @@
 #include <intrin.h>
 #include "the_chamber.h"
 #include "svm.h"
+#include "timing.h"
 #include "dump.h"
 
 volatile LONG   g_pause_active = 0;
 volatile LONG64 g_dump_seq     = 0;
 
-/* Originator CPU for the current KeIpiGenericCall broadcast. We record it
- * before broadcast so the park worker can skip itself: on this CPU the
- * guest VMMCALL that invoked us may have originated from an injected
- * thread running under g_target_cr3, in which case the stale VMCB.save.cr3
- * would otherwise cause the originator to count itself as "parked" even
- * though it is actively executing the dump handler in host context. (The
- * audit's self-deadlock variant that this guards against assumes a true
- * rendezvous-spin pause; today's broadcast is non-blocking, but skipping
- * the originator still gives g_parked_count the correct "how many sibling
- * vCPUs were racing" meaning rather than off-by-one.) */
+/* Originator CPU for the current targeted-DPC broadcast. Recorded so
+ * the pause DPC can skip itself if it runs on the originator: the
+ * VMMCALL that invoked us can be issued from a thread whose CR3 matches
+ * the capture target, in which case the originator would otherwise
+ * self-park inside its own spin loop and wedge the whole capture. The
+ * pause primitive IS blocking (pause_dpc_routine spins on
+ * g_pause_active up to PAUSE_WINDOW_100NS), which is exactly why the
+ * self-skip matters. */
 static volatile LONG g_pause_originator_cpu = -1;
 
 /* --- Externs we use from the kernel, without pulling a full header. --- */
@@ -172,6 +201,117 @@ ULONG dump_history_copy_out(PCHAMBER_DUMP_HISTORY out, ULONG capacity_bytes)
     return wrote;
 }
 
+/* --- KUSER_SHARED_DATA time-view masking --------------------------- */
+
+/* KUSER_SHARED_DATA fields advance during the pause because the clock
+ * ISR runs at CLOCK_LEVEL and preempts DISPATCH_LEVEL pause DPCs.
+ * snapshot_locked captures these before broadcast and rewinds them
+ * after the walk, before releasing the DPCs, so the guest's first
+ * post-resume read of GetTickCount / GetSystemTimeAsFileTime / the
+ * non-bypass QueryPerformanceCounter path sees pre-pause values.
+ * The TSC-bypass QPC path is handled separately by the per-CPU
+ * tsc_offset carve-out in pause_dpc_routine above. */
+typedef struct _KUSER_TIME_SNAPSHOT {
+    ULONG64 tick_count_quad;
+    ULONG   intr_low;
+    LONG    intr_high;
+    ULONG   sys_low;
+    LONG    sys_high;
+    LONG64  qpc_intr_time_bias;
+    BOOLEAN valid;
+    UCHAR   pad[7];
+} KUSER_TIME_SNAPSHOT;
+
+static void kuser_time_capture(KUSER_TIME_SNAPSHOT *out)
+{
+    const KUSER_SHARED_DATA *kud = SharedUserData;
+    ULONG attempts;
+
+    if (!out) return;
+    RtlZeroMemory(out, sizeof(*out));
+
+    /* Read InterruptTime with the documented High1 / LowPart / High2
+     * spin: the clock ISR writes High2, LowPart, High1 in that order
+     * (so High1 == High2 only once the full 64-bit write has landed).
+     * Bound the spin so a wedged writer cannot hang us. */
+    for (attempts = 0; attempts < 4096; attempts++) {
+        LONG  h1 = kud->InterruptTime.High1Time;
+        ULONG lo = kud->InterruptTime.LowPart;
+        LONG  h2 = kud->InterruptTime.High2Time;
+        if (h1 == h2) {
+            out->intr_low  = lo;
+            out->intr_high = h1;
+            break;
+        }
+        YieldProcessor();
+    }
+    if (attempts == 4096) return;
+
+    for (attempts = 0; attempts < 4096; attempts++) {
+        LONG  h1 = kud->SystemTime.High1Time;
+        ULONG lo = kud->SystemTime.LowPart;
+        LONG  h2 = kud->SystemTime.High2Time;
+        if (h1 == h2) {
+            out->sys_low  = lo;
+            out->sys_high = h1;
+            break;
+        }
+        YieldProcessor();
+    }
+    if (attempts == 4096) return;
+
+    out->tick_count_quad    = kud->TickCountQuad;
+    out->qpc_intr_time_bias = kud->QpcInterruptTimeBias;
+    out->valid              = TRUE;
+}
+
+/* Write the snapshot back to the KUSER_SHARED_DATA physical page via a
+ * writable kernel alias. SharedUserData itself is mapped read-only on
+ * the kernel side; MmMapIoSpaceEx gives us an RW window over the same
+ * PA for the duration of the rewind. Called from snapshot_locked
+ * AFTER the VAD walk finishes and BEFORE g_pause_active is cleared,
+ * so matched DPCs are still spinning and the target guest sees the
+ * rewound values on its first resume-side read. */
+static void kuser_time_rewind(const KUSER_TIME_SNAPSHOT *in)
+{
+    PHYSICAL_ADDRESS   pa;
+    PVOID              rw_map;
+    KUSER_SHARED_DATA *kud_rw;
+
+    if (!in || !in->valid) return;
+    if (KeGetCurrentIrql() > APC_LEVEL) return; /* MmMapIoSpaceEx bound */
+
+    pa = MmGetPhysicalAddress((PVOID)SharedUserData);
+    if (pa.QuadPart == 0) return;
+
+    rw_map = MmMapIoSpaceEx(pa, PAGE_SIZE, PAGE_READWRITE);
+    if (!rw_map) return;
+
+    kud_rw = (KUSER_SHARED_DATA *)rw_map;
+
+    /* Write-side protocol mirrors the clock ISR: High2, LowPart, High1,
+     * so a user-mode reader that spins until High1 == High2 observes a
+     * consistent 64-bit value after we return. */
+    kud_rw->InterruptTime.High2Time = in->intr_high;
+    _ReadWriteBarrier();
+    kud_rw->InterruptTime.LowPart   = in->intr_low;
+    _ReadWriteBarrier();
+    kud_rw->InterruptTime.High1Time = in->intr_high;
+
+    kud_rw->SystemTime.High2Time    = in->sys_high;
+    _ReadWriteBarrier();
+    kud_rw->SystemTime.LowPart      = in->sys_low;
+    _ReadWriteBarrier();
+    kud_rw->SystemTime.High1Time    = in->sys_high;
+
+    /* TickCountQuad is a 64-bit aligned field; the architecturally
+     * atomic store is enough. QpcInterruptTimeBias likewise. */
+    kud_rw->TickCountQuad           = in->tick_count_quad;
+    kud_rw->QpcInterruptTimeBias    = in->qpc_intr_time_bias;
+
+    MmUnmapIoSpace(rw_map, PAGE_SIZE);
+}
+
 /* --- Pause DPC ---------------------------------------------------- */
 
 /* Runs at DISPATCH_LEVEL on the CPU it was pinned to. The DPC fires in
@@ -187,12 +327,20 @@ ULONG dump_history_copy_out(PCHAMBER_DUMP_HISTORY out, ULONG capacity_bytes)
  * an originator that crashes mid-walk cannot wedge a vCPU forever. If
  * the ceiling is hit the DPC sets timed_out, increments nothing further,
  * and returns so the guest can resume. The originator checks timed_out
- * on unwind for the dump record. */
+ * on unwind for the dump record.
+ *
+ * TSC compensation on the match path: __rdtsc brackets the spin. The
+ * delta is pushed into this CPU's tsc_offset via timing_add_pause_cycles
+ * before the DPC returns. The ordinary per-exit clamp (60us) would
+ * otherwise swallow all but a sliver of a 2 s spin and leak the rest
+ * to guest-visible RDTSC. */
 static VOID pause_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2)
 {
     PAUSE_PER_CPU *slot = (PAUSE_PER_CPU *)Ctx;
     ULONGLONG      current_cr3;
+    ULONGLONG      tsc_spin_start, tsc_spin_end;
     ULARGE_INTEGER t0, t;
+    ULONG          cpu;
 
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(Sa1);
@@ -217,6 +365,11 @@ static VOID pause_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2)
     InterlockedExchange(&slot->parked, 1);
     InterlockedIncrement(&g_pause_completion);
 
+    /* Bracket the spin with the host TSC. Everything between here and
+     * the matching capture below is host-only time -- the guest vCPU
+     * is parked -- so charging it to this CPU's tsc_offset makes the
+     * guest's next RDTSC after resume continue as if no pause ran. */
+    tsc_spin_start = __rdtsc();
     t0.QuadPart = (ULONGLONG)KeQueryInterruptTime();
 
     while (InterlockedCompareExchange(
@@ -230,7 +383,18 @@ static VOID pause_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2)
         YieldProcessor();
     }
 
+    tsc_spin_end = __rdtsc();
     InterlockedExchange(&slot->parked, 0);
+
+    /* Charge the spin to this CPU's per-core TSC accumulator, bypassing
+     * the per-exit clamp. The DPC is pinned, so KeGetCurrentProcessorNumber
+     * matches the g_cpu_ctx / g_cpu_cycles slot we need to update. The
+     * refresh writes vmcb->ctl.tsc_offset in place and clears the
+     * Intercepts clean bit so the next VMRUN serves the new offset. */
+    if (tsc_spin_end > tsc_spin_start) {
+        cpu = KeGetCurrentProcessorNumber();
+        timing_add_pause_cycles(cpu, tsc_spin_end - tsc_spin_start);
+    }
 }
 
 NTSTATUS dump_pause_init(void)
@@ -568,6 +732,7 @@ static ULONGLONG snapshot_locked(PEPROCESS target,
     ULONGLONG     target_cr3;
     LARGE_INTEGER now;
     CHAMBER_DUMP_RECORD rec;
+    KUSER_TIME_SNAPSHOT  kuser_snap;
 
     if (KeGetCurrentIrql() >= DISPATCH_LEVEL) {
         return 0;
@@ -582,18 +747,30 @@ static ULONGLONG snapshot_locked(PEPROCESS target,
     if (target_cr3 == 0) return 0;
     g_pause_target_cr3 = target_cr3;
 
-    /* Detection-surface note (Wave-7 audit, "pause-world-dump" bucket):
-     * KeIpiGenericCall drops a correlated per-CPU interrupt which shows
-     * up as a simultaneous InterruptCount / DpcCount bump on every CPU
-     * in SystemProcessorPerformanceInformation. A real fix (spread the
-     * arrivals, or hide the bump) lives in the driver-stealth-hide
-     * bucket; flagging only here. All of the time-counter back-fill
-     * fixes the audit calls for (TSC_OFFSET, KTHREAD.KernelTime/UserTime,
-     * KPRCB.DpcTime/IdleTime, KUSER_SHARED_DATA.TickCountQuad,
-     * ThreadState anomaly) assume a multi-millisecond actual pause
-     * window; the current broadcast is non-blocking (see KNOWN BUG at
-     * top of file) and therefore has no such window to compensate for.
-     * They re-appear once the targeted-DPC rewrite lands. */
+    /* Snapshot KUSER_SHARED_DATA time counters BEFORE broadcasting the
+     * pause DPCs. The pause primitive is targeted-DPC rendezvous and
+     * actually blocks every CR3-matching vCPU for up to
+     * PAUSE_WINDOW_100NS (2 s) via YieldProcessor; during that window
+     * the clock ISR at CLOCK_LEVEL still fires on every CPU and
+     * advances KUSER_SHARED_DATA.{InterruptTime, SystemTime,
+     * TickCountQuad, QpcInterruptTimeBias}. If we left them advanced
+     * the target's next GetTickCount / GetSystemTimeAsFileTime /
+     * non-bypass QueryPerformanceCounter call would read a 2 s jump,
+     * which is exactly the "someone froze me" signal the pause exists
+     * to hide. The TSC-bypass QPC path and raw RDTSC are handled
+     * separately by pause_dpc_routine's tsc_offset carve-out.
+     *
+     * Residual: KTHREAD.KernelTime / UserTime / Cycle for the target
+     * thread are per-process ETHREAD state and would need per-build
+     * ntoskrnl offset knowledge to back-fill; left as a known residual
+     * in dump.c's top-of-file notes.
+     *
+     * Detection-surface note (separate from the time masking):
+     * targeted per-CPU DPCs show up as DpcCount bumps on every CPU in
+     * SystemProcessorPerformanceInformation. Hiding that signal lives
+     * in the driver-stealth-hide bucket; flagging only here. */
+    kuser_time_capture(&kuser_snap);
+
     matched = pause_broadcast_and_wait();
 
     if (probe_user_buf) {
@@ -622,6 +799,13 @@ static ULONGLONG snapshot_locked(PEPROCESS target,
     }
 
 record_history:
+
+    /* Rewind KUSER_SHARED_DATA time counters to their pre-pause values
+     * while the matched DPCs are still spinning. Once g_pause_active
+     * is cleared below the guest resumes, and we need the pre-pause
+     * values in place before that happens so the first user-mode
+     * QueryPerformanceCounter / GetTickCount call lands on them. */
+    kuser_time_rewind(&kuser_snap);
 
     InterlockedExchange(&g_pause_active, 0);
     InterlockedExchange(&g_pause_originator_cpu, -1);

@@ -221,23 +221,13 @@ static void rewrite_leaf_topology(PER_CPU_CTX *ctx, int regs[4])
     regs[3] = (int)identity_get_x2apic_id(ctx->cpu_index);
 }
 
-/* CPUID 0x15 TSC/crystal ratio. */
-static void rewrite_leaf_15(int regs[4])
-{
-    regs[0] = (int)g_identity_tsc_denom;
-    regs[1] = (int)g_identity_tsc_numer;
-    regs[2] = (int)g_identity_tsc_crystal;
-    regs[3] = 0;
-}
-
-/* CPUID 0x16 processor frequency fields (MHz). */
-static void rewrite_leaf_16(int regs[4])
-{
-    regs[0] = (int)(g_identity_cpu_base_mhz & 0xFFFFu);
-    regs[1] = (int)(g_identity_cpu_max_mhz  & 0xFFFFu);
-    regs[2] = (int)(g_identity_cpu_bus_mhz  & 0xFFFFu);
-    regs[3] = 0;
-}
+/* Leaves 0x15 (TSC/crystal ratio) and 0x16 (processor base/max/bus MHz) are
+ * Intel-only reporting leaves. Zen 4 does not implement them and the
+ * unconditional AMD zero-scrub below zeros both. There is therefore no
+ * dedicated rewrite_leaf_15 / rewrite_leaf_16 -- any output a seed-derived
+ * rewrite produced would be immediately overwritten by the scrub, so the
+ * previous versions of those functions were dead code; they have been
+ * removed. */
 
 /* CPUID 0x80000001 extended feature flags: overlay seed-derived ECX/EDX
  * bits onto the host-reported baseline so a reseed shifts observable
@@ -287,10 +277,6 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
         if (rewrite) rewrite_leaf_7(regs);
     } else if (leaf == 0xB || leaf == 0x1F) {
         if (rewrite) rewrite_leaf_topology(ctx, regs);
-    } else if (leaf == 0x15) {
-        if (rewrite) rewrite_leaf_15(regs);
-    } else if (leaf == 0x16) {
-        if (rewrite) rewrite_leaf_16(regs);
     } else if (leaf == 0x80000001U) {
         if (rewrite) rewrite_leaf_80000001(regs);
     } else if (leaf == 0x80000002U) {
@@ -303,10 +289,27 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
         /* EAX[7:0] physical address bits, EAX[15:8] virtual address bits,
          * ECX[7:0] NC (logical processor count minus 1). Pass through for
          * now; the identity table does not currently vary core count. */
-    } else if (leaf == 0x8000001DU || leaf == 0x8000001EU) {
-        /* Cache / core topology extended. Pass through unchanged — the
-         * identity rewrite varies APIC IDs and brand string, not core
-         * topology. */
+    } else if (leaf == 0x8000001DU) {
+        /* Cache topology. The NumSharingCache field at EAX[25:14]
+         * reports the number of logical processors sharing each cache
+         * level; it must agree with the per-level logical-processor
+         * counts advertised at CPUID 0xB EBX. Both this leaf and 0xB
+         * EBX are host-passthrough today -- rewrite_leaf_topology only
+         * replaces the x2APIC ID at 0xB/0x1F EDX -- so the two stay
+         * self-consistent. If a future rewrite varies 0xB EBX counts,
+         * this leaf must be adjusted in lockstep. */
+    } else if (leaf == 0x8000001EU) {
+        /* EAX = Extended APIC ID. Host passthrough advertises the
+         * physical CPU's extended APIC ID, which contradicts the
+         * per-vCPU x2APIC ID that rewrite_leaf_topology stamps into
+         * 0xB/0x1F EDX. Rewrite EAX here to the same seed-derived
+         * x2apic_id so a probe cross-checking the two leaves sees one
+         * identity. EBX (compute-unit / threads-per-CU) and ECX (node
+         * ID / nodes-per-package) stay passthrough -- they describe
+         * hardware topology, not the vCPU identity. */
+        if (rewrite) {
+            regs[0] = (int)identity_get_x2apic_id(ctx->cpu_index);
+        }
     } else if (leaf == 0x8000001FU) {
         /* Must zero SEV/SME regardless of rewrite toggle: the HV's own
          * SVM use should never leak a hardware SEV advertisement to the
@@ -336,9 +339,15 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
      * host passthrough would return either zeros or garbage depending on
      * micro-arch revision, and either is a vendor-mismatch tell on an
      * AuthenticAMD vendor string. Force them to all-zero explicitly.
-     * Leaf 0x1F (extended Intel topology) is similarly Intel-only; zero
-     * it too on the AMD vendor path. */
-    if (leaf == 0x15U || leaf == 0x16U || leaf == 0x1FU) {
+     *
+     * Leaf 0x1F is NOT Intel-only: on Zen 4 (family 0x19) the processor
+     * implements it as the V2 Extended Topology Enumeration, strictly
+     * supersetting the information at 0xB. A guest that reads a non-zero
+     * 0xB but zero 0x1F on a Zen 4-shaped CPU signature would itself be a
+     * topology-vs-generation mismatch. The rewrite_leaf_topology path
+     * above stamps the per-vCPU x2apic_id into 0x1F EDX for the same
+     * reason it does at 0xB; do NOT scrub the leaf back to zero here. */
+    if (leaf == 0x15U || leaf == 0x16U) {
         regs[0] = 0;
         regs[1] = 0;
         regs[2] = 0;
@@ -414,19 +423,24 @@ static void handle_rdpmc(PER_CPU_CTX *ctx, VMCB *vmcb)
  * effects.  Every other MSR path returns 0 on RDMSR and absorbs WRMSR
  * so a guest sweep of the MSR space cannot bugcheck the host.
  *
- * The identity MSRs (0x17, 0x8B, 0xC0000103, 0xC0010015) are listed
- * here so the SEH-wrapped pass branch stays reachable in case the
- * dedicated rewrite short-circuits are ever disabled; the normal path
- * handles them before this allowlist is consulted. */
+ * The identity-sensitive TSC_AUX (0xC0000103) and HWCR (0xC0010015) stay
+ * listed so the SEH-wrapped pass branch stays reachable in case the
+ * dedicated rewrite short-circuits are ever disabled; those two the
+ * identity_rewrite path handles before this allowlist is consulted.
+ *
+ * MSR 0x17 (IA32_PLATFORM_ID) and MSR 0x8B (IA32_BIOS_SIGN_ID) are NOT
+ * in the allowlist. A host __readmsr(0x17) on an AuthenticAMD part
+ * either raises #GP or returns an Intel-only pattern -- both are tells
+ * -- and a host __readmsr(0x8B) returns the bare-metal host's real
+ * microcode patch level, undermining the seed-derived identity view.
+ * Both are routed to the explicit shadow / #GP block below. */
 static BOOLEAN handle_msr_allowlist_pass(ULONG msr)
 {
     switch (msr) {
     case 0x00000010UL:   /* IA32_TIME_STAMP_COUNTER      */
-    case 0x00000017UL:   /* IA32_PLATFORM_ID             */
     case 0x0000001BUL:   /* IA32_APIC_BASE               */
     case 0x00000048UL:   /* SPEC_CTRL                    */
     case 0x00000049UL:   /* PRED_CMD                     */
-    case 0x0000008BUL:   /* IA32_BIOS_SIGN_ID            */
     case 0x000000E7UL:   /* MPERF                        */
     case 0x000000E8UL:   /* APERF                        */
     case 0x000000FEUL:   /* IA32_MTRRCAP                 */
@@ -451,7 +465,17 @@ static BOOLEAN handle_msr_allowlist_pass(ULONG msr)
 /* Return TRUE if the MSR is one of the identity-rewrite set. The
  * per-MSR handler short-circuits before __readmsr / __writemsr is
  * called, so none of these ever reaches real hardware from the guest
- * side when the machine-identity spoof toggle is set. */
+ * side when the machine-identity spoof toggle is set.
+ *
+ * MSR 0x17 (IA32_PLATFORM_ID) and MSR 0x8B (IA32_BIOS_SIGN_ID) are
+ * deliberately NOT handled here. On an AuthenticAMD vendor string:
+ *   - 0x17 is Intel-only; the correct bare-metal shape is #GP(0).
+ *   - 0x8B returns the microcode patch level in EAX with EDX = 0.
+ * The prior short-circuit kept them from ever reaching the fallback's
+ * explicit shapes: it absorbed writes, served zero (or a left-shifted
+ * value that landed in EDX, with EAX = 0) on reads, and skipped the
+ * #GP injection entirely. Routing both to the fallback block gives
+ * the hardware-accurate behaviour. */
 static BOOLEAN handle_msr_identity_rewrite(PER_CPU_CTX *ctx, VMCB *vmcb,
                                            ULONG msr, BOOLEAN is_write)
 {
@@ -461,25 +485,6 @@ static BOOLEAN handle_msr_identity_rewrite(PER_CPU_CTX *ctx, VMCB *vmcb,
                       CHAMBER_TOGGLE_MACHINE_IDENTITY_SPOOF) != 0);
 
     switch (msr) {
-    case 0x0000008BUL: /* IA32_BIOS_SIGN_ID -- microcode patch level */
-        if (is_write) {
-            /* Writes are architecturally used by the OS to poke the
-             * patch-loader; absorb them. */
-        } else {
-            value = spoof ? g_identity_microcode_rev : 0;
-            vmcb->save.rax   = (ULONGLONG)(ULONG)value;
-            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
-        }
-        return TRUE;
-
-    case 0x00000017UL: /* IA32_PLATFORM_ID */
-        if (!is_write) {
-            value = spoof ? g_identity_platform_id : 0;
-            vmcb->save.rax   = (ULONGLONG)(ULONG)value;
-            ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
-        }
-        return TRUE;
-
     case 0xC0000103UL: /* TSC_AUX */
         if (is_write) {
             value = (ULONGLONG)(ULONG)vmcb->save.rax |
@@ -578,10 +583,15 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
         return;
     }
 
-    /* Identity rewrite path: TSC_AUX, platform_id, microcode patch
-     * level, HWCR. Each is handled without reaching the host MSR so
-     * reseeds change the guest-visible value and the host state is
-     * not touched. */
+    /* Identity rewrite path: TSC_AUX (per-vCPU RDTSCP tag) and HWCR
+     * (SVM-detection hiding). Each is handled without reaching the
+     * host MSR so a reseed changes the guest-visible value and the
+     * host state is not touched. Platform_id (0x17) and microcode
+     * patch level (0x8B) are intentionally served further down in the
+     * explicit shadow / #GP fallback instead of here: the AMD-correct
+     * shapes (#GP on 0x17, EAX=patch id / EDX=0 on 0x8B) could not be
+     * produced from the rewrite short-circuit without the caller then
+     * advancing RIP, which short-circuited the #GP. */
     if (handle_msr_identity_rewrite(ctx, vmcb, msr, is_write)) {
         vmcb->save.rip = vmcb->ctl.next_rip;
         return;

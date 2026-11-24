@@ -26,7 +26,14 @@
  *      the observed-matching count, then runs the VAD walk at
  *      PASSIVE_LEVEL via KeStackAttachProcess.
  *
- *   3. dump_pause_end() InterlockedExchanges g_pause_active to 0, which
+ *   3. Before releasing the DPCs, the originator rewinds the
+ *      KUSER_SHARED_DATA time counters (InterruptTime, SystemTime,
+ *      TickCountQuad, QpcInterruptTimeBias) that the clock ISR
+ *      advanced during the pause -- the matched DPCs are still
+ *      holding their CPUs, so the rewind lands before any guest
+ *      resumes.
+ *
+ *   4. dump_pause_end() InterlockedExchanges g_pause_active to 0, which
  *      releases the parked DPCs; each returns and its CPU resumes the
  *      guest on its next VMRUN.
  *
@@ -42,8 +49,27 @@
  * is a pointer-reference, not a handle open, and is safe. Pair it with
  * ObDereferenceObject on unwind.
  *
- * TSC jumps across the pause window are masked by the existing TSC_OFFSET
- * accumulator (see timing.c) -- no change required here.
+ * Time-view masking across the pause window:
+ *
+ *   - Guest RDTSC / TSC-bypass QueryPerformanceCounter: each matched
+ *     pause DPC brackets its spin with __rdtsc() and charges the delta
+ *     to its own CPU's tsc_offset via timing_add_pause_cycles (timing.h).
+ *     The ordinary per-exit timing_update() clamp (~60us) cannot cover
+ *     a 2 s spin, so this path is the sanctioned bypass.
+ *
+ *   - Non-bypass QueryPerformanceCounter / GetTickCount /
+ *     GetSystemTimeAsFileTime / QueryUnbiasedInterruptTime: the
+ *     KUSER_SHARED_DATA fields these read advance during the pause
+ *     because the clock ISR at CLOCK_LEVEL preempts DISPATCH_LEVEL
+ *     DPCs. The originator snapshots them pre-broadcast and rewinds
+ *     them post-walk through an MmMapIoSpaceEx writable alias of the
+ *     shared page, before clearing g_pause_active.
+ *
+ *   - Residual: KTHREAD.KernelTime / UserTime / Cycle for the target
+ *     thread. Those fields live in ETHREAD/KTHREAD at offsets that
+ *     vary per ntoskrnl build; the driver carries no offset table for
+ *     them, so per-thread accrual drift is a known lower-priority
+ *     residual (dump.c top-of-file notes it as well).
  *
  * --- VMMCALL interface (documented here; no userland code in-tree) ---
  *

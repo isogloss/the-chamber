@@ -432,34 +432,30 @@ NTSTATUS identity_apply(const CHAMBER_CFG_V2 *cfg)
     g_identity_cpu_ext_feat_ecx = derive_u32(cfg->seed, "cpu_ext_feat_ecx");
     g_identity_cpu_ext_feat_edx = derive_u32(cfg->seed, "cpu_ext_feat_edx");
 
-    /* MSR 0x8B upper 32 bits hold the microcode patch level; low 32 are
-     * cleared by RDMSR before IA32_BIOS_SIGN_ID is read, but when read
-     * via the "patch_level" alias on AMD both halves can be meaningful.
-     * Emit a 64-bit derived value with the upper 32 bits reserved for
-     * the patch level and the lower 32 bits left zero. */
-    g_identity_microcode_rev = (ULONGLONG)derive_u32(cfg->seed, "microcode_rev") << 32;
+    /* MSR 0x8B (IA32_BIOS_SIGN_ID / AMD PatchLevel). On AuthenticAMD a
+     * RDMSR 0x8B returns the microcode patch id in EAX with EDX = 0 --
+     * the patch id lives in the LOW 32 bits of the 64-bit value, not
+     * the high 32. The prior `<< 32` placed the derived patch id in
+     * the HIGH 32 bits, so a reader that split the ULONGLONG the usual
+     * way (rax = (ULONG)value, edx = (ULONG)(value >> 32)) would see
+     * EAX = 0, EDX = patch id -- the Intel split, with the halves
+     * swapped versus AMD. The vmexit MSR fallback now serves a fixed
+     * Zen 4 B2 patch id for RDMSR 0x8B, so this global is no longer on
+     * the RDMSR path; keep the derivation but store the value in the
+     * AMD-correct position so any future consumer gets sane bytes. */
+    g_identity_microcode_rev = (ULONGLONG)derive_u32(cfg->seed, "microcode_rev");
 
     g_identity_platform_id   = derive_u64(cfg->seed, "platform_id");
 
-    /* CPUID 0x15 TSC/crystal ratio. Choose a 24 MHz crystal and a
-     * 100:1-ish ratio so the computed base frequency lands in a
-     * believable range. The seed shifts both the ratio and the crystal
-     * within narrow bands. */
-    {
-        ULONG r = derive_u32(cfg->seed, "tsc_ratio");
-        g_identity_tsc_denom   = 1 + (r & 0x3u);         /* 1..4 */
-        g_identity_tsc_numer   = 100 + (ULONG)((r >> 2) % 60u); /* 100..159 */
-        g_identity_tsc_crystal = 24000000U + (ULONG)((r >> 8) % 1000000u); /* ~24 MHz */
-    }
-
-    /* CPUID 0x16 base/max/bus frequency in MHz. */
-    {
-        ULONG f = derive_u32(cfg->seed, "cpu_freq_mhz");
-        g_identity_cpu_base_mhz = 2400U + (ULONG)((f      ) % 3000u); /* 2.4..5.4 GHz */
-        g_identity_cpu_max_mhz  = g_identity_cpu_base_mhz +
-                                  (ULONG)((f >>  8) % 1000u);
-        g_identity_cpu_bus_mhz  = 100U;
-    }
+    /* CPUID 0x15 (TSC/crystal ratio) and 0x16 (processor base/max/bus
+     * MHz) are Intel-only reporting leaves. The vmexit handler's AMD
+     * zero-scrub zeros both unconditionally for an AuthenticAMD vendor
+     * string, so g_identity_tsc_* and g_identity_cpu_*_mhz have no
+     * downstream reader on this build. The rewrite helpers that once
+     * consumed them (rewrite_leaf_15 / rewrite_leaf_16) were deleted as
+     * dead code; the globals stay declared in identity.h so the ABI
+     * surface is unchanged but are no longer populated here, matching
+     * the always-zero leaves they described. */
 
     /* ---- Per-vCPU table ----------------------------------------- */
 

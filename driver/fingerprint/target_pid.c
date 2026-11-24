@@ -10,12 +10,36 @@
  * Design intent: the list is small (operator + 1-8 samples typical). A
  * fixed-size table with a KSPIN_LOCK is cheaper than a search tree and
  * runs at DISPATCH_LEVEL from the registry callback's post-op context.
+ *
+ * ---------------------------------------------------------------------
+ * Cross-file note (Wave 8.5 residual "launcher never calls ADD_PID"):
+ * The launcher-side DumpService / Operator UI has to call ADD_PID for
+ *   (a) its own launcher PID (so its spoofed reads do not fingerprint
+ *       the host while it polls the HV driver)
+ *   (b) every sample PID the operator picks in the UI, BEFORE arming
+ *       any dump trigger — cm_filter / flt / IC all short-circuit on
+ *       cfp_target_contains and will not rewrite buffers for an
+ *       unlisted PID.
+ * After ADD_PID, the launcher should also call
+ *   IOCTL_CFP_SET_SHIM_IMAGE (once per process, or once per driver
+ *     load if the shim is shared) with the raw bytes of
+ *     chamber_shim.dll — the driver holds the buffer until unload and
+ *     the image-load notify in instrumentation.c injects it into each
+ *     target.
+ * The launcher-side code change lives under launcher/Services/ and is
+ * out of this bucket (driver/fingerprint/*.c); this comment records
+ * the contract so a future launcher-side fixer knows where to tap in.
+ * ---------------------------------------------------------------------
  */
 
 #include "fingerprint_cfg.h"
 
-#define CFP_TAG                      'cFPC'
+/* Pool tag resolves through the shared symbol in cfg_shared.c: every
+ * fp allocation wears the per-install tag the CFG swap assigned
+ * rather than wearing the hard-coded 'cFPC' giveaway. */
+#define CFP_TAG                      (g_cfp_pool_tag)
 #define CFP_MAX_PIDS                 32
+#define CFP_MAX_SHIM_BYTES           (1u * 1024u * 1024u)   /* 1 MiB cap */
 
 /* IOCTL control codes. Use FILE_DEVICE_UNKNOWN (0x22), the standard for
  * a custom control device — the previous 0x8001 was one nibble away
@@ -33,6 +57,14 @@
  * its own PIDs back from the driver — it holds them locally. See
  * target_pid.c history for the removed dispatch case. */
 #define IOCTL_CFP_CLEAR         CTL_CODE(CFP_IOCTL_DEVICE_TYPE, 0x804, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+/* Shim-image push: the launcher calls this exactly once (per driver
+ * load, or whenever the shim payload changes) with the raw bytes of
+ * chamber_shim.dll in SystemBuffer. instrumentation.c keeps the
+ * stored buffer in paged pool and its PsSetLoadImageNotifyRoutine
+ * maps the bytes into each target's user AS on first image load. A
+ * zero-length write clears the stored buffer. */
+#define IOCTL_CFP_SET_SHIM_IMAGE   CTL_CODE(CFP_IOCTL_DEVICE_TYPE, 0x806, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_CFP_CLEAR_SHIM_IMAGE CTL_CODE(CFP_IOCTL_DEVICE_TYPE, 0x807, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 typedef struct _CFP_IOCTL_PID {
     ULONG pid;              /* 32-bit; HANDLE values on x64 are always
@@ -189,6 +221,24 @@ cfp_target_handle_ioctl(_In_ PIRP irp,
 
     case IOCTL_CFP_CLEAR:
         cfp_target_cleanup();
+        status = STATUS_SUCCESS;
+        break;
+
+    case IOCTL_CFP_SET_SHIM_IMAGE:
+        /* Enforce the per-call length cap before the TU-crossing call:
+         * the dispatcher runs at PASSIVE_LEVEL for METHOD_BUFFERED and
+         * instrumentation.c duplicates the bytes into its own paged
+         * pool — a hostile caller could otherwise ask for an
+         * arbitrary-sized duplicate. */
+        if (in_len == 0 || in_len > CFP_MAX_SHIM_BYTES) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        status = cfp_instr_set_shim_image(buf, in_len);
+        break;
+
+    case IOCTL_CFP_CLEAR_SHIM_IMAGE:
+        cfp_instr_clear_shim_image();
         status = STATUS_SUCCESS;
         break;
     }

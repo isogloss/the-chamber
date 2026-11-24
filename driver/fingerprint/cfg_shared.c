@@ -19,10 +19,15 @@
  * The compile-time literal was 'cFPC' ("CPFc" in poolmon) — a per-driver
  * fingerprint that made the fp image stand out against the HV image's
  * own randomized tags. Sourcing the tag from the same CFG array keeps
- * every chamber-authored allocation under a single rotating identity. */
-static ULONG g_cfp_tag = CHAMBER_POOL_TAG;
+ * every chamber-authored allocation under a single rotating identity.
+ *
+ * Exported (non-static) so entry.c, target_pid.c, instrumentation.c and
+ * flt_filter.c resolve the SAME runtime tag at every ExAllocatePool2 /
+ * ExFreePoolWithTag site and no translation unit in this directory
+ * bakes 'cFPC' into .rdata. See fingerprint_cfg.h for the extern. */
+ULONG g_cfp_pool_tag = CHAMBER_POOL_TAG;
 
-#define CFP_TAG         (g_cfp_tag)
+#define CFP_TAG         (g_cfp_pool_tag)
 
 /* CFG blob is stored as a padded REG_BINARY whose on-the-wire length is
  * jittered across installs. The launcher derives the pad length from
@@ -45,7 +50,7 @@ static BOOLEAN  g_cfg_loaded  = FALSE;
 /* Tag the current blob was allocated under, captured before the
  * per-install tag swap. ExFreePoolWithTag must match the allocator's
  * tag, so cfp_cfg_unload uses this remembered value rather than the
- * (now-swapped) g_cfp_tag. */
+ * (now-swapped) g_cfp_pool_tag. */
 static ULONG    g_cfg_blob_tag = 0;
 
 /* -------- offset table (byte-exact against CFG v2 wire format) ----- */
@@ -216,7 +221,7 @@ cfp_read_cfgblob(_In_  PUNICODE_STRING service_key,
      * is the closest in role to the fp's control-device dispatch. */
     ULONG new_tag = *(PULONG)(blob + OFF_POOL_TAG + 5 * sizeof(ULONG));
     if (new_tag != 0) {
-        g_cfp_tag = new_tag;
+        g_cfp_pool_tag = new_tag;
     }
 
     *out_buf = blob;
@@ -253,8 +258,8 @@ cfp_cfg_unload(void)
     if (g_cfg_blob) {
         RtlSecureZeroMemory(g_cfg_blob, g_cfg_len);
         /* Use the tag the blob was allocated under, not the possibly-
-         * updated g_cfp_tag — they differ once the per-install tag
-         * swap ran. */
+         * updated g_cfp_pool_tag — they differ once the per-install
+         * tag swap ran. */
         ExFreePoolWithTag(g_cfg_blob,
                           g_cfg_blob_tag ? g_cfg_blob_tag : CFP_TAG);
         g_cfg_blob = NULL;
@@ -329,6 +334,13 @@ cfp_cfg_get(_In_ ULONG field_id,
     case CFP_FID_GPU_VEN_DEV:         return cfp_copy_field(OFF_GPU_VEN_DEV,          4,  out, len);
     case CFP_FID_EDID_NONCE:          return cfp_copy_field(OFF_EDID_NONCE,          16,  out, len);
     case CFP_FID_TOGGLES:             return cfp_copy_field(OFF_TOGGLES,              4,  out, len);
+    /* 12 ASCII bytes each; the launcher writes these at CFG derive time
+     * so a caller inside the driver can rebuild a device / service name
+     * that the launcher already knows (see entry.c for the device-name
+     * derivation and the handshake the launcher relies on to open the
+     * control device without guessing a per-boot random suffix). */
+    case CFP_FID_SERVICE_NAME:        return cfp_copy_field(OFF_SERVICE_NAME,        12,  out, len);
+    case CFP_FID_DEVICE_SUFFIX:       return cfp_copy_field(OFF_DEVICE_SUFFIX,       12,  out, len);
     }
     return FALSE;
 }

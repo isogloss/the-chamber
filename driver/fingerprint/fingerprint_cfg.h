@@ -51,12 +51,38 @@ enum cfp_field_id {
     CFP_FID_VOLUME_SERIAL_0 = 200,  /* 4 bytes per volume; +N for volume N (0..3) */
     CFP_FID_GPU_VEN_DEV,            /* 4 bytes: (VEN<<16)|DEV */
     CFP_FID_EDID_NONCE,             /* 16 raw bytes */
-    CFP_FID_TOGGLES                 /* 4 bytes (bit-packed; see CFG v2 offset 44) */
+    CFP_FID_TOGGLES,                /* 4 bytes (bit-packed; see CFG v2 offset 44) */
+    CFP_FID_SERVICE_NAME,           /* 12 bytes ASCII (NUL-terminated or filled) */
+    CFP_FID_DEVICE_SUFFIX           /* 12 bytes ASCII (NUL-terminated or filled) */
 };
 
 /* Toggle bit indices (match CFG v2 toggles field). */
 #define CFP_TOGGLE_CI_STATE_SPOOF        0x00000001UL
 #define CFP_TOGGLE_MACHINE_IDENTITY      0x00000002UL
 #define CFP_TOGGLE_TPM_ABSENT            0x00000200UL
+
+/* Per-install pool tag. Lives in cfg_shared.c. Starts as a neutral
+ * CHAMBER_POOL_TAG default at image load and gets replaced by the
+ * launcher-derived value inside cfp_cfg_load. Every ExAllocatePool2 /
+ * ExFreePoolWithTag site in driver/fingerprint/*.c reads from this
+ * symbol so no file wears a hard-coded per-driver 'cFPC' fingerprint.
+ * Allocations made after cfg load use the swapped tag; free callers
+ * must use the same runtime value unless the alloc site captured its
+ * own tag (as cfg_shared.c does for the blob allocation).
+ */
+extern ULONG g_cfp_pool_tag;
+
+/* Shim-image push (launcher → driver) and lifecycle. The launcher
+ * sends the raw bytes of chamber_shim.dll (or a trampoline-only
+ * payload) through IOCTL_CFP_SET_SHIM_IMAGE after IOCTL_CFP_ADD_PID
+ * and before spawning the target: cfp_instr_set_shim_image stores a
+ * single shared copy in paged pool, and the PsSetLoadImageNotifyRoutine
+ * handler cfp_instr_on_image_load maps that copy into the target's
+ * user address space on the first qualifying image load. The driver
+ * owns the stored buffer until cfp_instr_unregister (or a reset).
+ */
+NTSTATUS cfp_instr_set_shim_image(_In_reads_bytes_(len) PVOID bytes,
+                                  _In_ ULONG len);
+void     cfp_instr_clear_shim_image(void);
 
 #endif /* CHAMBER_FINGERPRINT_CFG_H */

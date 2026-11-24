@@ -38,6 +38,28 @@ public sealed class DriverLoader
     public string? LoadedFingerprintServiceName { get; private set; }
     public string? LoadedFingerprintImagePath { get; private set; }
 
+    /// <summary>
+    /// Full NT path (<c>\\.\&lt;suffix&gt;</c>) of the fingerprint driver's
+    /// control device, populated by
+    /// <see cref="QueryFingerprintDeviceNameAsync"/> on the first query
+    /// and cached for later <see cref="OpenFingerprintDeviceAsync"/> calls.
+    /// Null until the query lands successfully. The suffix is per-boot
+    /// random (see driver/fingerprint/entry.c:build_random_name), so
+    /// there is no stable literal the launcher can hard-code; the
+    /// property is set exactly once per driver load and cleared by
+    /// <see cref="UnloadFingerprintAsync"/>.
+    /// </summary>
+    public string? LoadedFingerprintDevicePath { get; private set; }
+
+    // Query-once memoization: QueryFingerprintDeviceNameAsync is idempotent
+    // and returns the cached suffix on the second and later calls. A
+    // SemaphoreSlim serialises concurrent first-time queries — DumpService
+    // can race the UI's status poller against a trigger arm, and without
+    // serialisation both would see a null cache, both would issue the
+    // IOCTL, and the slower winner would overwrite the earlier one with
+    // the same value (safe but wasteful).
+    private readonly SemaphoreSlim _fpNameQueryLock = new(1, 1);
+
     public async Task<SafeFileHandle> InstallAndLoadAsync(
         string serviceName,
         string imagePath,
@@ -112,13 +134,17 @@ public sealed class DriverLoader
     /// the already-patched 632-byte CFG v2 blob under the service's
     /// <c>Parameters\CfgBlob</c> value (REG_BINARY) so that
     /// <c>chamber_fingerprint!cfp_cfg_load</c> can pick it up at
-    /// <c>DriverEntry</c>. The fingerprint driver's control device is a
-    /// fixed-name symlink published inside the driver
-    /// (<c>\\.\CFPControl</c>), so no device handle is returned here — the
-    /// operator can open it on demand. Call this AFTER the HV driver has
-    /// loaded; the fingerprint driver depends on CFG v2 being readable
-    /// from registry and on a live SVM environment for its hypercall
-    /// callback into the HV side.
+    /// <c>DriverEntry</c>. The fingerprint driver's control device is
+    /// published under a per-boot random DOS suffix (see
+    /// <c>driver/fingerprint/entry.c:build_random_name</c>) — the former
+    /// static literal <c>\\.\CFPControl</c> is obsolete and must not
+    /// appear anywhere in the launcher. The suffix is not known at this
+    /// call site; the launcher learns it off the HV control handle via
+    /// <see cref="QueryFingerprintDeviceNameAsync"/>, which is why no
+    /// device handle is returned from here. Call this AFTER the HV
+    /// driver has loaded; the fingerprint driver depends on CFG v2
+    /// being readable from registry and on a live SVM environment for
+    /// its hypercall callback into the HV side.
     /// </summary>
     /// <param name="serviceName">
     /// Seed-minted service name for <c>chamber_fingerprint.sys</c>. Must be
@@ -228,6 +254,151 @@ public sealed class DriverLoader
         return h;
     }
 
+    /// <summary>
+    /// Learn and cache the fingerprint driver's per-boot random DOS
+    /// device suffix. The HV driver and the fingerprint driver share
+    /// one CFG v2 blob, so the HV side is authoritative: this method
+    /// opens a fresh HV control handle, sends
+    /// <see cref="DumpIoctls.IoctlGetFingerprintDeviceName"/>, and
+    /// stores the result in <see cref="LoadedFingerprintDevicePath"/>.
+    /// Idempotent — the second call returns the cached value without
+    /// issuing another IOCTL. Returns null if the fingerprint driver
+    /// has not been loaded (<see cref="LoadedFingerprintServiceName"/>
+    /// is null) so a caller can treat fingerprint integration as
+    /// strictly optional.
+    /// </summary>
+    public async Task<string?> QueryFingerprintDeviceNameAsync()
+    {
+        if (LoadedFingerprintServiceName is null)
+        {
+            // Fingerprint driver is not loaded; nothing to resolve.
+            return null;
+        }
+        if (LoadedFingerprintDevicePath is not null)
+        {
+            return LoadedFingerprintDevicePath;
+        }
+
+        await _fpNameQueryLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            // Re-check after taking the lock; another thread may have
+            // completed the query while we were waiting on the semaphore.
+            if (LoadedFingerprintDevicePath is not null)
+            {
+                return LoadedFingerprintDevicePath;
+            }
+
+            var resolved = await Task.Run(() =>
+            {
+                using var hv = OpenDevice();
+                var outSize = Marshal.SizeOf<DumpIoctls.FingerprintDeviceNameResponse>();
+                var outBuf = Marshal.AllocHGlobal(outSize);
+                try
+                {
+                    // Zero-fill: ByValTStr marshalling reads up to the
+                    // first NUL from the returned buffer, so a stale
+                    // tail cannot bleed into the managed string.
+                    for (var i = 0; i < outSize; ++i)
+                    {
+                        Marshal.WriteByte(outBuf, i, 0);
+                    }
+
+                    if (!NativeMethods.DeviceIoControl(
+                            hv,
+                            DumpIoctls.IoctlGetFingerprintDeviceName,
+                            IntPtr.Zero, 0,
+                            outBuf, (uint)outSize,
+                            out var returned, IntPtr.Zero))
+                    {
+                        throw new Win32Exception(
+                            Marshal.GetLastWin32Error(),
+                            "IOCTL_CFP_GET_DEVICE_NAME failed.");
+                    }
+                    if (returned < (uint)Marshal.SizeOf<uint>() * 2)
+                    {
+                        // Header did not fit; the driver has a protocol
+                        // mismatch we cannot recover from here.
+                        throw new InvalidOperationException(
+                            "IOCTL_CFP_GET_DEVICE_NAME: short response.");
+                    }
+                    var resp = Marshal.PtrToStructure<DumpIoctls.FingerprintDeviceNameResponse>(outBuf);
+                    var len = (int)Math.Min(resp.SuffixLengthChars, 128);
+                    if (len <= 0 || string.IsNullOrEmpty(resp.Suffix))
+                    {
+                        throw new InvalidOperationException(
+                            "IOCTL_CFP_GET_DEVICE_NAME: empty suffix.");
+                    }
+                    // Trim on the explicit length — the driver does not
+                    // null-terminate, and ByValTStr relies on ambient NUL.
+                    // Take whichever is shorter.
+                    var raw = resp.Suffix;
+                    if (raw.Length > len) raw = raw.Substring(0, len);
+                    return @"\\.\" + raw;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(outBuf);
+                }
+            }).ConfigureAwait(false);
+
+            LoadedFingerprintDevicePath = resolved;
+            return resolved;
+        }
+        finally
+        {
+            _fpNameQueryLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Open a handle to the fingerprint driver's control device. The
+    /// path is resolved lazily via
+    /// <see cref="QueryFingerprintDeviceNameAsync"/> on the first call,
+    /// then cached in <see cref="LoadedFingerprintDevicePath"/>. Throws
+    /// <see cref="InvalidOperationException"/> if the fingerprint
+    /// driver is not loaded. The caller owns the returned handle and
+    /// must dispose it (DumpService opens one per IOCTL, mirroring
+    /// <see cref="OpenDevice"/>'s discipline).
+    /// </summary>
+    public async Task<SafeFileHandle> OpenFingerprintDeviceAsync()
+    {
+        var path = LoadedFingerprintDevicePath
+                   ?? await QueryFingerprintDeviceNameAsync().ConfigureAwait(false);
+        if (string.IsNullOrEmpty(path))
+        {
+            throw new InvalidOperationException(
+                "Fingerprint driver not loaded or its device name has not been resolved.");
+        }
+
+        var h = NativeMethods.CreateFileW(
+            path,
+            NativeMethods.GENERIC_READ | NativeMethods.GENERIC_WRITE,
+            NativeMethods.FILE_SHARE_READ | NativeMethods.FILE_SHARE_WRITE,
+            IntPtr.Zero,
+            NativeMethods.OPEN_EXISTING,
+            0,
+            IntPtr.Zero);
+
+        if (h.IsInvalid)
+        {
+            var err = Marshal.GetLastWin32Error();
+            if (err == NativeMethods.ERROR_FILE_NOT_FOUND)
+            {
+                // The ephemeral DOS symlink may have been torn down after
+                // the first IOCTL_CFP_ARM_PID handshake (see entry.c:
+                // g_first_handshake_done). Invalidate the cache so the
+                // next call re-queries and either refreshes the suffix
+                // or surfaces the real failure.
+                LoadedFingerprintDevicePath = null;
+                throw new FileNotFoundException(
+                    "Fingerprint device symlink not available; re-query required.");
+            }
+            throw new Win32Exception(err, $"CreateFileW({path}) failed.");
+        }
+        return h;
+    }
+
     public async Task UnloadAsync(SafeFileHandle? device)
     {
         // Unload in reverse order of load: fingerprint first (it depends on
@@ -307,5 +478,12 @@ public sealed class DriverLoader
 
         LoadedFingerprintServiceName = null;
         LoadedFingerprintImagePath = null;
+        // Clearing the cached device path belongs here, not in
+        // UnloadAsync's trailer: the device path is tied to the
+        // fingerprint driver's current load, and leaving a stale suffix
+        // live past NtUnloadDriver would let OpenFingerprintDeviceAsync
+        // hand back a handle to whatever device object had since
+        // re-used that name.
+        LoadedFingerprintDevicePath = null;
     }
 }

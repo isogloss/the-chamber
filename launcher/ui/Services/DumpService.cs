@@ -2,7 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 using TheChamber.Interop;
@@ -38,9 +41,233 @@ public sealed class DumpService
 {
     private readonly DriverLoader _loader;
 
+    // Logical name the launcher's .csproj gives the embedded shim DLL
+    // (<EmbeddedResource .. LogicalName="TheChamber.Drivers.chamber_shim.dll"/>).
+    // Resolving it by LogicalName rather than by relative file path keeps
+    // the single-file publish working — the resource travels inside the
+    // assembly, not next to it on disk.
+    private const string ShimResourceName = "TheChamber.Drivers.chamber_shim.dll";
+
+    // Wave 8.5 fingerprint coordination state. Guards against duplicate
+    // pushes of the shim image (several MB per copy — the driver only
+    // needs one) and lets Clear undo add_pid for the last-selected
+    // target without the caller remembering the PID themselves.
+    private readonly SemaphoreSlim _fpStateLock = new(1, 1);
+    private bool _shimImagePushed;
+    private uint? _currentTargetPid;
+
     public DumpService(DriverLoader loader)
     {
         _loader = loader ?? throw new ArgumentNullException(nameof(loader));
+    }
+
+    /// <summary>
+    /// Push the embedded <c>chamber_shim.dll</c> bytes to the
+    /// fingerprint driver via IOCTL_CFP_SET_SHIM_IMAGE and remember
+    /// that it was pushed. Idempotent: on the second and later calls
+    /// the embedded bytes are not reloaded and the IOCTL is skipped.
+    /// Call this at service initialization (before the first
+    /// Arm/Dump) and again whenever the fingerprint driver reloads;
+    /// the latter path resets the "pushed" flag through
+    /// <see cref="InvalidateFingerprintStateAsync"/>.
+    /// A no-op if either the shim resource or the fingerprint driver
+    /// is not loaded — fingerprint integration is optional, and
+    /// returning quietly keeps the dump-tab usable on a dev machine
+    /// that has only the HV side built.
+    /// </summary>
+    public async Task<bool> PushShimImageAsync()
+    {
+        if (_loader.LoadedFingerprintServiceName is null)
+        {
+            return false;
+        }
+
+        await _fpStateLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_shimImagePushed) return true;
+
+            var shimBytes = LoadEmbeddedShimOrNull();
+            if (shimBytes is null || shimBytes.Length == 0)
+            {
+                // Dev build without the shim artifact; mark pushed so
+                // we don't keep probing the resource stream on every
+                // Arm call.
+                _shimImagePushed = true;
+                return false;
+            }
+
+            var sha = SHA256.HashData(shimBytes);
+
+            await Task.Run(() =>
+            {
+                using var fp = _loader.OpenFingerprintDeviceAsync().GetAwaiter().GetResult();
+                var headerSize = Marshal.SizeOf<CfpIoctls.SetShimImageRequest>();
+                var totalSize = headerSize + shimBytes.Length;
+                var inBuf = Marshal.AllocHGlobal(totalSize);
+                try
+                {
+                    var hdr = new CfpIoctls.SetShimImageRequest
+                    {
+                        ImageSize = (uint)shimBytes.Length,
+                        Flags = 0,
+                        ExpectedSha256 = sha,
+                    };
+                    Marshal.StructureToPtr(hdr, inBuf, fDeleteOld: false);
+                    Marshal.Copy(shimBytes, 0, IntPtr.Add(inBuf, headerSize), shimBytes.Length);
+
+                    if (!NativeMethods.DeviceIoControl(
+                            fp,
+                            CfpIoctls.IoctlSetShimImage,
+                            inBuf, (uint)totalSize,
+                            IntPtr.Zero, 0,
+                            out _, IntPtr.Zero))
+                    {
+                        throw new Win32Exception(
+                            Marshal.GetLastWin32Error(),
+                            "IOCTL_CFP_SET_SHIM_IMAGE failed.");
+                    }
+                }
+                finally
+                {
+                    Marshal.DestroyStructure<CfpIoctls.SetShimImageRequest>(inBuf);
+                    Marshal.FreeHGlobal(inBuf);
+                }
+            }).ConfigureAwait(false);
+
+            _shimImagePushed = true;
+            return true;
+        }
+        finally
+        {
+            _fpStateLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Push <paramref name="pid"/> to the fingerprint driver's spoof
+    /// list via IOCTL_CFP_ADD_PID. Called in response to an
+    /// OperatorWindow process-select event; the driver's registry /
+    /// FLT / IC callbacks then gate on membership so unlisted PIDs
+    /// pay no rewrite cost. Idempotent on the driver side (see
+    /// cfp_target_add in driver/fingerprint/target_pid.c), so a
+    /// redundant selection is cheap.
+    /// </summary>
+    public async Task SetTargetPidAsync(uint pid)
+    {
+        if (_loader.LoadedFingerprintServiceName is null) return;
+        if (pid == 0) throw new ArgumentOutOfRangeException(nameof(pid));
+
+        // Make sure the shim image is in place before any spoofed PID
+        // lands; the driver pairs the two, and a PID added before the
+        // shim is staged would spin in the post-create callback.
+        await PushShimImageAsync().ConfigureAwait(false);
+
+        var req = new CfpIoctls.CfpPidRequest { Pid = pid, Reserved = 0 };
+        await RunFingerprintVoidAsync(CfpIoctls.IoctlAddPid, req, "IOCTL_CFP_ADD_PID")
+            .ConfigureAwait(false);
+
+        await _fpStateLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            _currentTargetPid = pid;
+        }
+        finally
+        {
+            _fpStateLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Drop <paramref name="pid"/> from the fingerprint driver's spoof
+    /// list via IOCTL_CFP_REMOVE_PID. Safe to call for a PID that is
+    /// not currently listed; the driver returns STATUS_NOT_FOUND which
+    /// is surfaced as a Win32Exception the caller can swallow.
+    /// </summary>
+    public async Task RemoveTargetPidAsync(uint pid)
+    {
+        if (_loader.LoadedFingerprintServiceName is null) return;
+        if (pid == 0) throw new ArgumentOutOfRangeException(nameof(pid));
+
+        var req = new CfpIoctls.CfpPidRequest { Pid = pid, Reserved = 0 };
+        try
+        {
+            await RunFingerprintVoidAsync(CfpIoctls.IoctlRemovePid, req, "IOCTL_CFP_REMOVE_PID")
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            await _fpStateLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (_currentTargetPid == pid) _currentTargetPid = null;
+            }
+            finally
+            {
+                _fpStateLock.Release();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Clear every PID in the fingerprint driver's spoof list via
+    /// IOCTL_CFP_CLEAR. Called on process-deselect (when the operator
+    /// picks "no process") and as part of
+    /// <see cref="DisarmAllAsync"/> so a disarmed session does not
+    /// leave the driver spoofing stale PIDs.
+    /// </summary>
+    public async Task ClearTargetsAsync()
+    {
+        if (_loader.LoadedFingerprintServiceName is null) return;
+
+        await Task.Run(() =>
+        {
+            using var fp = _loader.OpenFingerprintDeviceAsync().GetAwaiter().GetResult();
+            if (!NativeMethods.DeviceIoControl(
+                    fp,
+                    CfpIoctls.IoctlClear,
+                    IntPtr.Zero, 0,
+                    IntPtr.Zero, 0,
+                    out _, IntPtr.Zero))
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "IOCTL_CFP_CLEAR failed.");
+            }
+        }).ConfigureAwait(false);
+
+        await _fpStateLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            _currentTargetPid = null;
+        }
+        finally
+        {
+            _fpStateLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Reset the service's cached fingerprint-driver state, so the
+    /// next <see cref="PushShimImageAsync"/> re-pushes the shim and
+    /// the next <see cref="SetTargetPidAsync"/> re-asserts its PID.
+    /// Call this if the fingerprint driver has been reloaded under
+    /// the service — the HV side can stay up while the fingerprint
+    /// side is replaced, and the driver-side state table is empty
+    /// again after such a reload.
+    /// </summary>
+    public async Task InvalidateFingerprintStateAsync()
+    {
+        await _fpStateLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            _shimImagePushed = false;
+            _currentTargetPid = null;
+        }
+        finally
+        {
+            _fpStateLock.Release();
+        }
     }
 
     /// <summary>
@@ -58,6 +285,14 @@ public sealed class DumpService
             throw new ArgumentException("Output directory required.", nameof(outputDir));
 
         Directory.CreateDirectory(outputDir);
+
+        // Keep the fingerprint driver aware of this PID so any in-flight
+        // registry / FLT / IC callback for the dumped process spoofs its
+        // fingerprint while the dump is captured. Best effort: a
+        // fingerprint-side failure is logged into the Win32Exception
+        // message but does not abort the dump, which can still complete
+        // on the HV side alone.
+        await TryEnsureFingerprintTargetAsync(pid).ConfigureAwait(false);
 
         // 128 MiB window matches the driver's current ring budget for a
         // single-shot capture; operators can retry with a larger buffer
@@ -109,28 +344,32 @@ public sealed class DumpService
     }
 
     /// <summary>Arm the write-to-execute trigger for the target.</summary>
-    public Task ArmWxAsync(uint pid)
+    public async Task ArmWxAsync(uint pid)
     {
+        await TryEnsureFingerprintTargetAsync(pid).ConfigureAwait(false);
         var req = new DumpIoctls.ArmPidRequest { Pid = pid };
-        return RunVoidAsync(DumpIoctls.IoctlArmWx, req, "IOCTL_ARM_WX");
+        await RunVoidAsync(DumpIoctls.IoctlArmWx, req, "IOCTL_ARM_WX").ConfigureAwait(false);
     }
 
     /// <summary>Arm the "execute at suspected OEP" trigger.</summary>
-    public Task ArmOepAsync(uint pid, ulong oep)
+    public async Task ArmOepAsync(uint pid, ulong oep)
     {
+        await TryEnsureFingerprintTargetAsync(pid).ConfigureAwait(false);
         var req = new DumpIoctls.ArmOepRequest { Pid = pid, Oep = oep };
-        return RunVoidAsync(DumpIoctls.IoctlArmOep, req, "IOCTL_ARM_OEP");
+        await RunVoidAsync(DumpIoctls.IoctlArmOep, req, "IOCTL_ARM_OEP").ConfigureAwait(false);
     }
 
     /// <summary>Arm the "N bytes written to watched page range" trigger.</summary>
-    public Task ArmWriteThresholdAsync(uint pid, uint bytes)
+    public async Task ArmWriteThresholdAsync(uint pid, uint bytes)
     {
+        await TryEnsureFingerprintTargetAsync(pid).ConfigureAwait(false);
         var req = new DumpIoctls.ArmWriteThresholdRequest
         {
             Pid = pid,
             ThresholdBytes = bytes,
         };
-        return RunVoidAsync(DumpIoctls.IoctlArmWriteThreshold, req, "IOCTL_ARM_WRITE_THRESHOLD");
+        await RunVoidAsync(DumpIoctls.IoctlArmWriteThreshold, req, "IOCTL_ARM_WRITE_THRESHOLD")
+            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -141,19 +380,24 @@ public sealed class DumpService
     /// the arm in the history list once <see cref="DisarmAllAsync"/> or
     /// a driver-side cancel clears it.
     /// </summary>
-    public Task ArmPayloadAsync(uint pid)
+    public async Task ArmPayloadAsync(uint pid)
     {
+        await TryEnsureFingerprintTargetAsync(pid).ConfigureAwait(false);
         var req = new DumpIoctls.ArmPidRequest { Pid = pid };
-        return RunVoidAsync(DumpIoctls.IoctlArmPayload, req, "IOCTL_ARM_PAYLOAD");
+        await RunVoidAsync(DumpIoctls.IoctlArmPayload, req, "IOCTL_ARM_PAYLOAD").ConfigureAwait(false);
     }
 
     /// <summary>
     /// Drops every arm this session issued. Safe to call with no arms
-    /// pending; the driver returns success either way.
+    /// pending; the driver returns success either way. The fingerprint
+    /// driver's spoof list is cleared last so a disarmed session
+    /// stops spoofing whatever PIDs were in flight; a fingerprint-side
+    /// failure is swallowed because the HV disarm has already
+    /// succeeded by that point and is the user-visible outcome.
     /// </summary>
-    public Task DisarmAllAsync()
+    public async Task DisarmAllAsync()
     {
-        return Task.Run(() =>
+        await Task.Run(() =>
         {
             using var h = _loader.OpenDevice();
             if (!NativeMethods.DeviceIoControl(
@@ -167,7 +411,17 @@ public sealed class DumpService
                     Marshal.GetLastWin32Error(),
                     "IOCTL_DISARM_TRIGGERS failed.");
             }
-        });
+        }).ConfigureAwait(false);
+
+        try
+        {
+            await ClearTargetsAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            // HV disarm already succeeded; swallowing keeps the
+            // caller's view of "disarm succeeded" accurate.
+        }
     }
 
     /// <summary>
@@ -323,5 +577,84 @@ public sealed class DumpService
             Marshal.FreeHGlobal(inBuf);
             Marshal.FreeHGlobal(outBuf);
         }
+    }
+
+    // --- Wave 8.5 fingerprint-driver helpers ---
+
+    /// <summary>
+    /// Best-effort ensure that the shim is staged and <paramref name="pid"/>
+    /// is on the fingerprint driver's spoof list. If the fingerprint
+    /// driver is not loaded, this is a no-op. If it is loaded but the
+    /// push fails, the exception is swallowed: the HV-side Arm/Dump
+    /// that follows is the user-visible operation, and a fingerprint
+    /// failure must not abort it. Use <see cref="SetTargetPidAsync"/>
+    /// directly when the caller wants the failure propagated.
+    /// </summary>
+    private async Task TryEnsureFingerprintTargetAsync(uint pid)
+    {
+        if (_loader.LoadedFingerprintServiceName is null) return;
+        try
+        {
+            await SetTargetPidAsync(pid).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Fingerprint-side failure must not abort the HV arm/dump.
+            // The caller surfaces the HV result; fingerprint integration
+            // is an auxiliary surface.
+        }
+    }
+
+    /// <summary>
+    /// Fingerprint-device equivalent of <see cref="RunVoidAsync"/>:
+    /// opens a fresh control-device handle on the fingerprint driver,
+    /// marshals <paramref name="req"/>, and surfaces a Win32Exception
+    /// on failure. Serialised through <see cref="_fpStateLock"/> is
+    /// unnecessary here — DeviceIoControl is thread-safe.
+    /// </summary>
+    private Task RunFingerprintVoidAsync<TIn>(uint code, TIn req, string ioctlName)
+        where TIn : struct
+    {
+        return Task.Run(() =>
+        {
+            using var fp = _loader.OpenFingerprintDeviceAsync().GetAwaiter().GetResult();
+            var inSize = Marshal.SizeOf<TIn>();
+            var inBuf = Marshal.AllocHGlobal(inSize);
+            try
+            {
+                Marshal.StructureToPtr(req, inBuf, fDeleteOld: false);
+                if (!NativeMethods.DeviceIoControl(
+                        fp, code,
+                        inBuf, (uint)inSize,
+                        IntPtr.Zero, 0,
+                        out _, IntPtr.Zero))
+                {
+                    throw new Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        $"{ioctlName} failed.");
+                }
+            }
+            finally
+            {
+                Marshal.DestroyStructure<TIn>(inBuf);
+                Marshal.FreeHGlobal(inBuf);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Read the embedded <c>chamber_shim.dll</c> bytes out of this
+    /// assembly's manifest resources. Returns null on a dev build that
+    /// published without the shim DLL (Condition="Exists(...)" in the
+    /// csproj skips the EmbeddedResource in that case).
+    /// </summary>
+    private static byte[]? LoadEmbeddedShimOrNull()
+    {
+        var asm = Assembly.GetExecutingAssembly();
+        using var s = asm.GetManifestResourceStream(ShimResourceName);
+        if (s is null) return null;
+        using var ms = new MemoryStream();
+        s.CopyTo(ms);
+        return ms.ToArray();
     }
 }
