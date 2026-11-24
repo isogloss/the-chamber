@@ -29,8 +29,7 @@
             <StackPanel Grid.Column="0" VerticalAlignment="Top">
                 <TextBlock Text="IDENTITY"
                            Foreground="{StaticResource ChamberFg}"
-                           FontSize="22"
-                           LetterSpacing="6" />
+                           FontSize="22" />
                 <TextBlock Text="every process-observable fingerprint under one seed"
                            Style="{StaticResource ChamberLabel}"
                            Margin="0,4,0,0" />
@@ -39,8 +38,7 @@
             <StackPanel Grid.Column="2" Orientation="Vertical" HorizontalAlignment="Right" VerticalAlignment="Top">
                 <TextBlock Text="SEED"
                            Style="{StaticResource ChamberLabel}"
-                           HorizontalAlignment="Right"
-                           LetterSpacing="3" />
+                           HorizontalAlignment="Right" />
                 <TextBlock x:Name="SeedHexA"
                            Style="{StaticResource ChamberValue}"
                            FontSize="12"
@@ -74,8 +72,7 @@
                                   Margin="0,16,0,0">
                         <StackPanel>
                             <TextBlock Text="IDENTITY FIELDS"
-                                       Style="{StaticResource ChamberLabel}"
-                                       LetterSpacing="4" Margin="0,0,0,8" />
+                                       Style="{StaticResource ChamberLabel}" Margin="0,0,0,8" />
 
                             <!-- Flat two-column grid of fields, populated in code behind
                                  against a scalar-field StackPanel so the control stays
@@ -84,7 +81,6 @@
 
                             <TextBlock Text="MAC ADDRESSES (6)"
                                        Style="{StaticResource ChamberLabel}"
-                                       LetterSpacing="4"
                                        Margin="0,16,0,8" />
                             <Border Style="{StaticResource ChamberRule}" />
                             <ItemsControl x:Name="MacList" Margin="0,8,0,0">
@@ -107,7 +103,6 @@
 
                             <TextBlock Text="DISK SERIALS (20)"
                                        Style="{StaticResource ChamberLabel}"
-                                       LetterSpacing="4"
                                        Margin="0,16,0,8" />
                             <Border Style="{StaticResource ChamberRule}" />
                             <ItemsControl x:Name="DiskList" Margin="0,8,0,0">
@@ -127,7 +122,6 @@
 
                             <TextBlock Text="VOLUME SERIALS (4)"
                                        Style="{StaticResource ChamberLabel}"
-                                       LetterSpacing="4"
                                        Margin="0,16,0,8" />
                             <Border Style="{StaticResource ChamberRule}" />
                             <ItemsControl x:Name="VolumeList" Margin="0,8,0,0">
@@ -191,7 +185,7 @@
             </Grid.ColumnDefinitions>
 
             <StackPanel Grid.Column="0" Orientation="Vertical">
-                <TextBlock Style="{StaticResource ChamberLabel}" LetterSpacing="3">
+                <TextBlock Style="{StaticResource ChamberLabel}">
                     <Run Text="only this seed survives across bootups. only " />
                     <Run Text="randomize" FontWeight="Bold" Foreground="{StaticResource ChamberFg}" />
                     <Run Text=" re-rolls." />
