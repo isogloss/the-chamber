@@ -127,6 +127,7 @@ $libs = @(
     (Join-Path $wdkLib 'ntoskrnl.lib'),
     (Join-Path $wdkLib 'hal.lib'),
     (Join-Path $wdkLib 'wmilib.lib'),
+    (Join-Path $wdkLib 'wdmsec.lib'),       # IoCreateDeviceSecure -> WdmlibIoCreateDeviceSecure
     (Join-Path $wdkLib 'BufferOverflowFastFailK.lib')
 ) | Where-Object { Test-Path $_ } | ForEach-Object { "`"$_`"" }
 $objArg = ($objFiles | ForEach-Object { "`"$_`"" }) -join ' '
