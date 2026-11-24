@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <!--
+    Managed-resource strings for the launcher UI. The driver .sys bytes
+    themselves do NOT live here — they are packed as <EmbeddedResource>
+    entries in TheChamber.csproj (with LogicalName set so
+    Assembly.GetManifestResourceStream can find them by stable name),
+    which keeps Assembly.GetManifestResourceStream reads one call deep
+    instead of routing through ResourceManager.
+  -->
+  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+
+  <data name="AppName" xml:space="preserve">
+    <value>The Chamber</value>
+    <comment>Product name shown on the splash and in dialogs.</comment>
+  </data>
+  <data name="AppTagline" xml:space="preserve">
+    <value>defensive hypervisor</value>
+  </data>
+  <data name="InstallFolderLeaf" xml:space="preserve">
+    <value>The Chamber</value>
+    <comment>Last component of %ProgramFiles%\The Chamber\ — do NOT prefix "\".</comment>
+  </data>
+  <data name="SeedStateLeaf" xml:space="preserve">
+    <value>TheChamber\seed.bin</value>
+    <comment>Relative to %AppData%. Format v1 wrapped in DPAPI.</comment>
+  </data>
+</root>

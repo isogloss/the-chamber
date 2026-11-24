@@ -1,0 +1,213 @@
+<Window x:Class="TheChamber.Views.RandomizeWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="The Chamber: identity"
+        Width="1080" Height="780"
+        MinWidth="960" MinHeight="620"
+        WindowStartupLocation="CenterOwner"
+        WindowStyle="SingleBorderWindow"
+        ResizeMode="CanResize"
+        Background="{StaticResource ChamberBg}"
+        FontFamily="{StaticResource ChamberMono}"
+        Foreground="{StaticResource ChamberFg}">
+
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Header: title + seed preview + Randomize-all -->
+        <Grid Grid.Row="0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Grid.Column="0" VerticalAlignment="Top">
+                <TextBlock Text="IDENTITY"
+                           Foreground="{StaticResource ChamberFg}"
+                           FontSize="22"
+                           LetterSpacing="6" />
+                <TextBlock Text="every process-observable fingerprint under one seed"
+                           Style="{StaticResource ChamberLabel}"
+                           Margin="0,4,0,0" />
+            </StackPanel>
+
+            <StackPanel Grid.Column="2" Orientation="Vertical" HorizontalAlignment="Right" VerticalAlignment="Top">
+                <TextBlock Text="SEED"
+                           Style="{StaticResource ChamberLabel}"
+                           HorizontalAlignment="Right"
+                           LetterSpacing="3" />
+                <TextBlock x:Name="SeedHexA"
+                           Style="{StaticResource ChamberValue}"
+                           FontSize="12"
+                           HorizontalAlignment="Right"
+                           Foreground="{StaticResource ChamberFgDim}" />
+                <TextBlock x:Name="SeedHexB"
+                           Style="{StaticResource ChamberValue}"
+                           FontSize="12"
+                           HorizontalAlignment="Right"
+                           Foreground="{StaticResource ChamberFgDim}" />
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
+                    <Button Content="copy" Click="OnCopySeed" Margin="0,0,8,0" />
+                    <Button Content="paste" Click="OnPasteSeed" Margin="0,0,8,0" />
+                    <Button Content="randomize all" Click="OnRandomizeAll" />
+                </StackPanel>
+            </StackPanel>
+        </Grid>
+
+        <!-- Tabs: machine identity / HV identity / toggles -->
+        <TabControl Grid.Row="1" Margin="0,20,0,0">
+
+            <!-- TAB 1: machine identity -->
+            <TabItem Header="MACHINE IDENTITY">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="auto" />
+                    </Grid.RowDefinitions>
+
+                    <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto"
+                                  Margin="0,16,0,0">
+                        <StackPanel>
+                            <TextBlock Text="IDENTITY FIELDS"
+                                       Style="{StaticResource ChamberLabel}"
+                                       LetterSpacing="4" Margin="0,0,0,8" />
+
+                            <!-- Flat two-column grid of fields, populated in code behind
+                                 against a scalar-field StackPanel so the control stays
+                                 readable even when the list grows. -->
+                            <StackPanel x:Name="IdentityScalars" />
+
+                            <TextBlock Text="MAC ADDRESSES (6)"
+                                       Style="{StaticResource ChamberLabel}"
+                                       LetterSpacing="4"
+                                       Margin="0,16,0,8" />
+                            <Border Style="{StaticResource ChamberRule}" />
+                            <ItemsControl x:Name="MacList" Margin="0,8,0,0">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid Margin="0,2">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="40" />
+                                                <ColumnDefinition Width="220" />
+                                                <ColumnDefinition Width="180" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="{Binding Index}" Foreground="{StaticResource ChamberFgFaint}" />
+                                            <TextBlock Grid.Column="1" Text="{Binding Mac}" />
+                                            <TextBlock Grid.Column="2" Text="{Binding Vendor}" Foreground="{StaticResource ChamberFgDim}" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+
+                            <TextBlock Text="DISK SERIALS (20)"
+                                       Style="{StaticResource ChamberLabel}"
+                                       LetterSpacing="4"
+                                       Margin="0,16,0,8" />
+                            <Border Style="{StaticResource ChamberRule}" />
+                            <ItemsControl x:Name="DiskList" Margin="0,8,0,0">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid Margin="0,1">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="40" />
+                                                <ColumnDefinition Width="auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="{Binding Index}" Foreground="{StaticResource ChamberFgFaint}" />
+                                            <TextBlock Grid.Column="1" Text="{Binding Serial}" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+
+                            <TextBlock Text="VOLUME SERIALS (4)"
+                                       Style="{StaticResource ChamberLabel}"
+                                       LetterSpacing="4"
+                                       Margin="0,16,0,8" />
+                            <Border Style="{StaticResource ChamberRule}" />
+                            <ItemsControl x:Name="VolumeList" Margin="0,8,0,0">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid Margin="0,1">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="40" />
+                                                <ColumnDefinition Width="auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="{Binding Letter}" Foreground="{StaticResource ChamberFgFaint}" />
+                                            <TextBlock Grid.Column="1" Text="{Binding Serial}" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </ScrollViewer>
+
+                    <Border Grid.Row="1" Style="{StaticResource ChamberRule}" />
+                    <StackPanel Grid.Row="1" Orientation="Horizontal"
+                                HorizontalAlignment="Right" Margin="0,8,0,0">
+                        <Button Content="randomize machine identity" Click="OnRandomizeIdentity" />
+                    </StackPanel>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 2: HV identity -->
+            <TabItem Header="HV IDENTITY">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="auto" />
+                    </Grid.RowDefinitions>
+
+                    <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto"
+                                  Margin="0,16,0,0">
+                        <StackPanel x:Name="HvScalars" />
+                    </ScrollViewer>
+
+                    <StackPanel Grid.Row="1" Orientation="Horizontal"
+                                HorizontalAlignment="Right" Margin="0,8,0,0">
+                        <Button Content="randomize hv identity" Click="OnRandomizeHv" />
+                    </StackPanel>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 3: toggles -->
+            <TabItem Header="TOGGLES">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Margin="0,16,0,0">
+                    <StackPanel x:Name="TogglePanel" />
+                </ScrollViewer>
+            </TabItem>
+        </TabControl>
+
+        <!-- Footer: proceed / cancel -->
+        <Grid Grid.Row="2" Margin="0,20,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Grid.Column="0" Orientation="Vertical">
+                <TextBlock Style="{StaticResource ChamberLabel}" LetterSpacing="3">
+                    <Run Text="only this seed survives across bootups. only " />
+                    <Run Text="randomize" FontWeight="Bold" Foreground="{StaticResource ChamberFg}" />
+                    <Run Text=" re-rolls." />
+                </TextBlock>
+                <TextBlock Style="{StaticResource ChamberLabel}" Margin="0,4,0,0">
+                    <Run Text="salt(identity)=" />
+                    <Run x:Name="IdSaltText" />
+                    <Run Text="   salt(hv)=" />
+                    <Run x:Name="HvSaltText" />
+                </TextBlock>
+            </StackPanel>
+
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <Button Content="cancel" Click="OnCancel" Margin="0,0,8,0" />
+                <Button Content="proceed" Click="OnProceed" Padding="24,6" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

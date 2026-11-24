@@ -1,0 +1,4 @@
+LIBRARY chamber_shim
+EXPORTS
+    chamber_shim_trampoline
+    chamber_shim_bind_sysnum

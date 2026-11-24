@@ -42,6 +42,9 @@
 #include "timing.h"
 #include "npt.h"
 #include "integrity.h"
+#include "identity.h"
+#include "dump.h"
+#include "dump_trigger.h"
 #include <wdmsec.h>   /* IoCreateDeviceSecure + SDDL_DEVOBJ_SYS_ALL_ADM_ALL */
 
 CHAMBER_GLOBALS g_chamber;
@@ -50,23 +53,61 @@ CHAMBER_GLOBALS g_chamber;
  * Initialized once in DriverEntry; declared extern in the_chamber.h. */
 KSPIN_LOCK g_stealth_lock;
 
-/* Phase 1.7: runtime-patchable config blob in a dedicated section. The
- * launcher locates the section by name (".cfg") and the magic field, then
- * overwrites device_path/symlink_path/marker_path with a per-install
- * randomized name before signing and loading the driver. Defaults below
- * look like a generic storage-filter driver so that a fresh build that
- * skipped the launcher is still non-obvious. */
+/* Seed-derived config blob. The launcher locates this section by name
+ * (".cfg") and by (magic == CHAMBER_CFG_MAGIC_V2 && version == 2 &&
+ * total_length == 632), overwriting it with the full 632-byte derived
+ * blob before signing. The default blob below carries placeholder
+ * values so the driver object code is self-consistent if a developer
+ * loads an un-patched build locally; nothing here is meant to be used
+ * on a release install. */
 #pragma section(".cfg", read, write)
 __declspec(allocate(".cfg"))
+CHAMBER_CFG_V2 g_chamber_cfg_v2 = {
+    CHAMBER_CFG_MAGIC_V2,
+    2,
+    CHAMBER_CFG_V2_TOTAL_LENGTH,
+    { 0 },                                      /* seed */
+    0,                                          /* toggles */
+    { 's','v','c','_','p','l','c','h','d','r',0,0 },
+    { 'p','l','c','h','d','r','d','e','v',0,0,0 },
+    { 'FsFl','FsFl','FsFl','FsFl','FsFl','FsFl' },
+    0x5452484D4648434AULL,                      /* vmmcall_magic placeholder */
+    0,                                          /* cfg_magic_override placeholder */
+    0, { 0, 0, 0 },                             /* rename_donor_index + pad */
+    1,                                          /* guest_asid (overridden) */
+    0, 0,                                       /* section_scramble, driver_nonce */
+    { 'C','H','A','M','B','E','R','-','P','L','C','H','D','R','-',0 },
+    { 0 },                                      /* machine_guid */
+    0,                                          /* install_date */
+    { 'X','X','X','X','X','-','X','X','X','X','X','-','X','X','X','X','X','-','X','X','X','X','X',0 },
+    { 0 },                                      /* digital_product_id */
+    { 'A','M','D',' ','R','y','z','e','n',' ','7',' ','7','7','0','0',
+      'X',' ','8','-','C','o','r','e',' ','P','r','o','c','e','s','s',
+      'o','r',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',0 },
+    { 0 }, { 0 }, { 0 }, { 0 }, { 0 },           /* smbios uuid, serials, bios */
+    { { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 } }, /* mac_addrs */
+    { { 0 } },                                   /* disk_serials */
+    { { 0 } },                                   /* volume_serials */
+    0x10022208UL,                                /* gpu_ven_dev placeholder */
+    { 0 },                                       /* edid_nonce */
+    { 0 }                                        /* tail pad */
+};
+
+/* Runtime wrapper over CHAMBER_CFG_V2, populated at DriverEntry so
+ * downstream call sites keep stable pointers to UNICODE_STRING buffers
+ * that persist for the driver's lifetime. The v1 struct name is kept
+ * purely so existing code paths compile; no v1 blob is read anywhere. */
 CHAMBER_CFG g_chamber_cfg = {
-    CHAMBER_CFG_MAGIC_V1,
-    1,
-    L"\\Device\\PciStor",
-    L"\\DosDevices\\PciStor",
-    L"\\??\\C:\\Windows\\System32\\config\\pcistor.dat",
+    CHAMBER_CFG_MAGIC_V2,
+    2,
+    { 0 },
+    { 0 },
+    { 0 },
     0,
     { 0 }
 };
+
+BOOLEAN g_chamber_cfg_v2_valid = FALSE;
 
 /* --- Forward decls --- */
 DRIVER_INITIALIZE DriverEntry;
@@ -78,12 +119,71 @@ static NTSTATUS crash_marker_present(BOOLEAN *out_present);
 static NTSTATUS crash_marker_drop(void);
 static NTSTATUS crash_marker_clear(void);
 
+/* Expand the v2 blob into the legacy WCHAR buffers consumed below.
+ * Called once in DriverEntry after the version/magic probe succeeds.
+ * Returns FALSE if either suffix would exceed its buffer, so the
+ * caller can refuse to load rather than truncate a path. */
+static BOOLEAN expand_cfg_v2_to_wide(void)
+{
+    SIZE_T i;
+    SIZE_T len;
+    static const WCHAR DEV_PREFIX[]    = L"\\Device\\";
+    static const WCHAR DOS_PREFIX[]    = L"\\DosDevices\\";
+    static const WCHAR MARKER_PREFIX[] =
+        L"\\??\\C:\\Windows\\System32\\config\\";
+    static const WCHAR MARKER_SUFFIX[] = L".dat";
+
+    /* device_path = L"\\Device\\" + suffix(ASCII). */
+    for (i = 0; DEV_PREFIX[i]; i++) g_chamber_cfg.device_path[i] = DEV_PREFIX[i];
+    len = i;
+    for (i = 0; i < sizeof(g_chamber_cfg_v2.device_suffix); i++) {
+        UCHAR b = g_chamber_cfg_v2.device_suffix[i];
+        if (b == 0) break;
+        if (len + 2 >= CHAMBER_CFG_DEVICE_MAX) return FALSE;
+        g_chamber_cfg.device_path[len++] = (WCHAR)b;
+    }
+    g_chamber_cfg.device_path[len] = 0;
+
+    /* symlink_path = L"\\DosDevices\\" + suffix. */
+    for (i = 0; DOS_PREFIX[i]; i++) g_chamber_cfg.symlink_path[i] = DOS_PREFIX[i];
+    len = i;
+    for (i = 0; i < sizeof(g_chamber_cfg_v2.device_suffix); i++) {
+        UCHAR b = g_chamber_cfg_v2.device_suffix[i];
+        if (b == 0) break;
+        if (len + 2 >= CHAMBER_CFG_SYMLINK_MAX) return FALSE;
+        g_chamber_cfg.symlink_path[len++] = (WCHAR)b;
+    }
+    g_chamber_cfg.symlink_path[len] = 0;
+
+    /* marker_path = L"\\??\\C:\\...\\" + service_name + L".dat". */
+    for (i = 0; MARKER_PREFIX[i]; i++) g_chamber_cfg.marker_path[i] = MARKER_PREFIX[i];
+    len = i;
+    for (i = 0; i < sizeof(g_chamber_cfg_v2.service_name); i++) {
+        UCHAR b = g_chamber_cfg_v2.service_name[i];
+        if (b == 0) break;
+        if (len + 6 >= CHAMBER_CFG_MARKER_MAX) return FALSE;
+        g_chamber_cfg.marker_path[len++] = (WCHAR)b;
+    }
+    for (i = 0; MARKER_SUFFIX[i]; i++) {
+        if (len + 2 >= CHAMBER_CFG_MARKER_MAX) return FALSE;
+        g_chamber_cfg.marker_path[len++] = MARKER_SUFFIX[i];
+    }
+    g_chamber_cfg.marker_path[len] = 0;
+
+    /* Pool-tag override: first subsystem tag (svm) carries the aggregate
+     * override; subsystem-specific tags are consulted by pool-aware call
+     * sites once the launcher populates them via the seed. */
+    g_chamber_cfg.pool_tag_override = g_chamber_cfg_v2.pool_tag[0];
+    return TRUE;
+}
+
 static void watchdog_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2);
 static void start_watchdog(void);
 static void stop_watchdog(void);
 static void reset_watchdog(void);
 
 static void scrub_service_key_name(PDRIVER_OBJECT Driver);
+static void scrub_object_header_name_info(PDRIVER_OBJECT Driver);
 
 /* --- Crash marker file ops (via ZwCreateFile / ZwWriteFile) --- */
 static NTSTATUS crash_marker_present(BOOLEAN *out_present)
@@ -212,6 +312,14 @@ static void watchdog_unload_worker(PDEVICE_OBJECT DevObj, PVOID Ctx)
      * UnloadRoutine ordering (integrity first, then SVM). */
     integrity_shutdown();
 
+    /* Disarm every passive trigger and tear down the pause primitive
+     * before dropping EFER.SVME. The pause DPCs run at DISPATCH_LEVEL
+     * in guest context; letting them persist after SVM shutdown would
+     * read stale CR3 against a stale target. */
+    (void)dump_trigger_disarm(0, CHAMBER_TRIGGER_ANY);
+    dump_trigger_shutdown();
+    dump_pause_shutdown();
+
     /* Full SVM teardown. svm_shutdown_all_cpus sets per-CPU
      * shutdown_requested, broadcasts the offline IPI (which clears
      * EFER.SVME), frees per-CPU structures, and nulls g_cpu_ctx. */
@@ -223,6 +331,7 @@ static void watchdog_unload_worker(PDEVICE_OBJECT DevObj, PVOID Ctx)
         npt_free_tables();
         g_chamber.npt_initialized = FALSE;
     }
+    identity_release();
 
     /* Free the work item itself. We stashed its pointer in globals so
      * the DPC could queue it exactly once; zero the pointer AFTER free
@@ -405,6 +514,93 @@ static void scrub_service_key_name(PDRIVER_OBJECT Driver)
     }
 }
 
+/* --- Wave 8: scrub OBJECT_HEADER_NAME_INFO.Name ----------------------
+ *
+ * The Phase 1.7 ServiceKeyName scrub above only touched DriverExtension
+ * ->ServiceKeyName. Every named kernel object ALSO carries an
+ * OBJECT_HEADER_NAME_INFO behind its OBJECT_HEADER, and for a
+ * DRIVER_OBJECT that holds the "\Driver\<svc>" directory path that
+ * ObQueryNameInformation returns. Leaving it intact means an enumerator
+ * walking \Driver still sees the original (launcher-randomized) service
+ * name. We overwrite the Name buffer in place with the same LCG noise
+ * ServiceKeyName uses so a reader sees a well-formed but meaningless
+ * UNICODE_STRING.
+ *
+ * Layout on Win10/11 x64 (stable across build numbers since at least
+ * 1607): OBJECT_HEADER is 0x30 bytes immediately before the object
+ * body; OBJECT_HEADER::InfoMask lives at offset 0x1A. Bit 1 of
+ * InfoMask indicates OBJECT_HEADER_NAME_INFO is present; the structure
+ * sits either 0x20 bytes (no CreatorInfo) or 0x40 bytes (CreatorInfo
+ * present ahead of it) before the OBJECT_HEADER. OBJECT_HEADER_NAME_INFO
+ * itself is 0x20 bytes: Directory(PVOID), Name(UNICODE_STRING=0x10),
+ * ReferenceCount+Reserved(0x8).
+ *
+ * The write is wrapped in SEH -- if a future Windows build shifts the
+ * layout this routine aborts cleanly instead of a KMODE bugcheck. The
+ * scrub is best-effort, not safety-critical. */
+#define CHAMBER_OBJECT_HEADER_BODY_OFFSET  0x30u
+#define CHAMBER_OBJECT_HEADER_INFOMASK_OFF 0x1Au
+#define CHAMBER_OBJHDR_INFOMASK_CREATOR    0x01u
+#define CHAMBER_OBJHDR_INFOMASK_NAME       0x02u
+#define CHAMBER_OBJHDR_NAME_INFO_SIZE      0x20u
+#define CHAMBER_OBJHDR_CREATOR_INFO_SIZE   0x20u
+
+typedef struct _CHAMBER_OBJECT_HEADER_NAME_INFO_LAYOUT {
+    PVOID          Directory;
+    UNICODE_STRING Name;
+    LONG           ReferenceCount;
+    ULONG          Reserved;
+} CHAMBER_OBJECT_HEADER_NAME_INFO_LAYOUT;
+
+static void scrub_object_header_name_info(PDRIVER_OBJECT Driver)
+{
+    PUCHAR obj_header;
+    UCHAR  info_mask;
+    PUCHAR name_info_base;
+    CHAMBER_OBJECT_HEADER_NAME_INFO_LAYOUT *ni;
+    USHORT chars, i;
+    ULONGLONG seed;
+
+    if (!Driver) return;
+
+    __try {
+        obj_header = (PUCHAR)Driver - CHAMBER_OBJECT_HEADER_BODY_OFFSET;
+        info_mask  = obj_header[CHAMBER_OBJECT_HEADER_INFOMASK_OFF];
+        if (!(info_mask & CHAMBER_OBJHDR_INFOMASK_NAME)) {
+            /* No NameInfo header -- nothing to scrub. */
+            return;
+        }
+        name_info_base = obj_header -
+            ((info_mask & CHAMBER_OBJHDR_INFOMASK_CREATOR)
+              ? (CHAMBER_OBJHDR_CREATOR_INFO_SIZE +
+                 CHAMBER_OBJHDR_NAME_INFO_SIZE)
+              :  CHAMBER_OBJHDR_NAME_INFO_SIZE);
+        ni = (CHAMBER_OBJECT_HEADER_NAME_INFO_LAYOUT *)name_info_base;
+
+        if (!ni->Name.Buffer || !ni->Name.MaximumLength) return;
+        /* Sanity: Name.Buffer must live in kernel address space.
+         * Canonical x64 kernel VAs start at 0xFFFF800000000000. */
+        if ((ULONG_PTR)ni->Name.Buffer < 0xFFFF800000000000ULL) return;
+
+        chars = ni->Name.MaximumLength / sizeof(WCHAR);
+        seed  = __rdtsc() ^ (ULONGLONG)(ULONG_PTR)ni;
+        for (i = 0; i + 1 < chars; i++) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            ni->Name.Buffer[i] = (WCHAR)(L'a' + ((seed >> 33) % 26));
+        }
+        if (chars > 0) ni->Name.Buffer[chars - 1] = L'\0';
+        if (chars > 0) {
+            ni->Name.Length = (USHORT)((chars - 1) * sizeof(WCHAR));
+        } else {
+            ni->Name.Length = 0;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* A future Windows layout change or a poisoned InfoMask lands
+         * here; the scrub is best-effort, swallow and proceed. */
+        return;
+    }
+}
+
 /* --- IRP handlers --- */
 NTSTATUS IrpCreateClose(PDEVICE_OBJECT Device, PIRP Irp)
 {
@@ -465,6 +661,163 @@ NTSTATUS IrpDeviceControl(PDEVICE_OBJECT Device, PIRP Irp)
         }
         st = STATUS_SUCCESS;
         break;
+
+    case IOCTL_THE_CHAMBER_DUMP_NOW: {
+        /* Operator issues a bare dump. METHOD_BUFFERED gives us a
+         * kernel copy of the input struct AND the output buffer in
+         * SystemBuffer -- but a dump needs a possibly-large output
+         * region in operator VA space, not a buffered copy. The
+         * dispatcher therefore reads the request struct from the
+         * input portion and routes to dump_run_targeted which
+         * accepts a kernel-side output buffer (we hand it
+         * SystemBuffer + sizeof(request) as the output window). */
+        CHAMBER_DUMP_NOW_REQ *req = (CHAMBER_DUMP_NOW_REQ *)buf;
+        ULONG hdr = sizeof(CHAMBER_DUMP_NOW_REQ);
+        if (in_len < hdr || out_len < hdr) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (req->target_pid == 0 ||
+            req->output_buffer_size == 0 ||
+            req->output_buffer_size > (out_len - hdr)) {
+            st = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        {
+            PUCHAR     output = (PUCHAR)buf + hdr;
+            ULONGLONG  bytes;
+            bytes = dump_trigger_manual(req->target_pid,
+                                        output,
+                                        req->output_buffer_size);
+            info = hdr + bytes;
+            /* Write the actual byte count back into the request
+             * echo at the head of the buffer so the operator knows
+             * the dump size without a second IOCTL. */
+            req->output_buffer_size = bytes;
+            st = (bytes > 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        }
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_DUMP_ON_PAYLOAD: {
+        /* Same shape as DUMP_NOW; distinct kind so the history ring
+         * records the payload cause. */
+        CHAMBER_DUMP_NOW_REQ *req = (CHAMBER_DUMP_NOW_REQ *)buf;
+        ULONG hdr = sizeof(CHAMBER_DUMP_NOW_REQ);
+        if (in_len < hdr || out_len < hdr) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (req->target_pid == 0 ||
+            req->output_buffer_size == 0 ||
+            req->output_buffer_size > (out_len - hdr)) {
+            st = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        {
+            PUCHAR     output = (PUCHAR)buf + hdr;
+            ULONGLONG  bytes;
+            bytes = dump_trigger_payload(req->target_pid,
+                                         output,
+                                         req->output_buffer_size);
+            info = hdr + bytes;
+            req->output_buffer_size = bytes;
+            st = (bytes > 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        }
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_ARM_WX: {
+        CHAMBER_ARM_WX_REQ *req = (CHAMBER_ARM_WX_REQ *)buf;
+        if (in_len < sizeof(*req)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        st = dump_trigger_arm_wx(
+                req->target_pid,
+                (PVOID)(ULONG_PTR)req->output_buffer_va,
+                req->output_buffer_size,
+                req->rearm != 0);
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_ARM_OEP: {
+        CHAMBER_ARM_OEP_REQ *req = (CHAMBER_ARM_OEP_REQ *)buf;
+        if (in_len < sizeof(*req)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        st = dump_trigger_arm_oep(
+                req->target_pid,
+                req->suspected_oep_gva,
+                (PVOID)(ULONG_PTR)req->output_buffer_va,
+                req->output_buffer_size,
+                req->rearm != 0);
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_ARM_WRITE_THRESHOLD: {
+        CHAMBER_ARM_WRITE_THRESHOLD_REQ *req =
+            (CHAMBER_ARM_WRITE_THRESHOLD_REQ *)buf;
+        if (in_len < sizeof(*req)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        st = dump_trigger_arm_write_threshold(
+                req->target_pid,
+                req->threshold_bytes,
+                (PVOID)(ULONG_PTR)req->output_buffer_va,
+                req->output_buffer_size,
+                req->rearm != 0);
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_DISARM_TRIGGERS: {
+        CHAMBER_DISARM_REQ *req = (CHAMBER_DISARM_REQ *)buf;
+        if (in_len < sizeof(*req)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        st = dump_trigger_disarm(req->target_pid, req->trigger_mask);
+        break;
+    }
+
+    case IOCTL_THE_CHAMBER_QUERY_DUMP_HISTORY: {
+        if (out_len < sizeof(CHAMBER_DUMP_HISTORY)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        {
+            ULONG wrote = dump_history_copy_out(
+                (PCHAMBER_DUMP_HISTORY)buf, out_len);
+            info = wrote;
+            st = (wrote > 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        }
+        break;
+    }
+
+    case IOCTL_CFP_GET_DEVICE_NAME: {
+        /* The HV driver cannot cross-query the fp driver's chosen
+         * suffix in-kernel without a shared registry publisher or a
+         * cross-driver import — neither of which Wave 8.5 landed. The
+         * common path (CFG blob present on both sides) does not need
+         * this IOCTL at all: launcher and fp driver derive the same
+         * suffix from CHAMBER_CFG_V2.device_suffix. STATUS_NOT_SUPPORTED
+         * is the explicit "fall back to CFG-derived suffix" sentinel
+         * the launcher's QueryFingerprintDeviceNameAsync handles; a
+         * generic STATUS_INVALID_DEVICE_REQUEST would be
+         * indistinguishable from a wrong code reaching the wrong
+         * driver. */
+        if (out_len < sizeof(CFP_DEVICE_NAME_RESPONSE)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        RtlZeroMemory(buf, sizeof(CFP_DEVICE_NAME_RESPONSE));
+        info = sizeof(CFP_DEVICE_NAME_RESPONSE);
+        st = STATUS_NOT_SUPPORTED;
+        break;
+    }
+
     default:
         break;
     }
@@ -491,6 +844,16 @@ VOID UnloadRoutine(PDRIVER_OBJECT Driver)
     (void)stealth_revert(Driver);
 
     stop_watchdog();
+
+    /* Disarm every passive trigger before tearing down the pause
+     * primitive: trigger_disarm restores NPT PDEs, which keeps the
+     * guest sane once SVM goes away, and releases referenced
+     * EPROCESSes. dump_pause_shutdown then frees the per-CPU DPC
+     * array. */
+    (void)dump_trigger_disarm(0, CHAMBER_TRIGGER_ANY);
+    dump_trigger_shutdown();
+    dump_pause_shutdown();
+
     /* KeRemoveQueueDpc does NOT wait for an in-flight DPC on another
      * CPU; without this flush, a pending watchdog_dpc_routine may race
      * svm_shutdown_all_cpus freeing g_cpu_ctx and write into freed
@@ -505,6 +868,7 @@ VOID UnloadRoutine(PDRIVER_OBJECT Driver)
         npt_free_tables();
         g_chamber.npt_initialized = FALSE;
     }
+    identity_release();
     vmexit_cleanup();
 
     UNICODE_STRING sym;
@@ -541,15 +905,40 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
 
     /* Phase 1.7: scrub the kernel-owned ServiceKeyName copy. Done early so
      * that even a concurrent enumerator racing with our bringup sees noise
-     * instead of the registry subkey name. */
+     * instead of the registry subkey name.
+     *
+     * Wave 8: also scrub the OBJECT_HEADER_NAME_INFO for the DRIVER_OBJECT
+     * itself. Without this, an enumerator walking \Driver resolves our
+     * DRIVER_OBJECT by its registered service-key name even though the
+     * ServiceKeyName copy is now noise. Both scrubs are best-effort and
+     * never fail the load path. */
     scrub_service_key_name(Driver);
+    scrub_object_header_name_info(Driver);
 
-    /* Sanity-check the config blob the launcher was supposed to patch. */
-    if (g_chamber_cfg.magic != CHAMBER_CFG_MAGIC_V1) {
-        CHAMBER_LOG_ERR("config blob magic mismatch 0x%08x\n",
-                        g_chamber_cfg.magic);
+    /* Version dispatch on the seed-derived config blob. The wave-3 v1
+     * shape is retired in place: the installer must have produced v2
+     * (magic 'CFG2', version 2, total_length 632). Loading a v1 blob
+     * is refused with a specific error so the installer path surfaces
+     * the mismatch rather than silently running under stale values. */
+    if (g_chamber_cfg_v2.magic == CHAMBER_CFG_MAGIC_V1 ||
+        g_chamber_cfg_v2.version == 1) {
+        CHAMBER_LOG_ERR("v1 config blob detected; v2 required\n");
+        return STATUS_REVISION_MISMATCH;
+    }
+    if (g_chamber_cfg_v2.magic != CHAMBER_CFG_MAGIC_V2 ||
+        g_chamber_cfg_v2.version != 2 ||
+        g_chamber_cfg_v2.total_length != CHAMBER_CFG_V2_TOTAL_LENGTH) {
+        CHAMBER_LOG_ERR("cfg blob mismatch magic=0x%08x ver=%u len=%u\n",
+                        g_chamber_cfg_v2.magic,
+                        g_chamber_cfg_v2.version,
+                        g_chamber_cfg_v2.total_length);
         return STATUS_INVALID_PARAMETER;
     }
+    if (!expand_cfg_v2_to_wide()) {
+        CHAMBER_LOG_ERR("cfg suffix too long for legacy path buffers\n");
+        return STATUS_INVALID_PARAMETER;
+    }
+    g_chamber_cfg_v2_valid = TRUE;
 
     /* Crash-marker safety: refuse to load if the previous session left
      * one, OR if the probe returned an indeterminate status (now
@@ -628,9 +1017,35 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
     }
     g_chamber.svm_initialized = TRUE;
 
+    /* Populate per-vCPU identity tables and single-valued derived state.
+     * svm_online_cpu has already run on every CPU (KeIpiGenericCall at
+     * the tail of svm_init_all_cpus), but the VMCB builder reads no
+     * identity state at bringup; the identity lookup is consulted at
+     * VMEXIT time by handle_cpuid and handle_msr. Applying the table
+     * after bringup is therefore sufficient and avoids calling an
+     * allocator from inside the IPI broadcast. */
+    st = identity_apply(&g_chamber_cfg_v2);
+    if (!NT_SUCCESS(st)) {
+        CHAMBER_LOG_ERR("identity_apply failed 0x%08x\n", st);
+        goto fail;
+    }
+
     /* Phase 1.2: set the pessimistic default microcode round-trip cost that
      * timing_update() adds to every captured host interval. */
     timing_calibrate();
+
+    /* Pause primitive + trigger registry. Both are PASSIVE_LEVEL init
+     * paths and must run after svm_init_all_cpus populates g_cpu_count
+     * and g_cpu_ctx; failures are non-fatal because the dump path
+     * refuses cleanly when the state is absent. */
+    st = dump_pause_init();
+    if (!NT_SUCCESS(st)) {
+        CHAMBER_LOG_WARN("dump_pause_init failed 0x%08x\n", st);
+    }
+    st = dump_trigger_init();
+    if (!NT_SUCCESS(st)) {
+        CHAMBER_LOG_WARN("dump_trigger_init failed 0x%08x\n", st);
+    }
 
     start_watchdog();
 
@@ -651,8 +1066,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
      * the live DRIVER_OBJECT BEFORE stealth_apply scrambles section
      * headers and zeros the PE prefix; DriverStart/DriverSize survive
      * stealth_apply, but doing this first keeps the hide pass agnostic
-     * to stealth internals. */
-    (void)npt_hide_hv_image(Driver->DriverStart, Driver->DriverSize);
+     * to stealth internals.
+     *
+     * The runtime toggle (CHAMBER_TOGGLE_HV_INTROSPECTION_RESIST) is
+     * also honoured -- an operator who left it off in the launcher UI
+     * gets the hide pass skipped even on a build that compiled it in. */
+    if (g_chamber_cfg_v2_valid &&
+        (g_chamber_cfg_v2.toggles & CHAMBER_TOGGLE_HV_INTROSPECTION_RESIST))
+    {
+        (void)npt_hide_hv_image(Driver->DriverStart, Driver->DriverSize);
+    }
 
     /* Phase 7.1 TLB flush: broadcast the ASID-flush request to every
      * per-CPU VMCB so stale (GVA, HPA) translations from before the

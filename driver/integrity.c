@@ -236,13 +236,39 @@ NTSTATUS integrity_init(PDRIVER_OBJECT drv)
         if (g_hv_image_size == 0) return STATUS_INVALID_IMAGE_FORMAT;
     }
 
-    /* Allocate the shared status page from nonpaged pool. It will be
-     * reachable from guest context via its kernel VA (same mapping;
-     * nonpaged pool has one VA that both host and guest see because
-     * the guest IS the host OS kernel). */
-    g_integrity_status = (PCHAMBER_INTEGRITY_STATUS)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED, sizeof(CHAMBER_INTEGRITY_STATUS),
-        POOLTAG("integrity"));
+    /* Wave 8: allocate the shared status page via
+     * MmAllocateContiguousMemorySpecifyCache instead of ExAllocatePool2.
+     *
+     * The prior allocation came from nonpaged pool and, at 4 KiB, could
+     * land in the big-pool allocator -- which means it was enumerable
+     * through NtQuerySystemInformation(SystemBigPoolInformation) at the
+     * driver's canonical pool tag. A 4-KiB NPP block whose first four
+     * bytes tick (call_count, hv_responded, integrity_failed, last_hash)
+     * on a stable 5-second cadence is a strong passive-scanner
+     * fingerprint on its own, regardless of the tag.
+     *
+     * MmAllocateContiguousMemorySpecifyCache returns a page backed by a
+     * single physical frame that is NOT tracked by ExAllocatePool's
+     * big-pool table, so SystemBigPoolInformation does not list it. The
+     * page is still identity-mapped in the NPT (guest sees it at the
+     * same GPA as the HV sees its HPA), which the guest DPC requires to
+     * read hv_responded / integrity_failed.
+     *
+     * A future hardening step is to NPT-hide this page and route reads
+     * through a VMMCALL, matching the pattern used for the HV code
+     * region; wave8 keeps the DPC reading the status page directly
+     * because §7.1 and §7.2 are still mutually exclusive (see file
+     * header). */
+    {
+        PHYSICAL_ADDRESS lowest, highest, zero;
+        lowest.QuadPart  = 0;
+        highest.QuadPart = (LONGLONG)-1;
+        zero.QuadPart    = 0;
+        g_integrity_status = (PCHAMBER_INTEGRITY_STATUS)
+            MmAllocateContiguousMemorySpecifyCache(
+                sizeof(CHAMBER_INTEGRITY_STATUS),
+                lowest, highest, zero, MmCached);
+    }
     if (!g_integrity_status) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -270,7 +296,9 @@ void integrity_shutdown(void)
         g_integrity_armed = FALSE;
     }
     if (g_integrity_status) {
-        ExFreePoolWithTag(g_integrity_status, POOLTAG("integrity"));
+        /* Wave 8: paired with MmAllocateContiguousMemorySpecifyCache
+         * in integrity_init. */
+        MmFreeContiguousMemory(g_integrity_status);
         g_integrity_status = NULL;
     }
     g_hv_image_start = NULL;

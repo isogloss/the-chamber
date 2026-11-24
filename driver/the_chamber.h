@@ -62,21 +62,119 @@
  * ----------------------------------------------------------------------- */
 
 #define CHAMBER_CFG_MAGIC_V1     0x5F474643UL   /* "CFG_" launcher marker */
+#define CHAMBER_CFG_MAGIC_V2     0x32474643UL   /* "CFG2" launcher marker */
 #define CHAMBER_CFG_DEVICE_MAX   64
 #define CHAMBER_CFG_SYMLINK_MAX  64
 #define CHAMBER_CFG_MARKER_MAX   128
 
+/* v1 struct kept for name compatibility; the .cfg section now holds the
+ * v2 blob and the v1 shape is no longer accepted at DriverEntry. */
 typedef struct _CHAMBER_CFG {
-    ULONG magic;                                 /* CHAMBER_CFG_MAGIC_V1 */
+    ULONG magic;
     ULONG version;
-    WCHAR device_path [CHAMBER_CFG_DEVICE_MAX];  /* L"\\Device\\<name>" */
-    WCHAR symlink_path[CHAMBER_CFG_SYMLINK_MAX]; /* L"\\DosDevices\\<name>" */
-    WCHAR marker_path [CHAMBER_CFG_MARKER_MAX];  /* L"\\??\\C:\\...\\<name>.dat" */
-    ULONG pool_tag_override;                     /* 0 => use CHAMBER_POOL_TAG */
+    WCHAR device_path [CHAMBER_CFG_DEVICE_MAX];
+    WCHAR symlink_path[CHAMBER_CFG_SYMLINK_MAX];
+    WCHAR marker_path [CHAMBER_CFG_MARKER_MAX];
+    ULONG pool_tag_override;
     ULONG reserved[16];
 } CHAMBER_CFG;
 
-extern CHAMBER_CFG g_chamber_cfg;
+/* ---- Seed-derived machine-identity config (v2) -----------------------
+ * Wire format is byte-exact: #pragma pack(1), little-endian, 632 bytes.
+ * The installer locates this blob in the on-disk .sys by scanning for
+ * (magic == 0x32474643 && version == 2 && total_length == 632) and
+ * overwrites it with seed-expanded values before signing. Every
+ * runtime-visible machine fingerprint comes from this blob or from
+ * iterated SHA-256 of the seed. The signing identity (cert + the
+ * embedded launcher cert) stays constant across reseeds. */
+
+/* Toggle bit positions in CHAMBER_CFG_V2.toggles. */
+#define CHAMBER_TOGGLE_CI_STATE_SPOOF         (1UL <<  0)
+#define CHAMBER_TOGGLE_MACHINE_IDENTITY_SPOOF (1UL <<  1)
+#define CHAMBER_TOGGLE_HV_INTROSPECTION_RESIST (1UL << 2)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_SVM       (1UL << 3)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_NPT       (1UL << 4)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_VMEXIT    (1UL << 5)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_DUMP      (1UL << 6)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_INTEGRITY (1UL << 7)
+#define CHAMBER_TOGGLE_POOL_TAG_RANDOMIZE_DISPATCH  (1UL << 8)
+#define CHAMBER_TOGGLE_TPM_ABSENT_SPOOF             (1UL << 9)
+
+#define CHAMBER_CFG_V2_TOTAL_LENGTH  632
+
+#pragma pack(push, 1)
+typedef struct _CHAMBER_CFG_V2 {
+    /* Header */
+    ULONG     magic;                        /* off 0  */
+    ULONG     version;                      /* off 4  */
+    ULONG     total_length;                 /* off 8  */
+
+    /* Master seed */
+    UCHAR     seed[32];                     /* off 12 */
+
+    /* Toggles (bit-packed) */
+    ULONG     toggles;                      /* off 44 */
+
+    /* HV identity */
+    UCHAR     service_name[12];             /* off 48  */
+    UCHAR     device_suffix[12];            /* off 60  */
+    ULONG     pool_tag[6];                  /* off 72  : svm/npt/vmexit/dump/integrity/dispatch */
+    ULONGLONG vmmcall_magic;                /* off 96  */
+    ULONGLONG chamber_cfg_magic_override;   /* off 104 */
+    UCHAR     rename_donor_index;           /* off 112 */
+    UCHAR     _pad0[3];                     /* off 113 */
+    ULONG     guest_asid;                   /* off 116 */
+    ULONG     section_scramble_seed;        /* off 120 */
+    ULONGLONG driver_nonce;                 /* off 124 */
+
+    /* Machine identity */
+    UCHAR     computer_name[16];            /* off 132 */
+    UCHAR     machine_guid[16];             /* off 148 */
+    ULONGLONG install_date_filetime;        /* off 164 */
+    UCHAR     product_id[24];               /* off 172 */
+    UCHAR     digital_product_id[164];      /* off 196 */
+    UCHAR     cpu_brand_string[48];         /* off 360 */
+    UCHAR     smbios_system_uuid[16];       /* off 408 */
+    UCHAR     baseboard_serial[16];         /* off 424 */
+    UCHAR     chassis_serial[16];           /* off 440 */
+    UCHAR     bios_vendor[16];              /* off 456 */
+    UCHAR     bios_version[16];             /* off 472 */
+    UCHAR     mac_addrs[6][4];              /* off 488 */
+    UCHAR     disk_serials[20][4];          /* off 512 */
+    UCHAR     volume_serials[4][4];         /* off 592 */
+    ULONG     gpu_ven_dev;                  /* off 608 */
+    UCHAR     edid_nonce[16];               /* off 612 */
+
+    /* Tail pad to 8-aligned total length */
+    UCHAR     _tail_pad[4];                 /* off 628 */
+} CHAMBER_CFG_V2;
+#pragma pack(pop)
+C_ASSERT(sizeof(CHAMBER_CFG_V2) == CHAMBER_CFG_V2_TOTAL_LENGTH);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, seed)                == 12);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, toggles)             == 44);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, pool_tag)            == 72);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, vmmcall_magic)       == 96);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, rename_donor_index)  == 112);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, guest_asid)          == 116);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, driver_nonce)        == 124);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, computer_name)       == 132);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, cpu_brand_string)    == 360);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, mac_addrs)           == 488);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, disk_serials)        == 512);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, volume_serials)      == 592);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, gpu_ven_dev)         == 608);
+C_ASSERT(FIELD_OFFSET(CHAMBER_CFG_V2, edid_nonce)          == 612);
+
+extern CHAMBER_CFG     g_chamber_cfg;         /* legacy wrapper; populated at init from v2 */
+extern CHAMBER_CFG_V2  g_chamber_cfg_v2;      /* authoritative seed-derived blob */
+extern BOOLEAN         g_chamber_cfg_v2_valid; /* TRUE after DriverEntry version probe */
+
+/* Agent C's fingerprint driver reads its own copy of CHAMBER_CFG_V2 from
+ * a service-parameters registry blob (see audit/wave4_design.md §7).
+ * TODO (Agent C): if a shared-memory hook is needed for runtime coordination
+ * between the HV driver and chamber_fingerprint.sys, declare it here and
+ * wire the implementation in a dedicated file; the HV side exposes only
+ * the v2 cfg through the launcher's patcher. */
 
 #define THE_CHAMBER_VERSION  0x00010000UL  /* 1.0.0 */
 #define WATCHDOG_TIMEOUT_MS  60000
@@ -88,6 +186,51 @@ extern CHAMBER_CFG g_chamber_cfg;
 #define IOCTL_THE_CHAMBER_KICK      CTL_CODE(0x8000, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 #define IOCTL_THE_CHAMBER_SHUTDOWN  CTL_CODE(0x8000, 0x803, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
+/* Passive-dump operator interface. The pause primitive and the trigger
+ * registry live in dump.c / dump_trigger.c; the IOCTL dispatcher in
+ * the_chamber.c just marshals the input buffer and calls through. All
+ * of these are FILE_WRITE_ACCESS so a plain-read open cannot arm /
+ * initiate a dump. */
+#define IOCTL_THE_CHAMBER_DUMP_NOW \
+    CTL_CODE(0x8000, 0x820, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_ARM_WX \
+    CTL_CODE(0x8000, 0x821, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_ARM_OEP \
+    CTL_CODE(0x8000, 0x822, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_ARM_WRITE_THRESHOLD \
+    CTL_CODE(0x8000, 0x823, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_DUMP_ON_PAYLOAD \
+    CTL_CODE(0x8000, 0x824, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_DISARM_TRIGGERS \
+    CTL_CODE(0x8000, 0x825, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_THE_CHAMBER_QUERY_DUMP_HISTORY \
+    CTL_CODE(0x8000, 0x826, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+/* Function 0x830 lives in the fingerprint-coordination block (disjoint
+ * from the dump block above) so the fp driver and HV driver never clash
+ * on function numbers. The HV driver cannot know the suffix the fp
+ * driver picked when CFG was absent and the fp driver fell back to a
+ * random per-boot suffix; it returns STATUS_NOT_SUPPORTED in that case
+ * and the launcher derives the suffix from its own copy of
+ * CHAMBER_CFG_V2 (the common path — launcher and fp driver derive the
+ * same ASCII string from the same CFG bytes, so no runtime handshake
+ * is required when CFG is live). Keeping the code wired on the HV side
+ * lets a later wave attach a cross-driver publisher without changing
+ * either the launcher protocol or the suffix generator. */
+#define IOCTL_CFP_GET_DEVICE_NAME \
+    CTL_CODE(0x8000, 0x830, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+/* Output of IOCTL_CFP_GET_DEVICE_NAME. SuffixLengthChars counts the
+ * UTF-16 code units of Suffix that are valid; the driver does NOT
+ * null-terminate. Reserved must be zero. 128 code units of Suffix
+ * capacity is the launcher-facing contract (DumpIoctls.cs structural
+ * layout); shortening it breaks the ByValTStr marshal. */
+typedef struct _CFP_DEVICE_NAME_RESPONSE {
+    ULONG  SuffixLengthChars;
+    ULONG  Reserved;
+    WCHAR  Suffix[128];
+} CFP_DEVICE_NAME_RESPONSE, *PCFP_DEVICE_NAME_RESPONSE;
+
 typedef struct _CHAMBER_STATUS {
     ULONG   version;
     ULONG   cpu_count;
@@ -95,6 +238,82 @@ typedef struct _CHAMBER_STATUS {
     ULONG   reserved;
     ULONGLONG vmexit_count;
 } CHAMBER_STATUS, *PCHAMBER_STATUS;
+
+/* --- Operator IOCTL argument structs ---------------------------------
+ * All passed via METHOD_BUFFERED; sizes are bounded and the dispatcher
+ * checks the full struct before passing through. Addresses are operator-
+ * context VAs; the HV switches to target context for the walk.
+ * Reserved fields are zero-initialized by the dispatcher.
+ */
+typedef struct _CHAMBER_DUMP_NOW_REQ {
+    ULONGLONG target_pid;        /* PID to dump; resolved via PsLookup */
+    ULONGLONG output_buffer_va;  /* operator VA receiving TLV stream */
+    ULONGLONG output_buffer_size;/* byte capacity */
+} CHAMBER_DUMP_NOW_REQ, *PCHAMBER_DUMP_NOW_REQ;
+
+typedef struct _CHAMBER_ARM_WX_REQ {
+    ULONGLONG target_pid;        /* PID whose user AS gets W/noX NPT marking */
+    ULONGLONG output_buffer_va;  /* operator VA for the eventual dump */
+    ULONGLONG output_buffer_size;
+    ULONG     rearm;             /* 1 = re-arm after each fire */
+    ULONG     reserved;
+} CHAMBER_ARM_WX_REQ, *PCHAMBER_ARM_WX_REQ;
+
+typedef struct _CHAMBER_ARM_OEP_REQ {
+    ULONGLONG target_pid;        /* PID; the covering 2 MB PDE is X=0 */
+    ULONGLONG suspected_oep_gva; /* guest VA where the OEP is expected */
+    ULONGLONG output_buffer_va;
+    ULONGLONG output_buffer_size;
+    ULONG     rearm;
+    ULONG     reserved;
+} CHAMBER_ARM_OEP_REQ, *PCHAMBER_ARM_OEP_REQ;
+
+typedef struct _CHAMBER_ARM_WRITE_THRESHOLD_REQ {
+    ULONGLONG target_pid;        /* PID whose writable user pages are W=0 */
+    ULONGLONG threshold_bytes;   /* dump fires when counter reaches this */
+    ULONGLONG output_buffer_va;
+    ULONGLONG output_buffer_size;
+    ULONG     rearm;
+    ULONG     reserved;
+} CHAMBER_ARM_WRITE_THRESHOLD_REQ, *PCHAMBER_ARM_WRITE_THRESHOLD_REQ;
+
+typedef struct _CHAMBER_DISARM_REQ {
+    ULONGLONG target_pid;        /* 0 = disarm all triggers */
+    ULONG     trigger_mask;      /* bitmask of CHAMBER_TRIGGER_*; 0 = all */
+    ULONG     reserved;
+} CHAMBER_DISARM_REQ, *PCHAMBER_DISARM_REQ;
+
+/* Trigger kind bits used by CHAMBER_DISARM_REQ.trigger_mask and by the
+ * history record so the operator can filter by cause. */
+#define CHAMBER_TRIGGER_MANUAL           (1UL << 0)
+#define CHAMBER_TRIGGER_WX               (1UL << 1)
+#define CHAMBER_TRIGGER_OEP              (1UL << 2)
+#define CHAMBER_TRIGGER_WRITE_THRESHOLD  (1UL << 3)
+#define CHAMBER_TRIGGER_PAYLOAD          (1UL << 4)
+#define CHAMBER_TRIGGER_ANY              (0xFFFFFFFFUL)
+
+/* QUERY_DUMP_HISTORY output: a fixed-size ring of recent dumps. The
+ * dispatcher caps the copy at the operator's output buffer so a smaller
+ * buffer reads the N newest entries. */
+#define CHAMBER_DUMP_HISTORY_MAX  32
+
+typedef struct _CHAMBER_DUMP_RECORD {
+    ULONGLONG seq;               /* monotonic dump sequence number */
+    ULONGLONG target_pid;
+    ULONGLONG target_cr3;
+    ULONGLONG trigger_gpa;       /* GPA that caused the trigger, or 0 */
+    ULONGLONG bytes_written;
+    ULONGLONG timestamp_100ns;   /* KeQuerySystemTimePrecise snapshot */
+    ULONG     trigger_kind;      /* CHAMBER_TRIGGER_* */
+    ULONG     parked_cpus;       /* count of CPUs parked for this dump */
+} CHAMBER_DUMP_RECORD, *PCHAMBER_DUMP_RECORD;
+
+typedef struct _CHAMBER_DUMP_HISTORY {
+    ULONGLONG total_dumps;       /* lifetime count (may exceed records[]) */
+    ULONG     record_count;      /* records populated in this response */
+    ULONG     reserved;
+    CHAMBER_DUMP_RECORD records[CHAMBER_DUMP_HISTORY_MAX];
+} CHAMBER_DUMP_HISTORY, *PCHAMBER_DUMP_HISTORY;
 
 /* --- Canonical AMD SVM types --- */
 /* The SVM cluster (svm.h) fills in the exact layouts per AMD manual Vol 2

@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <LangVersion>12</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>thechamber</AssemblyName>
+    <RootNamespace>TheChamber</RootNamespace>
+
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>embedded</DebugType>
+
+    <!-- Hide warnings that the WPF xaml compiler is noisy about for tiny apps. -->
+    <NoWarn>$(NoWarn);CS1591;CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- DPAPI for seed persistence (user-scope ProtectedData). -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Embedded driver blobs + user-mode shim + the signing cert public
+         portion. Each `Condition="Exists(...)"` keeps the project
+         buildable when the artifacts have not been produced yet (e.g.
+         on a dev machine that has run `dotnet build` before the WDK /
+         MSVC pipeline). The release pipeline builds them first so the
+         single-file publish picks them all up. -->
+    <EmbeddedResource Include="..\..\driver\build\the_chamber.sys"
+                      LogicalName="TheChamber.Drivers.the_chamber.sys"
+                      Condition="Exists('..\..\driver\build\the_chamber.sys')" />
+    <EmbeddedResource Include="..\..\driver\fingerprint\build\chamber_fingerprint.sys"
+                      LogicalName="TheChamber.Drivers.chamber_fingerprint.sys"
+                      Condition="Exists('..\..\driver\fingerprint\build\chamber_fingerprint.sys')" />
+    <EmbeddedResource Include="..\..\launcher\shim\build\chamber_shim.dll"
+                      LogicalName="TheChamber.Drivers.chamber_shim.dll"
+                      Condition="Exists('..\..\launcher\shim\build\chamber_shim.dll')" />
+    <EmbeddedResource Include="..\..\recovery\the_chamber_sign.cer"
+                      LogicalName="TheChamber.Certs.the_chamber.cer"
+                      Condition="Exists('..\..\recovery\the_chamber_sign.cer')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Resources\chamber.png" />
+    <EmbeddedResource Include="Resources\Resources.resx"
+                      LogicalName="TheChamber.Resources.Resources.resources" />
+  </ItemGroup>
+
+</Project>
