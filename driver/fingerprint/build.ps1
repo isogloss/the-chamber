@@ -132,6 +132,7 @@ $libs = @(
     (Join-Path $wdkLib 'hal.lib'),
     (Join-Path $wdkLib 'wmilib.lib'),
     (Join-Path $wdkLib 'fltmgr.lib'),
+    (Join-Path $wdkLib 'wdmsec.lib'),       # IoCreateDeviceSecure + SDDL_DEVOBJ_SYS_ALL
     (Join-Path $wdkLib 'BufferOverflowFastFailK.lib')
 ) | Where-Object { Test-Path $_ } | ForEach-Object { "`"$_`"" }
 $objArg = ($objFiles | ForEach-Object { "`"$_`"" }) -join ' '
