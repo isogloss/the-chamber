@@ -16,8 +16,7 @@
         <!-- ROW 0 — Target process selector -->
         <StackPanel Grid.Row="0">
             <TextBlock Text="TARGET PROCESS"
-                       Style="{StaticResource ChamberLabel}"
-                       LetterSpacing="4" Margin="0,0,0,6" />
+                       Style="{StaticResource ChamberLabel}" Margin="0,0,0,6" />
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
@@ -46,8 +45,7 @@
         <!-- ROW 1 — Output directory picker -->
         <StackPanel Grid.Row="1" Margin="0,16,0,0">
             <TextBlock Text="OUTPUT DIRECTORY"
-                       Style="{StaticResource ChamberLabel}"
-                       LetterSpacing="4" Margin="0,0,0,6" />
+                       Style="{StaticResource ChamberLabel}" Margin="0,0,0,6" />
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
@@ -76,8 +74,7 @@
         <!-- ROW 2 — Trigger selection -->
         <StackPanel Grid.Row="2" Margin="0,16,0,0">
             <TextBlock Text="TRIGGER"
-                       Style="{StaticResource ChamberLabel}"
-                       LetterSpacing="4" Margin="0,0,0,6" />
+                       Style="{StaticResource ChamberLabel}" Margin="0,0,0,6" />
             <StackPanel>
                 <!-- Manual -->
                 <Grid Margin="0,2">
@@ -254,7 +251,6 @@
                 <TextBlock Grid.Column="0"
                            Text="HISTORY"
                            Style="{StaticResource ChamberLabel}"
-                           LetterSpacing="4"
                            VerticalAlignment="Center" />
                 <Button Grid.Column="1"
                         Content="refresh history"

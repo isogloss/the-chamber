@@ -111,6 +111,15 @@ static BOOLEAN        g_trigger_init = FALSE;
  * uses it to wait for stragglers before freeing the trigger pool. */
 static volatile LONG g_trigger_outstanding = 0;
 
+/* Forward declarations — these functions are called earlier in this
+ * TU than their definitions, and dump_trigger.c is textually included
+ * at the tail of dump.c, so without an explicit forward decl the first
+ * call picks up an implicit `extern int fn()` signature and collides
+ * with the real static definition further down. Must appear AFTER
+ * TRIGGER_STATE is defined above. */
+static void trigger_reset_slot_locked(TRIGGER_STATE *t);
+static void trigger_broadcast_tlb_flush(void);
+
 /* --- Lifecycle ----------------------------------------------------- */
 
 static WORKER_THREAD_ROUTINE trigger_fire_worker;
@@ -178,8 +187,6 @@ NTSTATUS dump_trigger_init(void)
 
     return STATUS_SUCCESS;
 }
-
-static void trigger_reset_slot_locked(TRIGGER_STATE *t);
 
 void dump_trigger_shutdown(void)
 {

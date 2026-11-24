@@ -41,6 +41,7 @@
 
 #include "fingerprint_cfg.h"
 #include <wdmsec.h>     /* IoCreateDeviceSecure + SDDL_* constants */
+#include <ntimage.h>    /* PE image types (PIMAGE_DOS_HEADER / NT_HEADERS / SECTION_HEADER) */
 
 /* Pool tag resolves through the shared symbol in cfg_shared.c so this
  * TU does not bake 'cFPC' into .rdata and every allocation here wears

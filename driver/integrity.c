@@ -66,6 +66,7 @@
 
 #include <ntddk.h>
 #include <wdm.h>
+#include <ntimage.h>
 #include <intrin.h>
 #include "the_chamber.h"
 #include "svm.h"

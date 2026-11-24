@@ -67,7 +67,10 @@
  * capture returns.
  */
 
-#include <ntddk.h>
+/* ntifs.h brings in KAPC_STATE / KeStackAttachProcess / KeUnstackDetachProcess
+ * which are declared only in the FS layer of the WDK, not in ntddk.h / wdm.h.
+ * ntifs.h itself #includes ntddk.h so a straight swap here is safe. */
+#include <ntifs.h>
 #include <wdm.h>
 #include <intrin.h>
 #include "the_chamber.h"
@@ -88,25 +91,12 @@ volatile LONG64 g_dump_seq     = 0;
  * self-skip matters. */
 static volatile LONG g_pause_originator_cpu = -1;
 
-/* --- Externs we use from the kernel, without pulling a full header. --- */
+/* --- Externs we use from the kernel, without pulling a full header. ---
+ * KeStackAttachProcess / KeUnstackDetachProcess / KAPC_STATE come from
+ * <ntifs.h> above; KeSetTargetProcessorDpcEx comes from <wdm.h>;
+ * MEMORY_INFORMATION_CLASS + ZwQueryVirtualMemory come from <ntifs.h>. */
 NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId,
                                                 PEPROCESS *Process);
-NTKERNELAPI VOID     KeStackAttachProcess(PEPROCESS Process,
-                                          PKAPC_STATE ApcState);
-NTKERNELAPI VOID     KeUnstackDetachProcess(PKAPC_STATE ApcState);
-NTKERNELAPI VOID     KeSetTargetProcessorDpcEx(PKDPC Dpc,
-                                               PPROCESSOR_NUMBER Number);
-
-typedef enum _MEMORY_INFORMATION_CLASS {
-    MemoryBasicInformation = 0
-} MEMORY_INFORMATION_CLASS;
-
-NTSTATUS ZwQueryVirtualMemory(HANDLE ProcessHandle,
-                              PVOID BaseAddress,
-                              MEMORY_INFORMATION_CLASS Class,
-                              PVOID Buffer,
-                              SIZE_T Length,
-                              PSIZE_T ReturnLength);
 
 /* --- Pause primitive state ---------------------------------------- */
 
@@ -261,7 +251,12 @@ static void kuser_time_capture(KUSER_TIME_SNAPSHOT *out)
     if (attempts == 4096) return;
 
     out->tick_count_quad    = kud->TickCountQuad;
-    out->qpc_intr_time_bias = kud->QpcInterruptTimeBias;
+    /* QpcInterruptTimeBias lives at fixed offset 0x3B0 on x64 — the
+     * field name varies across WDK versions (QpcBias on 19041, renamed
+     * to QpcInterruptTimeBias in the Win11 SDK) so we access it by
+     * literal offset to keep the build portable. */
+    out->qpc_intr_time_bias =
+        *(volatile LONGLONG *)((PUCHAR)(ULONG_PTR)kud + 0x3B0);
     out->valid              = TRUE;
 }
 
@@ -305,9 +300,10 @@ static void kuser_time_rewind(const KUSER_TIME_SNAPSHOT *in)
     kud_rw->SystemTime.High1Time    = in->sys_high;
 
     /* TickCountQuad is a 64-bit aligned field; the architecturally
-     * atomic store is enough. QpcInterruptTimeBias likewise. */
+     * atomic store is enough. QPC bias likewise — written by fixed
+     * offset (see the matching note in kuser_time_capture). */
     kud_rw->TickCountQuad           = in->tick_count_quad;
-    kud_rw->QpcInterruptTimeBias    = in->qpc_intr_time_bias;
+    *(volatile LONGLONG *)((PUCHAR)kud_rw + 0x3B0) = in->qpc_intr_time_bias;
 
     MmUnmapIoSpace(rw_map, PAGE_SIZE);
 }

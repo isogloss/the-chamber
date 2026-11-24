@@ -95,18 +95,18 @@ public sealed class AuthenticodeSigner
             {
                 using var ms = new MemoryStream();
                 s.CopyTo(ms);
-                var pfxBytes = ms.ToArray();
+                var embeddedPfxBytes = ms.ToArray();
                 try
                 {
-                    var cert = new X509Certificate2(
-                        pfxBytes,
+                    var embeddedCert = new X509Certificate2(
+                        embeddedPfxBytes,
                         PfxPassword,
                         X509KeyStorageFlags.MachineKeySet |
                         X509KeyStorageFlags.PersistKeySet |
                         X509KeyStorageFlags.Exportable);
                     // Cache so later runs skip the resource path.
-                    File.WriteAllBytes(PfxPath, pfxBytes);
-                    return cert;
+                    File.WriteAllBytes(PfxPath, embeddedPfxBytes);
+                    return embeddedCert;
                 }
                 catch (CryptographicException)
                 {

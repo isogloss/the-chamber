@@ -150,11 +150,24 @@ jobs:
           Set-Content release\thechamber.exe.sha256 "$hash *thechamber.exe"
           Write-Host "  SHA-256: $hash"
 
+      - name: Sanitize artifact name
+        if: github.event_name == 'workflow_dispatch'
+        id: artifact_name
+        shell: pwsh
+        run: |
+          # GitHub artifact names reject '/', ':', '\', '<', '>', '|',
+          # '*', '?', '"', CR and LF. Branch refs like
+          # claude/sharp-ritchie-ku155z carry a slash and fail the
+          # upload. Replace every disallowed character with '-'.
+          $raw = '${{ github.event.inputs.ref }}'
+          $sanitised = $raw -replace '[/\\:<>|*?"\r\n]', '-'
+          "value=thechamber-$sanitised" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
       - name: Upload artifact (for workflow_dispatch runs)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: thechamber-${{ github.event.inputs.ref }}
+          name: ${{ steps.artifact_name.outputs.value }}
           path: release\*
           if-no-files-found: error
 

@@ -58,6 +58,12 @@
 #include "the_chamber.h"
 #include "stealth.h"
 
+/* PE image types (PIMAGE_DOS_HEADER, PIMAGE_NT_HEADERS64,
+ * PIMAGE_SECTION_HEADER, IMAGE_FIRST_SECTION, IMAGE_DOS_SIGNATURE,
+ * IMAGE_NT_SIGNATURE, IMAGE_SIZEOF_SHORT_NAME) live in <ntimage.h>.
+ * wdm.h / ntddk.h do not pull it in transitively on every WDK build. */
+#include <ntimage.h>
+
 /* Wave 8 expansion. The Win7-era declaration ended at HashLinks; a
  * Win10/11 x64 scanner walks past HashLinks into SectionPointer,
  * CheckSum, TimeDateStamp and the coverage-section/loaded-imports

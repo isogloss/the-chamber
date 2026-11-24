@@ -5,7 +5,7 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
-    <LangVersion>12</LangVersion>
+    <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>thechamber</AssemblyName>
@@ -50,7 +50,12 @@
 
   <ItemGroup>
     <Resource Include="Resources\chamber.png" />
-    <EmbeddedResource Include="Resources\Resources.resx"
+    <!-- Resources\Resources.resx is picked up automatically by the .NET
+         SDK's default EmbeddedResource glob. Override its LogicalName
+         via a Metadata update on the implicit item so the embedded
+         manifest name stays stable (TheChamber.Resources.Resources.resources)
+         without re-declaring and triggering NETSDK1022 duplication. -->
+    <EmbeddedResource Update="Resources\Resources.resx"
                       LogicalName="TheChamber.Resources.Resources.resources" />
   </ItemGroup>
 
