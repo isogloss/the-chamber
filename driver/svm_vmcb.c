@@ -351,16 +351,26 @@ void svm_build_vmcb(PER_CPU_CTX *ctx) {
     /* AMD 15.9 / 15.5.1: VMRUN must be intercepted; VMMCALL is the guest ->
      * host hypercall path (intercept vector 4).
      *
-     * Deliberately NOT intercepted: VMLOAD, VMSAVE, CLGI, STGI, INVLPGA,
-     * SKINIT, ICEBP, WBINVD, MONITOR, MWAIT, MWAIT_COND, XSETBV. Bare-metal
-     * Zen 4 with SVM available delivers #GP(0) on each of these at CPL > 0
-     * (XSETBV also faults on OSXSAVE=0); #UD only when SVM is unavailable
-     * or EFER.SVME is clear. Letting hardware deliver the fault matches
-     * what a probe at CPL 3 would see on a bare-metal box. OR'ing any of
-     * the IVEC4_VMLOAD/VMSAVE/CLGI/STGI/SKINIT/MONITOR/MWAIT/MWAIT_COND/
-     * XSETBV bits here would create a VMEXIT where bare metal would have
-     * delivered a fault at the trojan instruction. Don't add them. */
-    ctl->intercept_vec4 |= IVEC4_VMRUN | IVEC4_VMMCALL;
+     * VMLOAD/VMSAVE/CLGI/STGI are intercepted so the handler can inject #UD
+     * at the current RIP. Without interception, hardware delivers #GP(0)
+     * at CPL>0 because EFER.SVME is set in the VMCB -- a VMAware-style
+     * probe would then conclude that SVM is available on the box. A
+     * bare-metal machine with EFER.SVME clear (the shape this sandbox
+     * imitates) raises #UD on these opcodes, so the VMEXIT handler
+     * translates each intercept into a vector-6 injection at the trojan
+     * instruction, matching that bare-metal behaviour.
+     *
+     * Deliberately still NOT intercepted: INVLPGA, SKINIT, ICEBP, WBINVD,
+     * MONITOR, MWAIT, MWAIT_COND, XSETBV. Bare-metal Zen 4 with SVM
+     * available delivers #GP(0) on each of these at CPL > 0 (XSETBV also
+     * faults on OSXSAVE=0); letting hardware deliver that fault matches
+     * what a probe at CPL 3 would see. OR'ing any of the IVEC4_SKINIT/
+     * MONITOR/MWAIT/MWAIT_COND/XSETBV bits here would create a VMEXIT
+     * where bare metal would have delivered a fault at the trojan
+     * instruction. Don't add them. */
+    ctl->intercept_vec4 |= IVEC4_VMRUN  | IVEC4_VMMCALL |
+                           IVEC4_VMLOAD | IVEC4_VMSAVE  |
+                           IVEC4_STGI   | IVEC4_CLGI;
 
     /* No DR intercepts.  Phase 6.3 HW-breakpoint capture is out of scope
      * for passive dump; the HV has no use for guest DR0-DR3 state and

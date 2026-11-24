@@ -257,12 +257,128 @@ static void rewrite_leaf_8000001F(int regs[4])
     regs[3] = 0;
 }
 
+/* Architectural post-CPUID / post-VMMCALL single-step trap: if guest
+ * RFLAGS.TF is set at the point of an intercepted instruction, hardware
+ * on bare metal would deliver #DB after that instruction retires. SVM
+ * VMEXIT handlers never auto-deliver the #DB; we have to inject it
+ * ourselves. Caller must have already advanced vmcb->save.rip to
+ * next_rip so the #DB fires at the post-instruction RIP (matching the
+ * bare-metal trap-class semantics where RIP at delivery points to the
+ * next instruction).
+ *
+ * event_inject layout (AMD Table 15-5):
+ *   bits 0-7  vector (1 = #DB)
+ *   bits 8-10 type   (3 = exception)
+ *   bit  11   error-code valid (0 = no EC for #DB)
+ *   bit  31   valid (1)
+ *   bits 32-63 error code (unused for #DB) */
+#define RFLAGS_TF   (1ULL << 8)
+static void inject_db_if_tf(VMCB *vmcb)
+{
+    if ((vmcb->save.rflags & RFLAGS_TF) != 0) {
+        vmcb->ctl.event_inject = (1ULL << 31) | (3ULL << 8) | 1ULL;
+    }
+}
+
+/* Serve one cached leaf into the save/gpr registers. Shared by the
+ * cacheable-leaf and the HV/invalid-band fast paths. */
+static void cpuid_serve_regs(PER_CPU_CTX *ctx, VMCB *vmcb,
+                             ULONG eax, ULONG ebx, ULONG ecx, ULONG edx)
+{
+    vmcb->save.rax   = (ULONGLONG)eax;
+    ctx->gpr_save[1] = (ULONGLONG)ebx;
+    ctx->gpr_save[2] = (ULONGLONG)ecx;
+    ctx->gpr_save[3] = (ULONGLONG)edx;
+    vmcb->save.rip   = vmcb->ctl.next_rip;
+    inject_db_if_tf(vmcb);
+}
+
 static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
 {
     ULONG leaf = (ULONG)vmcb->save.rax;
     ULONG subleaf = (ULONG)ctx->gpr_save[2];   /* rcx */
     int regs[4];
     BOOLEAN rewrite = identity_rewrites_enabled();
+    const CHAMBER_CPUID_REWRITE_CACHE *cache = NULL;
+
+    /* Hot-path CPUID servicing (TIMER defence against the sibling-SMT
+     * software clock). When identity rewrites are enabled and the
+     * per-vCPU cache is populated, serve the common leaves directly
+     * from the cached (EAX, EBX, ECX, EDX) rather than re-running the
+     * __cpuidex + per-leaf rewrite pipeline. Trims handler wallclock
+     * -- the only honest fix for a probe that counts on a sibling
+     * logical processor. Leaves outside the cacheable set (including
+     * every leaf with dynamic state: TSC-backed 0x15/0x16, RDPMC-
+     * related, or 0xB/0x1F subleaves beyond CHAMBER_CPUID_*_SUBLEAVES)
+     * fall through to the slow path below. */
+    if (rewrite) {
+        cache = identity_get_cpuid_cache(ctx->cpu_index);
+        if (cache && cache->valid) {
+            const CHAMBER_CPUID_LEAF *entry = NULL;
+
+            switch (leaf) {
+            case 1U:
+                entry = &cache->leaf_1;
+                break;
+            case 7U:
+                if (subleaf == 0) entry = &cache->leaf_7_0;
+                break;
+            case 0xBU:
+                if (subleaf < CHAMBER_CPUID_B_SUBLEAVES)
+                    entry = &cache->leaf_B[subleaf];
+                break;
+            case 0x1FU:
+                if (subleaf < CHAMBER_CPUID_1F_SUBLEAVES)
+                    entry = &cache->leaf_1F[subleaf];
+                break;
+            case 0x80000001U:
+                entry = &cache->leaf_80000001;
+                break;
+            case 0x80000002U:
+                entry = &cache->leaf_80000002;
+                break;
+            case 0x80000003U:
+                entry = &cache->leaf_80000003;
+                break;
+            case 0x80000004U:
+                entry = &cache->leaf_80000004;
+                break;
+            case 0x8000001EU:
+                entry = &cache->leaf_8000001E;
+                break;
+            default:
+                break;
+            }
+
+            if (entry) {
+                cpuid_serve_regs(ctx, vmcb,
+                                 entry->eax, entry->ebx,
+                                 entry->ecx, entry->edx);
+                return;
+            }
+
+            /* Zero-shaped bands: the HV-reserved range (0x40000000..
+             * 0x4FFFFFFF) and the invalid-basic-leaf collapse
+             * (leaves above max_basic_leaf but below the HV range).
+             *
+             * The invalid-basic case closes a VMAware CPUID_SIGNATURE
+             * sub-check: a probe that reads leaf 0x40000000 (zeroed)
+             * and an invalid basic leaf like 0x04201337 should see the
+             * same all-zero shape. Without this case, Zen 4 reflows
+             * invalid leaves above max-basic into a NON-ZERO max-basic
+             * fill, so the two reads differ -- itself the tell. We
+             * anchor the collapse at leaf > 0x0D (the last real basic
+             * leaf we care about) on top of leaf > max_basic_leaf so a
+             * misreported max_basic cannot accidentally zero a leaf
+             * we actually want to pass through. */
+            if ((leaf >= 0x40000000U && leaf <= 0x4FFFFFFFU) ||
+                (leaf > cache->max_basic_leaf && leaf > 0x0DU &&
+                 leaf < 0x40000000U)) {
+                cpuid_serve_regs(ctx, vmcb, 0, 0, 0, 0);
+                return;
+            }
+        }
+    }
 
     __cpuidex(regs, (int)leaf, (int)subleaf);
 
@@ -377,6 +493,28 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
         regs[3] = 0;
     }
 
+    /* Invalid-basic-leaf collapse (slow-path mirror of the fast-path
+     * case above). Reached when the fast-path cache was not consulted
+     * (rewrites disabled or cache not populated yet). Needs the host
+     * max-basic leaf, which we read via CPUID.0 on demand. Anchored at
+     * leaf > 0x0D for the same safety reason the fast path uses: an
+     * unreported max-basic from the host must not accidentally zero a
+     * basic leaf we rewrite elsewhere. Closes the VMAware
+     * CPUID_SIGNATURE invalid-basic-leaf-collapse sub-check, where the
+     * probe reads leaf 0x40000000 (zero) and an invalid basic leaf
+     * like 0x04201337; on Zen 4 the invalid leaf reflows to a NON-ZERO
+     * max-basic fill and the two reads differ -- itself the tell. */
+    if (leaf > 0x0DU && leaf < 0x40000000U) {
+        int basic[4];
+        __cpuidex(basic, 0, 0);
+        if (leaf > (ULONG)basic[0]) {
+            regs[0] = 0;
+            regs[1] = 0;
+            regs[2] = 0;
+            regs[3] = 0;
+        }
+    }
+
     vmcb->save.rax = (ULONGLONG)(ULONG)regs[0];   /* eax */
     ctx->gpr_save[1] = (ULONGLONG)(ULONG)regs[1]; /* ebx */
     ctx->gpr_save[2] = (ULONGLONG)(ULONG)regs[2]; /* ecx */
@@ -388,6 +526,14 @@ static void handle_cpuid(PER_CPU_CTX *ctx, VMCB *vmcb)
      * the list of other exits where next_rip is valid and the full list
      * of fault-class exits where it is NOT. */
     vmcb->save.rip = vmcb->ctl.next_rip;
+
+    /* Architectural post-CPUID single-step trap: if guest RFLAGS.TF is
+     * set, bare metal would deliver #DB after CPUID retires. SVM VMEXIT
+     * handlers do not auto-deliver the trap, so inject it here after
+     * RIP has advanced to next_rip. Closes the VMAware SINGLE_STEP
+     * gap, where the probe sets TF and expects the trap at the
+     * post-CPUID RIP. */
+    inject_db_if_tf(vmcb);
 }
 
 /* ------------------------------------------------------------------ */
@@ -634,19 +780,31 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
             vmcb->save.efer = value;
             vmcb->ctl.vmcb_clean_bits &= ~VMCB_CLEAN_BIT_CR;
         } else {
-            /* Wave 8: report vmcb->save.efer AS-STORED, SVME included.
+            /* Mask SVME out of the guest-visible EFER read while keeping
+             * SVME=1 in VMCB.save.efer (required for VMRUN). The SVM
+             * story the HV tells the guest is "firmware disabled SVM":
+             *   - CPUID.80000001.ECX[2] cleared (handle_cpuid)
+             *   - VM_CR LOCK=1 / SVMDIS=1 (below)
+             *   - EFER.SVME reads as 0 here
+             *   - A guest VMLOAD/VMSAVE/CLGI/STGI at CPL3 therefore has
+             *     nothing to probe against: the capability bit is off,
+             *     the firmware lock is set, and the EFER view agrees.
+             * The prior behaviour reported vmcb->save.efer AS-STORED
+             * with SVME=1, which handed VMAware's SVM_EXCEPTIONS arm (b)
+             * an exact CPUID-vs-EFER mismatch tell (CPUID hides SVM
+             * while EFER advertises SVME=1). A guest write path still
+             * ORs SVME=1 back into the stored VMCB.save.efer so VMRUN's
+             * consistency check continues to pass; the host's physical
+             * EFER is never touched by this handler.
              *
-             * Prior behaviour masked SVME off on read while the write path
-             * force-ORs it on. A guest sequence `v = rdmsr(EFER); wrmsr(EFER, v)`
-             * would therefore observe value churn: bit 12 read as 0, written
-             * back as 0, then re-set to 1 inside the VMCB -- next read still
-             * 0. The lie is self-consistent but the mere act of SVME flapping
-             * through the shadow leaves a diff that a paravirt probe can
-             * catch by comparing (rdmsr post-wrmsr == wrmsr-input). Returning
-             * the stored value makes the round-trip stable. The host's own
-             * SVME policy remains unaffected because this handler never
-             * touches physical EFER. */
-            value = vmcb->save.efer;
+             * Round-trip note: a guest `v = rdmsr(EFER); wrmsr(EFER, v)`
+             * reads SVME=0, writes SVME=0, sees SVME=0 on re-read -- the
+             * internal re-OR of SVME into VMCB.save.efer is invisible
+             * to the guest observer, so the round-trip is stable. The
+             * only guest-visible asymmetry is a guest that explicitly
+             * writes SVME=1 and then reads back SVME=0, which exactly
+             * matches the "VM_CR.LOCK=1 absorbs the write" story. */
+            value = vmcb->save.efer & ~EFER_SVME;
             vmcb->save.rax   = (ULONGLONG)(ULONG)value;
             ctx->gpr_save[3] = (ULONGLONG)(ULONG)(value >> 32);
         }
@@ -934,6 +1092,14 @@ static void handle_vmmcall(PER_CPU_CTX *ctx, VMCB *vmcb)
     }
 
     vmcb->save.rip = vmcb->ctl.next_rip;
+
+    /* VMMCALL is a TF-sensitive decoded intercept, same as CPUID.
+     * Mirror the post-CPUID #DB inject: if guest RFLAGS.TF is set,
+     * deliver the architectural single-step trap at the post-VMMCALL
+     * RIP after we have advanced vmcb->save.rip to next_rip. Keeps
+     * the guest-visible trap sequencing consistent whether a TF-set
+     * guest hits CPUID or VMMCALL. */
+    inject_db_if_tf(vmcb);
 }
 
 /* ------------------------------------------------------------------ */

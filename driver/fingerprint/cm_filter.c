@@ -2,8 +2,10 @@
  *
  * Covers every registry identity value a packed sample reads to
  * fingerprint the host: MachineGuid, ProductId, InstallDate,
- * DigitalProductId, EDID blob, BitLocker status, NtpServer, and the
- * HARDWARE\\DESCRIPTION\\System\\BIOS mirror.
+ * DigitalProductId, EDID blob, BitLocker status, NtpServer, the
+ * HARDWARE\\DESCRIPTION\\System\\BIOS mirror, and the PCI / USB
+ * HardwareID / CompatibleIDs multi-strings under
+ * SYSTEM\\CurrentControlSet\\Enum\\ (SetupDi device enumeration).
  *
  * The registered callback fires pre-op and post-op on every registry
  * operation in the kernel. We intercept RegNtPostQueryValueKey only,
@@ -24,6 +26,12 @@
  * a VM or the real monitor may differ from the shape we claim. For
  * that one path we rewrite the blob in post-op to our EDID template,
  * truncating if the caller's buffer is shorter.
+ *
+ * The REG_MULTI_SZ rewrite for \Enum\PCI\ and \Enum\USB\ HardwareID /
+ * CompatibleIDs values is also strictly in-place: VEN:DEV and VID:PID
+ * tokens are always four hex digits so the overwrite preserves the
+ * per-string NUL framing and the REG_MULTI_SZ trailing double-NUL
+ * without touching DataLength.
  */
 
 #include "fingerprint_cfg.h"
@@ -116,6 +124,143 @@ bytes_to_wstring(const UCHAR *src, ULONG srclen, WCHAR *dst, ULONG max_chars)
     }
     if (max_chars) dst[n] = 0;
     return n;
+}
+
+/* ---------------- PCI/USB enum VEN:DEV pool ----------------
+ *
+ * Seed-derived canonical VEN:DEV pairs we substitute into the four-hex
+ * tokens inside HardwareID / CompatibleIDs multi-strings under
+ *   \Registry\Machine\System\CurrentControlSet\Enum\PCI\...
+ *   \Registry\Machine\System\CurrentControlSet\Enum\USB\...
+ *
+ * VMAware's DEVICES probe walks those multi-strings via
+ * SetupDiGetDeviceRegistryPropertyW(SPDRP_HARDWAREID) and matches each
+ * VEN:DEV (or VID:PID) token against a VM-vendor blacklist:
+ *     virtio        0x1AF4
+ *     VMware        0x15AD
+ *     QEMU/Red Hat  0x1B36
+ *     VirtualBox    0x80EE
+ *     Parallels     0x1AB8
+ *     Xen           0x5853
+ * The pool below is constructed to exclude every entry on that list;
+ * each pair is a real retail-silicon identity so the probe parses it
+ * as bare metal. If a pool entry is ever rotated at reseed, verify it
+ * is not in the blacklist above before shipping.
+ */
+static const struct {
+    USHORT ven;
+    USHORT dev;
+} g_cfp_vendev_pool[] = {
+    { 0x1002, 0x7480 },   /* AMD/ATI RDNA 2 (Navi 24) */
+    { 0x10EC, 0x8168 },   /* Realtek RTL8111/8168 GbE */
+    { 0x8086, 0x08D8 }    /* Intel chipset */
+};
+#define CFP_VENDEV_POOL_N \
+    (sizeof(g_cfp_vendev_pool) / sizeof(g_cfp_vendev_pool[0]))
+
+/* Parse four wide-char hex digits at `p` into a USHORT (big-endian in
+ * reading order, matching "VEN_xxxx" = v[0]<<12 | v[1]<<8 | ...).
+ * Returns FALSE if any digit is non-hex. */
+static BOOLEAN
+cfp_parse_hex4_w(const WCHAR *p, USHORT *out)
+{
+    USHORT v = 0;
+    for (int i = 0; i < 4; ++i) {
+        WCHAR c = p[i];
+        UCHAR d;
+        if      (c >= L'0' && c <= L'9') d = (UCHAR)(c - L'0');
+        else if (c >= L'a' && c <= L'f') d = (UCHAR)(c - L'a' + 10);
+        else if (c >= L'A' && c <= L'F') d = (UCHAR)(c - L'A' + 10);
+        else return FALSE;
+        v = (USHORT)((v << 4) | d);
+    }
+    *out = v;
+    return TRUE;
+}
+
+/* Write a four-digit uppercase hex representation of `v` into `p[0..3]`.
+ * Matches the casing PnP normally stores (upper-case VEN/DEV tokens). */
+static void
+cfp_write_hex4_w(WCHAR *p, USHORT v)
+{
+    static const WCHAR hex[] = L"0123456789ABCDEF";
+    p[0] = hex[(v >> 12) & 0xF];
+    p[1] = hex[(v >>  8) & 0xF];
+    p[2] = hex[(v >>  4) & 0xF];
+    p[3] = hex[ v        & 0xF];
+}
+
+/* Case-insensitive four-WCHAR match: compares buf[0..3] against a
+ * literal 4-char tag (ASCII, either upper or lower on both sides).
+ * Short-circuits on any mismatch. */
+static BOOLEAN
+cfp_match4_i(const WCHAR *buf, const WCHAR *tag)
+{
+    for (int k = 0; k < 4; ++k) {
+        WCHAR a = buf[k];
+        WCHAR b = tag[k];
+        if (a >= L'a' && a <= L'z') a = (WCHAR)(a - L'a' + L'A');
+        if (b >= L'a' && b <= L'z') b = (WCHAR)(b - L'a' + L'A');
+        if (a != b) return FALSE;
+    }
+    return TRUE;
+}
+
+/* Rewrite the VEN:DEV (PCI) or VID:PID (USB) tokens inside a single
+ * REG_MULTI_SZ wide-char buffer in place. `cwchars` is the buffer
+ * length in WCHARs, inclusive of the trailing double-NUL. The rewrite
+ * is strictly same-length (4 hex digits for 4 hex digits) so NUL
+ * framing and REG_MULTI_SZ DataLength are preserved — no caller-side
+ * buffer resize is required.
+ *
+ * The pool entry is selected via a modulo on the original VEN value;
+ * this keeps the mapping deterministic per original device so repeated
+ * reads of the same HardwareID produce the same rewritten bytes, and a
+ * DEV_ token in the same substring pairs to the same pool entry as its
+ * VEN_ prefix. */
+static void
+cfp_rewrite_hwid_vendev(WCHAR *buf, ULONG cwchars, BOOLEAN is_usb)
+{
+    if (!buf || cwchars < 8) return;
+
+    const WCHAR *ven_tag = is_usb ? L"VID_" : L"VEN_";
+    const WCHAR *dev_tag = is_usb ? L"PID_" : L"DEV_";
+
+    /* A full "VEN_xxxx&DEV_xxxx" token occupies 17 WCHARs:
+     *   VEN_xxxx = 8    &  = 1    DEV_xxxx = 8
+     * The VEN_-only read only needs 8 WCHARs, so the outer bound is 8. */
+    ULONG i = 0;
+    while (i + 8 <= cwchars) {
+        if (!cfp_match4_i(&buf[i], ven_tag)) {
+            ++i;
+            continue;
+        }
+        USHORT old_ven;
+        if (!cfp_parse_hex4_w(&buf[i + 4], &old_ven)) {
+            ++i;
+            continue;
+        }
+        ULONG slot = (ULONG)old_ven % (ULONG)CFP_VENDEV_POOL_N;
+        cfp_write_hex4_w(&buf[i + 4], g_cfp_vendev_pool[slot].ven);
+
+        /* Paired DEV_/PID_ tag sits at i+9 when preceded by '&':
+         *   VEN_xxxx & DEV_xxxx
+         *   0  4   8 9 13   17
+         * so the DEV_ hex digits start at i+13 and end at i+16. */
+        if (i + 17 <= cwchars &&
+            buf[i + 8] == L'&' &&
+            cfp_match4_i(&buf[i + 9], dev_tag))
+        {
+            USHORT old_dev;
+            if (cfp_parse_hex4_w(&buf[i + 13], &old_dev)) {
+                cfp_write_hex4_w(&buf[i + 13], g_cfp_vendev_pool[slot].dev);
+            }
+        }
+
+        /* Skip past the VEN_xxxx we just wrote so the next iteration
+         * cannot re-match on the four digits we installed. */
+        i += 8;
+    }
 }
 
 /* ---------------- per-path rewriters ---------------- */
@@ -280,6 +425,33 @@ patch_kvpi(PKEY_VALUE_PARTIAL_INFORMATION kvpi,
             }
         }
         break;
+
+    case REG_MULTI_SZ: {
+        /* SetupDi device enumeration: HardwareID / CompatibleIDs under
+         *   \Registry\Machine\System\CurrentControlSet\Enum\PCI\...
+         *   \Registry\Machine\System\CurrentControlSet\Enum\USB\...
+         * are REG_MULTI_SZ with VEN_/DEV_ (PCI) or VID_/PID_ (USB) four-
+         * hex-digit tokens. We rewrite the tokens in place to canonical
+         * retail VEN:DEV pairs drawn from g_cfp_vendev_pool so VMAware's
+         * DEVICES probe parses each as bare-metal silicon rather than as
+         * a virtio / VMware / QEMU / VirtualBox / Parallels / Xen tell.
+         * The rewrite is same-length, so DataLength and the REG_MULTI_SZ
+         * double-NUL frame carry through unchanged. */
+        BOOLEAN is_pci = unicode_contains_i(key_path, L"\\Enum\\PCI\\");
+        BOOLEAN is_usb = !is_pci &&
+                         unicode_contains_i(key_path, L"\\Enum\\USB\\");
+        if (!is_pci && !is_usb) break;
+        if (!unicode_equals_i(value_name, L"HardwareID") &&
+            !unicode_equals_i(value_name, L"CompatibleIDs") &&
+            !unicode_equals_i(value_name, L"CompatibleID")) {
+            break;
+        }
+        if (kvpi->DataLength < 8 * sizeof(WCHAR)) break;
+        cfp_rewrite_hwid_vendev((WCHAR *)kvpi->Data,
+                                kvpi->DataLength / sizeof(WCHAR),
+                                is_usb);
+        break;
+    }
 
     case REG_BINARY: {
         /* Surfaces 29, 30, 48: DigitalProductId, DigitalProductId4, EDID. */

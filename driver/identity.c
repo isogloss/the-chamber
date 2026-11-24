@@ -405,6 +405,128 @@ static ULONGLONG derive_u64(const UCHAR seed[32], const char *field)
     return v;
 }
 
+/* ------------------------------------------------------------------- */
+/* Hot-path CPUID rewrite cache.                                       */
+/* Mirrors the identity-driven rewrites that handle_cpuid's slow path  */
+/* applies, so the fast path can serve the common leaves without       */
+/* re-running them. Leaves whose output depends only on seed-derived   */
+/* identity + host CPUID at identity_apply time belong here; leaves    */
+/* that depend on guest-dynamic state (TSC, RDPMC, per-call subleaf    */
+/* beyond the cached fan-out) are left to the slow path.               */
+/* ------------------------------------------------------------------- */
+
+static void cache_leaf(CHAMBER_CPUID_LEAF *out, const int regs[4])
+{
+    out->eax = (ULONG)regs[0];
+    out->ebx = (ULONG)regs[1];
+    out->ecx = (ULONG)regs[2];
+    out->edx = (ULONG)regs[3];
+}
+
+/* Pack 16 bytes of the 48-byte brand string into one brand-string
+ * leaf's four output registers, little-endian. Mirrors the vmexit-side
+ * brand_slot_to_regs helper so the cache emits identical bytes. */
+static void brand_slot_into_leaf(ULONG slot, CHAMBER_CPUID_LEAF *out)
+{
+    const UCHAR *base = &g_chamber_cfg_v2.cpu_brand_string[slot * 16];
+    ULONG r, i, v;
+    ULONG regs[4];
+    for (r = 0; r < 4; r++) {
+        v = 0;
+        for (i = 0; i < 4; i++) {
+            v |= ((ULONG)base[r * 4 + i]) << (i * 8);
+        }
+        regs[r] = v;
+    }
+    out->eax = regs[0];
+    out->ebx = regs[1];
+    out->ecx = regs[2];
+    out->edx = regs[3];
+}
+
+static void populate_cpuid_cache(ULONG vcpu)
+{
+    CHAMBER_CPUID_REWRITE_CACHE *cache;
+    int regs[4];
+    ULONG sub;
+    ULONG apic, x2apic;
+
+    cache = &g_cpu_identity[vcpu].cpuid_cache;
+    RtlZeroMemory(cache, sizeof(*cache));
+
+    apic   = g_cpu_identity[vcpu].apic_id & 0xFFu;
+    x2apic = g_cpu_identity[vcpu].x2apic_id;
+
+    /* Max basic leaf from host. Used by the invalid-basic-leaf collapse
+     * in handle_cpuid (Zen 4 reflows invalid leaves above max-basic to
+     * a non-zero max-basic fill; zeroing that range matches the shape
+     * the HV-reserved band already emits). */
+    __cpuidex(regs, 0, 0);
+    cache->max_basic_leaf = (ULONG)regs[0];
+
+    /* Leaf 1 -- CPU signature in EAX, APIC ID in EBX[31:24], HV-present
+     * bit cleared in ECX[31]. */
+    __cpuidex(regs, 1, 0);
+    {
+        ULONG ebx = (ULONG)regs[1];
+        ebx = (ebx & 0x00FFFFFFu) | (apic << 24);
+        regs[1] = (int)ebx;
+        if (g_identity_cpu_signature) regs[0] = (int)g_identity_cpu_signature;
+        regs[2] &= ~(1u << 31);
+    }
+    cache_leaf(&cache->leaf_1, regs);
+
+    /* Leaf 7 subleaf 0 -- extended features, host passthrough today. */
+    __cpuidex(regs, 7, 0);
+    cache_leaf(&cache->leaf_7_0, regs);
+
+    /* Leaf 0xB extended topology -- stamp per-vCPU x2APIC into EDX. */
+    for (sub = 0; sub < CHAMBER_CPUID_B_SUBLEAVES; sub++) {
+        __cpuidex(regs, 0xB, (int)sub);
+        regs[3] = (int)x2apic;
+        cache_leaf(&cache->leaf_B[sub], regs);
+    }
+
+    /* Leaf 0x1F V2 extended topology -- same x2APIC stamping as 0xB. */
+    for (sub = 0; sub < CHAMBER_CPUID_1F_SUBLEAVES; sub++) {
+        __cpuidex(regs, 0x1F, (int)sub);
+        regs[3] = (int)x2apic;
+        cache_leaf(&cache->leaf_1F[sub], regs);
+    }
+
+    /* Leaf 0x80000001 -- seed-derived ECX/EDX overlay masked to host
+     * bits, plus the unconditional SVM-off / TOPO_EXT / PCtrExt scrub
+     * handle_cpuid applies after the per-leaf rewrite. */
+    __cpuidex(regs, 0x80000001, 0);
+    {
+        ULONG host_ecx = (ULONG)regs[2];
+        ULONG host_edx = (ULONG)regs[3];
+        regs[2] = (int)(host_ecx & (host_ecx ^ g_identity_cpu_ext_feat_ecx));
+        regs[3] = (int)(host_edx & (host_edx ^ g_identity_cpu_ext_feat_edx));
+        regs[2] = (int)((ULONG)regs[2] | (host_ecx & 0x000003FFu));
+        regs[3] = (int)((ULONG)regs[3] | (host_edx & 0x3FFFFFFFu));
+        /* Unconditional AMD scrub: SVM off, TOPO_EXT/PCtrExt pinned on. */
+        regs[2] &= ~(1u << 2);
+        regs[2] |=  (1u << 22) | (1u << 23);
+    }
+    cache_leaf(&cache->leaf_80000001, regs);
+
+    /* Leaves 0x80000002-4 -- seed-derived brand string slots. */
+    brand_slot_into_leaf(0, &cache->leaf_80000002);
+    brand_slot_into_leaf(1, &cache->leaf_80000003);
+    brand_slot_into_leaf(2, &cache->leaf_80000004);
+
+    /* Leaf 0x8000001E -- Extended APIC ID in EAX matches the per-vCPU
+     * x2APIC stamped at 0xB/0x1F EDX; the compute-unit and node fields
+     * stay at their host-passthrough values (hardware topology, not
+     * vCPU identity). */
+    __cpuidex(regs, 0x8000001E, 0);
+    regs[0] = (int)x2apic;
+    cache_leaf(&cache->leaf_8000001E, regs);
+
+    cache->valid = TRUE;
+}
+
 NTSTATUS identity_apply(const CHAMBER_CFG_V2 *cfg)
 {
     SIZE_T i;
@@ -492,6 +614,15 @@ NTSTATUS identity_apply(const CHAMBER_CFG_V2 *cfg)
         }
     }
 
+    /* Precompute each vCPU's CPUID rewrite cache. Must run after the
+     * per-vCPU APIC / x2APIC IDs are populated (above) and the single-
+     * valued globals (g_identity_cpu_signature / ext-feat / brand
+     * string in g_chamber_cfg_v2) are live, because the cache embeds
+     * all of those directly. */
+    for (i = 0; i < g_cpu_count; i++) {
+        populate_cpuid_cache((ULONG)i);
+    }
+
     g_identity_valid = TRUE;
     return STATUS_SUCCESS;
 }
@@ -528,4 +659,10 @@ void identity_set_tsc_aux(ULONG vcpu, ULONGLONG value)
     if (!g_cpu_identity || vcpu >= g_cpu_count) return;
     g_cpu_identity[vcpu].tsc_aux_latched = value;
     g_cpu_identity[vcpu].tsc_aux_latched_valid = TRUE;
+}
+
+const CHAMBER_CPUID_REWRITE_CACHE *identity_get_cpuid_cache(ULONG vcpu)
+{
+    if (!g_cpu_identity || vcpu >= g_cpu_count) return NULL;
+    return &g_cpu_identity[vcpu].cpuid_cache;
 }

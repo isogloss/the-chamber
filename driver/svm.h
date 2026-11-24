@@ -23,8 +23,16 @@
 #define VMEXIT_RDPMC            0x52ULL
 #define VMEXIT_CPUID            0x72ULL
 #define VMEXIT_MSR              0x7CULL
-#define VMEXIT_VMMCALL          0x81ULL
 #define VMEXIT_VMRUN            0x80ULL
+#define VMEXIT_VMMCALL          0x81ULL
+/* AMD Table 15-7: VMLOAD/VMSAVE/STGI/CLGI exits occupy 0x82..0x85. Guest
+ * attempts at CPL>0 would otherwise raise #GP(0) because EFER.SVME is set
+ * in the VMCB; VMAware-style probes distinguish bare-metal SVME-off
+ * (delivers #UD) from SVME-on. Intercept so the handler injects #UD. */
+#define VMEXIT_VMLOAD           0x82ULL
+#define VMEXIT_VMSAVE           0x83ULL
+#define VMEXIT_STGI             0x84ULL
+#define VMEXIT_CLGI             0x85ULL
 #define VMEXIT_NPF              0x400ULL
 #define VMEXIT_INVALID          ((ULONGLONG)-1)
 
