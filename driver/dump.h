@@ -13,14 +13,18 @@
  *
  * Capture mechanics:
  *
- *   1. dump_pause_begin() installs a targeted-DPC rendezvous. One KDPC
- *      per active logical CPU, each pinned via KeSetTargetProcessorDpcEx,
- *      is queued with KeInsertQueueDpc. Every DPC runs at DISPATCH_LEVEL
- *      on its own CPU, reads __readcr3() (which runs on the guest, so
- *      CR3 is live), compares against the capture target, and if the
- *      match is positive spins on g_pause_active with a bounded wait
- *      (two seconds via KeQueryInterruptTime). Non-matching CPUs and
- *      timed-out matching CPUs return at once.
+ *   1. pause_broadcast_and_wait() (static in dump.c) installs a
+ *      targeted-DPC rendezvous. One KDPC per active logical CPU, each
+ *      pinned via KeSetTargetProcessorDpcEx, is queued with
+ *      KeInsertQueueDpc. Every DPC runs at DISPATCH_LEVEL on its own
+ *      CPU, reads __readcr3() (which runs on the guest, so CR3 is
+ *      live), compares against the capture target, and if the match
+ *      is positive spins on g_pause_active with a bounded wait (two
+ *      seconds via KeQueryInterruptTime). Non-matching CPUs and
+ *      timed-out matching CPUs return at once. The DPC that lands on
+ *      the originator CPU (recorded in g_pause_originator_cpu) also
+ *      self-skips so the originator can run its walk at
+ *      PASSIVE_LEVEL without wedging itself.
  *
  *   2. The originator spins until the per-CPU parked counter reaches
  *      the observed-matching count, then runs the VAD walk at
@@ -33,9 +37,10 @@
  *      holding their CPUs, so the rewind lands before any guest
  *      resumes.
  *
- *   4. dump_pause_end() InterlockedExchanges g_pause_active to 0, which
- *      releases the parked DPCs; each returns and its CPU resumes the
- *      guest on its next VMRUN.
+ *   4. snapshot_locked InterlockedExchanges g_pause_active to 0,
+ *      which releases the parked DPCs; each returns and its CPU
+ *      resumes the guest on its next VMRUN. dump_pause_init /
+ *      dump_pause_shutdown own the KDPC array lifetime across loads.
  *
  * Re-entrancy: the DPC array is allocated once (at init) and reused
  * across every call; a global g_dump_seq counter is bumped per fire so

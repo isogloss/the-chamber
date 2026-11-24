@@ -796,6 +796,28 @@ NTSTATUS IrpDeviceControl(PDEVICE_OBJECT Device, PIRP Irp)
         break;
     }
 
+    case IOCTL_CFP_GET_DEVICE_NAME: {
+        /* The HV driver cannot cross-query the fp driver's chosen
+         * suffix in-kernel without a shared registry publisher or a
+         * cross-driver import — neither of which Wave 8.5 landed. The
+         * common path (CFG blob present on both sides) does not need
+         * this IOCTL at all: launcher and fp driver derive the same
+         * suffix from CHAMBER_CFG_V2.device_suffix. STATUS_NOT_SUPPORTED
+         * is the explicit "fall back to CFG-derived suffix" sentinel
+         * the launcher's QueryFingerprintDeviceNameAsync handles; a
+         * generic STATUS_INVALID_DEVICE_REQUEST would be
+         * indistinguishable from a wrong code reaching the wrong
+         * driver. */
+        if (out_len < sizeof(CFP_DEVICE_NAME_RESPONSE)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        RtlZeroMemory(buf, sizeof(CFP_DEVICE_NAME_RESPONSE));
+        info = sizeof(CFP_DEVICE_NAME_RESPONSE);
+        st = STATUS_NOT_SUPPORTED;
+        break;
+    }
+
     default:
         break;
     }

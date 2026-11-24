@@ -206,6 +206,31 @@ extern BOOLEAN         g_chamber_cfg_v2_valid; /* TRUE after DriverEntry version
 #define IOCTL_THE_CHAMBER_QUERY_DUMP_HISTORY \
     CTL_CODE(0x8000, 0x826, METHOD_BUFFERED, FILE_READ_ACCESS)
 
+/* Function 0x830 lives in the fingerprint-coordination block (disjoint
+ * from the dump block above) so the fp driver and HV driver never clash
+ * on function numbers. The HV driver cannot know the suffix the fp
+ * driver picked when CFG was absent and the fp driver fell back to a
+ * random per-boot suffix; it returns STATUS_NOT_SUPPORTED in that case
+ * and the launcher derives the suffix from its own copy of
+ * CHAMBER_CFG_V2 (the common path — launcher and fp driver derive the
+ * same ASCII string from the same CFG bytes, so no runtime handshake
+ * is required when CFG is live). Keeping the code wired on the HV side
+ * lets a later wave attach a cross-driver publisher without changing
+ * either the launcher protocol or the suffix generator. */
+#define IOCTL_CFP_GET_DEVICE_NAME \
+    CTL_CODE(0x8000, 0x830, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+/* Output of IOCTL_CFP_GET_DEVICE_NAME. SuffixLengthChars counts the
+ * UTF-16 code units of Suffix that are valid; the driver does NOT
+ * null-terminate. Reserved must be zero. 128 code units of Suffix
+ * capacity is the launcher-facing contract (DumpIoctls.cs structural
+ * layout); shortening it breaks the ByValTStr marshal. */
+typedef struct _CFP_DEVICE_NAME_RESPONSE {
+    ULONG  SuffixLengthChars;
+    ULONG  Reserved;
+    WCHAR  Suffix[128];
+} CFP_DEVICE_NAME_RESPONSE, *PCFP_DEVICE_NAME_RESPONSE;
+
 typedef struct _CHAMBER_STATUS {
     ULONG   version;
     ULONG   cpu_count;

@@ -348,6 +348,20 @@ static VOID pause_dpc_routine(PKDPC Dpc, PVOID Ctx, PVOID Sa1, PVOID Sa2)
 
     if (!slot) return;
 
+    /* If this DPC is running on the originator CPU (operator process
+     * happens to share CR3 with the target — e.g. the operator
+     * triggered a dump of its own analysis helper), skip the park so
+     * the originator can finish its walk; otherwise the originator
+     * wedges itself inside its own spin loop at DISPATCH_LEVEL and
+     * the whole capture stalls for the full PAUSE_WINDOW_100NS before
+     * timing out. */
+    cpu = KeGetCurrentProcessorNumber();
+    if ((LONG)cpu == InterlockedCompareExchange(
+            &g_pause_originator_cpu, -1, -1)) {
+        InterlockedIncrement(&g_pause_completion);
+        return;
+    }
+
     /* Live CR3 of whatever the guest was running when this CPU took
      * the DPC. The VMCB save area would be stale here because CR3
      * writes are not intercepted, so the save-area value only
@@ -652,6 +666,16 @@ static ULONG pause_broadcast_and_wait(void)
     ULARGE_INTEGER t0, t;
 
     if (!g_pause_per_cpu || g_pause_cpu_count == 0) return 0;
+
+    /* Record this CPU as the originator BEFORE any DPC is queued so
+     * the pinned DPC that lands on this same CPU (the targeted-DPC
+     * broadcast fires one per processor, including this one) can
+     * self-skip and avoid wedging the originator inside its own spin
+     * loop. snapshot_locked clears this back to -1 on unwind. The
+     * originator runs at DISPATCH_LEVEL for the KeInsertQueueDpc
+     * loop so KeGetCurrentProcessorNumber is stable here. */
+    InterlockedExchange(&g_pause_originator_cpu,
+                        (LONG)KeGetCurrentProcessorNumber());
 
     for (i = 0; i < g_pause_cpu_count; i++) {
         InterlockedExchange(&g_pause_per_cpu[i].parked,    0);

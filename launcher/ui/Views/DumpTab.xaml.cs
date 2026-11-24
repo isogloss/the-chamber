@@ -359,6 +359,34 @@ public partial class DumpTab : UserControl
         }
     }
 
+    /// <summary>
+    /// Fires when the operator picks a different target process from
+    /// ProcessCombo. Pushes the new PID to the fingerprint driver's
+    /// spoof list (which also stages chamber_shim.dll on the first
+    /// call) so the per-process rewrites are live BEFORE the operator
+    /// clicks Arm / Dump. Without this, trigger arms would race
+    /// against a cold IC trampoline and an unmapped shim VA in the
+    /// target. Silent on failure: fp integration is strictly optional,
+    /// so a transient IOCTL error here must not block the dump UI.
+    /// </summary>
+    private async void OnProcessSelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_service is null) return;
+        if (ProcessCombo.SelectedItem is not ProcessItem p) return;
+        if (p.Pid == 0) return;
+
+        try
+        {
+            await _service.SetTargetPidAsync(p.Pid).ConfigureAwait(true);
+        }
+        catch (Exception)
+        {
+            // Fingerprint integration is optional; swallow and let the
+            // operator proceed with HV-only functionality. A real error
+            // surfaces on Arm/Dump through the standard error path.
+        }
+    }
+
     // --- Helpers ---
 
     private ProcessItem? GetSelectedProcessOrWarn()

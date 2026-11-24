@@ -60,6 +60,24 @@ public partial class OperatorWindow : Window
             // DumpTab opens its own control-device handles per IOCTL
             // through DumpService, so no handle is shared across tabs.
             DumpTabContent.AttachService(_dumpService);
+
+            // Push chamber_shim.dll bytes into the fingerprint driver
+            // as soon as the service is wired, so the first PID the
+            // operator selects does not have to wait on the shim. The
+            // call is a no-op when the fp driver did not load, and
+            // idempotent on the driver side, so repeat loads are safe.
+            _ = System.Threading.Tasks.Task.Run(async () =>
+            {
+                try
+                {
+                    await _dumpService.PushShimImageAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Optional surface; errors show up on first ADD_PID
+                    // if they are blocking there.
+                }
+            });
         };
 
         Closed += async (_, _) => await OnClosedAsync().ConfigureAwait(false);

@@ -60,6 +60,12 @@ public sealed class DriverLoader
     // the same value (safe but wasteful).
     private readonly SemaphoreSlim _fpNameQueryLock = new(1, 1);
 
+    // CFG-derived fingerprint device suffix. Snapshotted from
+    // cfgBlob[60..72] during InstallAndLoadFingerprintAsync; used as the
+    // STATUS_NOT_SUPPORTED fallback in QueryFingerprintDeviceNameAsync
+    // when the HV driver declines to publish the fp driver's chosen name.
+    private string? _fpDeviceSuffixFromCfg;
+
     public async Task<SafeFileHandle> InstallAndLoadAsync(
         string serviceName,
         string imagePath,
@@ -173,6 +179,21 @@ public sealed class DriverLoader
                 (cfgBlob?.Length.ToString() ?? "null") + ".",
                 nameof(cfgBlob));
         }
+
+        // Cache the device suffix the fp driver will derive from the same
+        // CFG blob (offset 60, 12 ASCII bytes — see CfgPatcher.OffDeviceSuffix
+        // and driver/fingerprint/entry.c:build_cfg_name). The HV driver has
+        // no way to cross-query the fp driver's chosen suffix in kernel
+        // mode, so IOCTL_CFP_GET_DEVICE_NAME returns STATUS_NOT_SUPPORTED;
+        // on that sentinel the launcher opens \\.\<SuffixFromCfg> directly.
+        // Both sides produce the same 12 bytes because both derive from
+        // the same seed, so no runtime handshake is required.
+        var suffixSpan = new ReadOnlySpan<byte>(cfgBlob, 60, 12);
+        var suffixEnd = suffixSpan.IndexOf((byte)0);
+        if (suffixEnd < 0) suffixEnd = suffixSpan.Length;
+        _fpDeviceSuffixFromCfg = suffixEnd > 0
+            ? System.Text.Encoding.ASCII.GetString(suffixSpan.Slice(0, suffixEnd))
+            : null;
 
         // Service subkey — same shape as the HV driver's, plus a
         // Parameters subkey holding the CFG v2 blob the fingerprint
@@ -311,8 +332,23 @@ public sealed class DriverLoader
                             outBuf, (uint)outSize,
                             out var returned, IntPtr.Zero))
                     {
+                        // STATUS_NOT_SUPPORTED (0xC00000BB, mapped to
+                        // ERROR_NOT_SUPPORTED=50) is the explicit "HV
+                        // driver cannot cross-query the fp driver's
+                        // suffix in kernel mode; fall back to the one
+                        // you already derived from CFG" sentinel. Both
+                        // sides derive the same 12 bytes from the same
+                        // seed, so the CFG-derived path opens the same
+                        // device the fp driver created. Any other
+                        // failure is a real IOCTL error.
+                        var err = Marshal.GetLastWin32Error();
+                        if (err == NativeMethods.ERROR_NOT_SUPPORTED &&
+                            !string.IsNullOrEmpty(_fpDeviceSuffixFromCfg))
+                        {
+                            return @"\\.\" + _fpDeviceSuffixFromCfg;
+                        }
                         throw new Win32Exception(
-                            Marshal.GetLastWin32Error(),
+                            err,
                             "IOCTL_CFP_GET_DEVICE_NAME failed.");
                     }
                     if (returned < (uint)Marshal.SizeOf<uint>() * 2)
@@ -326,6 +362,15 @@ public sealed class DriverLoader
                     var len = (int)Math.Min(resp.SuffixLengthChars, 128);
                     if (len <= 0 || string.IsNullOrEmpty(resp.Suffix))
                     {
+                        // Driver returned success with an empty suffix:
+                        // treat the same as NOT_SUPPORTED and use the
+                        // CFG-derived value (applies to the random
+                        // fallback case when the fp driver's CFG was
+                        // unreadable but the launcher's was fine).
+                        if (!string.IsNullOrEmpty(_fpDeviceSuffixFromCfg))
+                        {
+                            return @"\\.\" + _fpDeviceSuffixFromCfg;
+                        }
                         throw new InvalidOperationException(
                             "IOCTL_CFP_GET_DEVICE_NAME: empty suffix.");
                     }

@@ -745,16 +745,31 @@ static void handle_msr(PER_CPU_CTX *ctx, VMCB *vmcb)
          *
          * Microcode-patch level (MSR 0x8B) is a frequent probe target.
          * On AuthenticAMD a RDMSR 0x8B returns the patch id in EAX with
-         * EDX=0. Serve a plausible shadow (Zen 4 B2 published patch id)
-         * on read; absorb writes. Keep the value conservative and NOT
-         * derived from seeded entropy. */
+         * EDX=0. Pick from a small pool of real published Zen 4 B2
+         * patch ids using g_identity_microcode_rev (seed-derived) so a
+         * reseed rotates the id; if the identity path isn't primed
+         * yet (zero), fall back to a single fixed real value. Writes
+         * are absorbed. */
         if (msr == 0x8BUL) {
             if (!is_write) {
-                /* AMD family 0x19 model 0x61 stepping 2 (Raphael B2)
-                 * published microcode patch level. Low 32 bits only;
-                 * EDX is 0 on AMD per architecture. */
-                ULONGLONG v = 0x0A601206ULL;
-                vmcb->save.rax   = (ULONGLONG)(ULONG)v;
+                /* Real published AMD family 0x19 model 0x61 stepping 2
+                 * (Raphael B2) microcode patch ids. Keeping the pool to
+                 * known-good values avoids emitting a bit pattern no
+                 * shipped CPU has carried -- itself a fingerprint a
+                 * sample can cross-check against a public patch list. */
+                static const ULONG zen4_b2_patch_ids[] = {
+                    0x0A601203UL, 0x0A601206UL, 0x0A601209UL,
+                    0x0A60120AUL, 0x0A60120CUL,
+                };
+                ULONG v;
+                if (g_identity_microcode_rev != 0) {
+                    v = zen4_b2_patch_ids[
+                        (ULONG)(g_identity_microcode_rev & 0xFFFFFFFFUL) %
+                        RTL_NUMBER_OF(zen4_b2_patch_ids)];
+                } else {
+                    v = 0x0A601206UL;
+                }
+                vmcb->save.rax   = (ULONGLONG)v;
                 ctx->gpr_save[3] = 0;
             }
             vmcb->save.rip = vmcb->ctl.next_rip;

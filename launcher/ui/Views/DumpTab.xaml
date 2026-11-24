@@ -27,7 +27,8 @@
                           x:Name="ProcessCombo"
                           IsEditable="False"
                           MinHeight="28"
-                          DisplayMemberPath="Display" />
+                          DisplayMemberPath="Display"
+                          SelectionChanged="OnProcessSelectionChanged" />
                 <Button Grid.Column="1"
                         Content="refresh"
                         Click="OnRefreshProcesses"

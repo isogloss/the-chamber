@@ -21,6 +21,7 @@ internal static class NativeMethods
     public const uint FILE_SHARE_WRITE = 0x00000002;
     public const uint OPEN_EXISTING = 3;
     public const int ERROR_FILE_NOT_FOUND = 2;
+    public const int ERROR_NOT_SUPPORTED = 50;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct UNICODE_STRING
