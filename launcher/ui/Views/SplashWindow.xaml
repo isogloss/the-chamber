@@ -6,61 +6,54 @@
         WindowStyle="None"
         ResizeMode="NoResize"
         AllowsTransparency="False"
-        Width="960" Height="640"
-        Background="{StaticResource ChamberBg}"
-        FontFamily="{StaticResource ChamberMono}">
+        Width="1400" Height="900"
+        Background="#FF000000"
+        FontFamily="{StaticResource ChamberMono}"
+        TextOptions.TextFormattingMode="Display"
+        TextOptions.TextRenderingMode="ClearType">
 
+    <!-- Bare-minimum splash: a hooded-figure ASCII art reveal above a
+         "THE CHAMBER" word-mark on pure black. Everything else that used to
+         live here (chamber.png hero, subtitle, status line, footer rule) has
+         been stripped. The StatusText block is kept as a non-rendered sink so
+         the public SetStatus API on the code-behind still has somewhere to
+         write; it is never shown. -->
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="*" />
-            <RowDefinition Height="auto" />
-            <RowDefinition Height="auto" />
-            <RowDefinition Height="auto" />
-            <RowDefinition Height="36" />
+            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <!-- Centered chamber image. Dithered look is baked in via the
-             image filter; render at exact pixel size to keep it crisp. -->
-        <Image Grid.Row="0"
-               Source="pack://application:,,,/Resources/chamber.png"
-               Stretch="Uniform"
-               Margin="0,48,0,24"
-               Opacity="0.92"
-               SnapsToDevicePixels="True"
-               UseLayoutRounding="True"
-               RenderOptions.BitmapScalingMode="HighQuality" />
+        <!-- Art container. Scaled uniformly to fit the window; the per-line
+             TextBlocks are built on Loaded by SplashWindow.xaml.cs and
+             animated in top-to-bottom. -->
+        <Viewbox Grid.Row="0"
+                 Stretch="Uniform"
+                 StretchDirection="DownOnly"
+                 HorizontalAlignment="Center"
+                 VerticalAlignment="Center"
+                 Margin="24,24,24,8">
+            <StackPanel x:Name="ArtHost" />
+        </Viewbox>
 
-        <TextBlock Grid.Row="1"
-                   Text="THE CHAMBER"
-                   HorizontalAlignment="Center"
-                   Foreground="{StaticResource ChamberFg}"
-                   FontSize="{StaticResource ChamberFontSizeHero}"
-                   FontWeight="Light"
-                   FontFamily="{StaticResource ChamberMono}" />
+        <StackPanel Grid.Row="1"
+                    HorizontalAlignment="Center"
+                    Margin="0,8,0,40">
+            <TextBlock x:Name="TitleText"
+                       Text="THE CHAMBER"
+                       Foreground="#FFE8F4F8"
+                       FontFamily="{StaticResource ChamberMono}"
+                       FontSize="{StaticResource ChamberFontSizeHero}"
+                       FontWeight="Light"
+                       HorizontalAlignment="Center"
+                       Opacity="0" />
 
-        <TextBlock Grid.Row="2"
-                   Text="defensive hypervisor"
-                   HorizontalAlignment="Center"
-                   Foreground="{StaticResource ChamberFgDim}"
-                   FontSize="{StaticResource ChamberFontSizeSmall}"
-                   Margin="0,6,0,0" />
-
-        <TextBlock x:Name="StatusText"
-                   Grid.Row="3"
-                   Text=""
-                   HorizontalAlignment="Center"
-                   Foreground="{StaticResource ChamberFgFaint}"
-                   FontSize="{StaticResource ChamberFontSizeSmall}"
-                   Margin="0,36,0,0" />
-
-        <!-- Footer rule -->
-        <Border Grid.Row="4" BorderThickness="0,1,0,0" BorderBrush="{StaticResource ChamberLine}">
-            <TextBlock Text="passive-dump sandbox / AMD-SVM"
-                       Foreground="{StaticResource ChamberFgFaint}"
-                       FontSize="10"
-                       VerticalAlignment="Center"
-                       HorizontalAlignment="Right"
-                       Margin="0,0,16,0" />
-        </Border>
+            <!-- SetStatus() targets this hidden sink so callers in App.xaml.cs
+                 still compile. Collapsed, so it takes no layout space and
+                 renders nothing. -->
+            <TextBlock x:Name="StatusText"
+                       Text=""
+                       Visibility="Collapsed" />
+        </StackPanel>
     </Grid>
 </Window>
